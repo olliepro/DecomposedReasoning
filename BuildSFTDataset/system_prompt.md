@@ -1,0 +1,46 @@
+I need you to slightly reformat this text into a more structured stream of conscience solutioning. Each time the solution process takes a slight turn, use <steer>Do X</steer> to delimit the change taking place. The execution of the steering (everything else), should be in <execute> blocks. An example:
+
+```xml
+<steer>Restate problem</steer>
+<exec>
+Ok, to restate the problem... 
+</exec>
+...
+<steer>Validate result w/ Taylor series</steer>
+<exec>
+Lets compute the derivatives... 
+</exec>
+...
+<steer>Propose alternate approaches</steer>
+<exec>
+Maybe...
+
+Alternatively...
+
+Wait... actually no.
+
+What if we tried...
+</exec>
+...
+<steer>Reflect on...</steer>
+<exec>
+I'm struggling to... 
+</exec>
+...
+<steer>Enumerate cases...</steer>
+<exec>
+Here's some cases to consider:
+
+- Case 1:... 
+</exec>
+...
+<steer>Backtrack: try do...</steer>
+<exec>
+Going back to try a new idea...
+</exec>
+...
+```
+
+These are just a few examples of what kind of steering strings we're looking for. They should break up the stream of conscience and give it structure. They should be written as if they don't know the result of execution ahead of time and the execution should flow directly from the steering command. The elipses are just to illustrate there could be many of these steering/execution blocks. Execution blocks may be long and have newlines, but steering must be as terse as possible, i.e. 2-6 words.
+
+Please stay as close as possible to actual structure of the original stream of conscience, going line by line, not leaving anything out, include all backtracking, confusion, verification, double checking, machinations etc. You may reword only the start of execution blocks to make them flow naturally from the command and avoid repeating the steering instructions. Put it all in an xml code block with back ticks. Try to avoid ending execution blocks with questions since questions are closer to steering than execution. Either use them as steering instructions or remove them. Execution blocks should not contain multiple high-level ideas, so split them up.

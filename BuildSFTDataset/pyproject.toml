@@ -1,0 +1,21 @@
+[project]
+name = "decomposed-reasoning"
+version = "0.1.0"
+description = "Transform <think> blocks in Dolci-Think-SFT using Gemini prompts."
+requires-python = ">=3.11"
+dependencies = [
+  "datasets>=2.19.0",
+  "google-genai>=1.51.0",
+  "streamlit>=1.54.0",
+  "tiktoken>=0.7.0",
+  "tqdm>=4.66.4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pyright>=1.1.380",
+]
+
+[tool.pyright]
+typeCheckingMode = "basic"
+reportMissingTypeStubs = "none"

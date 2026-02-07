@@ -1,0 +1,31 @@
+# OS
+.DS_Store
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.pyright/
+
+# Virtual environments
+.venv/
+venv/
+
+# Secrets and local env
+.env
+*.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Generated dataset artifacts
+BuildSFTDataset/output/
+BuildSFTDataset/output_nonbatch5/
+
+# Streamlit cache
+.streamlit/
