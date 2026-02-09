@@ -8,11 +8,14 @@ from pathlib import Path
 
 import streamlit as st
 
-THINK_BLOCK_PATTERN = re.compile(r"<think>(.*?)</think>", flags=re.DOTALL | re.IGNORECASE)
+THINK_BLOCK_PATTERN = re.compile(
+    r"<think>(.*?)</think>", flags=re.DOTALL | re.IGNORECASE
+)
 TAG_BLOCK_PATTERN = re.compile(
     r"<(steer|steering|exec|execute|execution)>(.*?)</\1>",
     flags=re.DOTALL | re.IGNORECASE,
 )
+STEER_TAG_PATTERN = re.compile(r"<(?:steer|steering)\b[^>]*>", flags=re.IGNORECASE)
 
 
 def cache_data_if_available(func):
@@ -92,12 +95,18 @@ class RowOption:
         row_id: Dataset row identifier.
         dataset_source: Source label.
         think_count: Number of think blocks in row.
+        think_tokens: Think token count for row (exact if available, else estimate).
+        steer_instance_count: Number of steer instances across row think blocks.
+        think_to_steer_instances_ratio: Think-to-steer ratio for row.
     """
 
     row_index: int
     row_id: str
     dataset_source: str
     think_count: int
+    think_tokens: int
+    steer_instance_count: int
+    think_to_steer_instances_ratio: float | None
 
     def label(self) -> str:
         """Build row selector label.
@@ -105,9 +114,15 @@ class RowOption:
         Returns:
             Human-readable row label.
         """
+        ratio_text = (
+            f"{self.think_to_steer_instances_ratio:.2f}"
+            if self.think_to_steer_instances_ratio is not None
+            else "n/a"
+        )
         return (
             f"row {self.row_index} | id={self.row_id} | "
-            f"source={self.dataset_source} | think={self.think_count}"
+            f"source={self.dataset_source} | think={self.think_count} | "
+            f"ratio={ratio_text}"
         )
 
 
@@ -159,6 +174,73 @@ def load_jsonl_rows(path_str: str) -> list[dict[str, object]]:
     return rows
 
 
+def discover_think_token_stats_path(base_dir: Path, dataset_path: Path) -> Path | None:
+    """Return nearest think-token-stats parquet for selected dataset.
+
+    Args:
+        base_dir: BuildSFTDataset directory.
+        dataset_path: Selected transformed JSONL path.
+
+    Returns:
+        Path to `think_token_stats.parquet` if found, else None.
+    """
+
+    candidate_paths: list[Path] = []
+    for parent in [dataset_path.parent, *dataset_path.parents]:
+        candidate_paths.append(
+            parent / "cluster_analysis" / "think_token_stats.parquet"
+        )
+    candidate_paths.append(
+        base_dir / "output" / "cluster_analysis" / "think_token_stats.parquet"
+    )
+    candidate_paths.append(
+        base_dir / "output_nonbatch5" / "cluster_analysis" / "think_token_stats.parquet"
+    )
+    seen: set[Path] = set()
+    for candidate_path in candidate_paths:
+        resolved_candidate = candidate_path.resolve()
+        if resolved_candidate in seen:
+            continue
+        seen.add(resolved_candidate)
+        if candidate_path.exists():
+            return candidate_path
+    return None
+
+
+@cache_data_if_available
+def load_think_token_map(path_str: str) -> dict[str, int]:
+    """Load row_id -> new think token count from parquet.
+
+    Args:
+        path_str: Path to `think_token_stats.parquet`.
+
+    Returns:
+        Mapping of row id to integer think-token count.
+    """
+
+    try:
+        import pandas as pd
+    except Exception:  # noqa: BLE001
+        return {}
+
+    stats_path = Path(path_str)
+    if not stats_path.exists():
+        return {}
+    stats_df = pd.read_parquet(stats_path)
+    required_columns = {"row_id", "new_think_tokens"}
+    if not required_columns.issubset(stats_df.columns):
+        return {}
+
+    token_map: dict[str, int] = {}
+    for row_id, token_value in zip(
+        stats_df["row_id"].astype(str).tolist(),
+        stats_df["new_think_tokens"].astype(int).tolist(),
+    ):
+        if row_id not in token_map:
+            token_map[row_id] = int(token_value)
+    return token_map
+
+
 def extract_think_refs(messages: list[dict[str, object]]) -> list[ThinkBlockRef]:
     """Extract think-block references from assistant messages.
 
@@ -187,32 +269,142 @@ def extract_think_refs(messages: list[dict[str, object]]) -> list[ThinkBlockRef]
     return refs
 
 
-def build_row_options(rows: list[dict[str, object]]) -> list[RowOption]:
+def count_steer_instances(text: str) -> int:
+    """Count steer/steering tags in one think block.
+
+    Args:
+        text: Think block text.
+
+    Returns:
+        Number of steer instances.
+    """
+
+    return len(STEER_TAG_PATTERN.findall(text))
+
+
+def estimate_think_tokens(think_refs: list[ThinkBlockRef]) -> int:
+    """Estimate think-token count from whitespace tokens.
+
+    Args:
+        think_refs: Think block references from one row.
+
+    Returns:
+        Approximate token count.
+    """
+
+    return sum(len(ref.block_text.split()) for ref in think_refs)
+
+
+def compute_think_to_steer_ratio(
+    think_tokens: int, steer_instance_count: int
+) -> float | None:
+    """Compute think-to-steer-instance ratio.
+
+    Args:
+        think_tokens: Think token count.
+        steer_instance_count: Number of steer instances.
+
+    Returns:
+        Ratio or None when steer count is zero.
+    """
+
+    if steer_instance_count <= 0:
+        return None
+    return float(think_tokens) / float(steer_instance_count)
+
+
+def build_row_options(
+    rows: list[dict[str, object]],
+    *,
+    think_token_map: dict[str, int] | None = None,
+) -> list[RowOption]:
     """Build row options that contain at least one think block.
 
     Args:
         rows: Parsed dataset rows.
+        think_token_map: Optional row-id map of exact think-token counts.
 
     Returns:
         Selectable row options.
     """
+    token_map = think_token_map or {}
     options: list[RowOption] = []
     for row_index, row in enumerate(rows):
         messages = row.get("messages")
         if not isinstance(messages, list):
             continue
-        think_count = len(extract_think_refs(messages=messages))
+        think_refs = extract_think_refs(messages=messages)
+        think_count = len(think_refs)
         if think_count == 0:
             continue
+        row_id = str(row.get("id", f"row-{row_index}"))
+        steer_instance_count = sum(
+            count_steer_instances(text=ref.block_text) for ref in think_refs
+        )
+        think_tokens = token_map.get(
+            row_id, estimate_think_tokens(think_refs=think_refs)
+        )
+        think_to_steer_instances_ratio = compute_think_to_steer_ratio(
+            think_tokens=think_tokens,
+            steer_instance_count=steer_instance_count,
+        )
         options.append(
             RowOption(
                 row_index=row_index,
-                row_id=str(row.get("id", f"row-{row_index}")),
+                row_id=row_id,
                 dataset_source=str(row.get("dataset_source", "unknown")),
                 think_count=think_count,
+                think_tokens=think_tokens,
+                steer_instance_count=steer_instance_count,
+                think_to_steer_instances_ratio=think_to_steer_instances_ratio,
             )
         )
     return options
+
+
+def sort_row_options(row_options: list[RowOption], sort_mode: str) -> list[RowOption]:
+    """Sort row options by selected mode.
+
+    Args:
+        row_options: Row options.
+        sort_mode: Sort mode label.
+
+    Returns:
+        Sorted options.
+    """
+
+    if sort_mode == "Lowest think/steer ratio":
+        return sorted(
+            row_options,
+            key=lambda option: (
+                (
+                    float("inf")
+                    if option.think_to_steer_instances_ratio is None
+                    else option.think_to_steer_instances_ratio
+                ),
+                option.row_index,
+            ),
+        )
+    if sort_mode == "Highest think/steer ratio":
+        return sorted(
+            row_options,
+            key=lambda option: (
+                (
+                    float("-inf")
+                    if option.think_to_steer_instances_ratio is None
+                    else option.think_to_steer_instances_ratio
+                ),
+                -option.row_index,
+            ),
+            reverse=True,
+        )
+    if sort_mode == "Most steer instances":
+        return sorted(
+            row_options,
+            key=lambda option: (option.steer_instance_count, -option.row_index),
+            reverse=True,
+        )
+    return sorted(row_options, key=lambda option: option.row_index)
 
 
 def strip_code_fences(text: str) -> str:
@@ -269,7 +461,9 @@ def parse_xml_sections(xml_text: str) -> tuple[list[SteeringSection], str | None
                     )
                     continue
                 latest = sections[-1]
-                merged = latest.execute_text + ("\n\n" if latest.execute_text else "") + text
+                merged = (
+                    latest.execute_text + ("\n\n" if latest.execute_text else "") + text
+                )
                 sections[-1] = SteeringSection(
                     steer_text=latest.steer_text,
                     execute_text=merged.strip(),
@@ -312,7 +506,9 @@ def parse_with_regex_fallback(cleaned: str) -> list[SteeringSection]:
             continue
         latest = sections[-1]
         merged = latest.execute_text + ("\n\n" if latest.execute_text else "") + text
-        sections[-1] = SteeringSection(steer_text=latest.steer_text, execute_text=merged)
+        sections[-1] = SteeringSection(
+            steer_text=latest.steer_text, execute_text=merged
+        )
 
     if sections:
         return sections
@@ -366,12 +562,41 @@ def main() -> None:
         )
 
     rows = load_jsonl_rows(path_str=str(selected_file))
-    row_options = build_row_options(rows=rows)
+    think_token_stats_path = discover_think_token_stats_path(
+        base_dir=base_dir, dataset_path=selected_file
+    )
+    think_token_map = (
+        load_think_token_map(path_str=str(think_token_stats_path))
+        if think_token_stats_path is not None
+        else {}
+    )
+    row_options = build_row_options(rows=rows, think_token_map=think_token_map)
     if not row_options:
         st.error("No rows with `<think>` blocks found in selected file.")
         return
 
     with st.sidebar:
+        sort_mode = st.selectbox(
+            label="Row sort",
+            options=[
+                "Dataset order",
+                "Lowest think/steer ratio",
+                "Highest think/steer ratio",
+                "Most steer instances",
+            ],
+        )
+        row_options = sort_row_options(row_options=row_options, sort_mode=sort_mode)
+        if think_token_stats_path is None or not think_token_map:
+            st.caption(
+                "Using estimated think tokens from text splitting (stats file not found)."
+            )
+        else:
+            stats_path_label = (
+                str(think_token_stats_path.relative_to(base_dir))
+                if think_token_stats_path.is_relative_to(base_dir)
+                else str(think_token_stats_path)
+            )
+            st.caption("Using exact think token counts from: " f"{stats_path_label}")
         selected_row_option = st.selectbox(
             label="Row",
             options=row_options,
@@ -399,6 +624,11 @@ def main() -> None:
             "selected_message_index": selected_think_ref.message_index,
             "selected_think_index": selected_think_ref.block_index,
             "sections_parsed": len(sections),
+            "think_tokens": selected_row_option.think_tokens,
+            "steer_instances": selected_row_option.steer_instance_count,
+            "think_to_steer_instances_ratio": (
+                selected_row_option.think_to_steer_instances_ratio
+            ),
         }
     )
 

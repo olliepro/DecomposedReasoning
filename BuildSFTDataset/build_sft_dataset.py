@@ -229,6 +229,19 @@ class ThinkTask:
     block_index: int
 
 
+@dataclass(frozen=True)
+class BatchRunResult:
+    """Batch run outputs and metadata.
+
+    Args:
+        outputs: Outputs mapped by request index.
+        batch_job_name: Fully-qualified batch job name.
+    """
+
+    outputs: list[str]
+    batch_job_name: str
+
+
 def parse_dotenv(path: Path) -> dict[str, str]:
     """Parse a simple dotenv file into key/value pairs.
 
@@ -433,14 +446,18 @@ def get_stage_status(state: dict[str, object], stage: Stage) -> StageStatus | No
         Stage status or None.
     """
     stages = state.get("stages", {})
+    if not isinstance(stages, dict):
+        return None
     payload = stages.get(stage)
     if not isinstance(payload, dict):
         return None
+    metadata_payload = payload.get("metadata", {})
+    metadata = dict(metadata_payload) if isinstance(metadata_payload, dict) else {}
     return StageStatus(
         completed=bool(payload.get("completed", False)),
         config_hash=str(payload.get("config_hash", "")),
         updated_at=str(payload.get("updated_at", "")),
-        metadata=dict(payload.get("metadata", {})),
+        metadata=metadata,
     )
 
 
@@ -938,9 +955,32 @@ def extract_response_text(response: object) -> str:
     Returns:
         Extracted text.
     """
-    text = getattr(response, "text", None)
-    if isinstance(text, str) and text:
-        return text
+    if isinstance(response, dict):
+        text_value = response.get("text")
+        if isinstance(text_value, str) and text_value:
+            return text_value
+        candidates = response.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            return ""
+        first = candidates[0]
+        if not isinstance(first, dict):
+            return ""
+        content = first.get("content")
+        if not isinstance(content, dict):
+            return ""
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            return ""
+        texts = [
+            part.get("text", "")
+            for part in parts
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        return "".join(texts)
+
+    text_value = getattr(response, "text", None)
+    if isinstance(text_value, str) and text_value:
+        return text_value
     candidates = getattr(response, "candidates", None)
     if not candidates:
         return ""
@@ -1063,7 +1103,7 @@ def build_client(model: TransformConfig) -> genai.Client:
     if model.mode == "gemini":
         return genai.Client(api_key=model.api_key)
 
-    http_options = types.HttpOptions(apiVersion="v1")
+    http_options = types.HttpOptions(api_version="v1")
     if model.mode == "vertex":
         if not model.project_id or not model.location:
             raise SystemExit("--project and --location are required in vertex mode.")
@@ -1092,7 +1132,7 @@ def call_model(
         Cleaned response text.
     """
     thinking_config = (
-        types.ThinkingConfig(thinking_level=model.thinking_level)
+        types.ThinkingConfig(thinking_level=cast(Any, model.thinking_level))
         if model.thinking_level
         else None
     )
@@ -1295,8 +1335,8 @@ def run_batch_requests(
     client: genai.Client,
     model: TransformConfig,
     inline_requests: list[dict[str, object]],
-) -> list[str]:
-    """Run batch API and return cleaned outputs.
+) -> BatchRunResult:
+    """Run a new batch API job and return cleaned outputs.
 
     Args:
         client: GenAI client.
@@ -1304,22 +1344,23 @@ def run_batch_requests(
         inline_requests: Batch request payloads.
 
     Returns:
-        Cleaned outputs aligned with request order.
+        Outputs and batch metadata.
     """
     if not inline_requests:
-        return []
+        return BatchRunResult(outputs=[], batch_job_name="")
 
     batch_job = client.batches.create(
         model=resolve_batch_model_id(model_id=model.model_id),
-        src=inline_requests,
+        src=cast(Any, inline_requests),
         config={"display_name": f"build-sft-{int(time.time())}"},
     )
     assert batch_job.name is not None
-    print(f"Batch submitted: name={batch_job.name}", flush=True)
+    batch_job_name = batch_job.name
+    print(f"Batch submitted: name={batch_job_name}", flush=True)
 
     poll_count = 0
     while True:
-        batch_job = client.batches.get(name=batch_job.name)
+        batch_job = client.batches.get(name=batch_job_name)
         state_obj = getattr(batch_job, "state", None)
         state_name = getattr(state_obj, "name", str(state_obj))
         poll_count += 1
@@ -1331,88 +1372,267 @@ def run_batch_requests(
 
     if state_name != "JOB_STATE_SUCCEEDED":
         raise RuntimeError(f"Batch job ended with {state_name}")
+    assert batch_job.name is not None
 
+    responses = get_batch_response_items(client=client, batch_job=batch_job)
+    outputs = resolve_batch_outputs(
+        client=client,
+        model=model,
+        inline_requests=inline_requests,
+        responses=responses,
+    )
+    return BatchRunResult(outputs=outputs, batch_job_name=batch_job.name)
+
+
+def normalize_batch_job_name(batch_job_name: str) -> str:
+    """Normalize a batch identifier to the full API name.
+
+    Args:
+        batch_job_name: Batch name or suffix.
+
+    Returns:
+        Name in `batches/<id>` format.
+    """
+    normalized = batch_job_name.strip()
+    if normalized.startswith("batches/"):
+        return normalized
+    return f"batches/{normalized}"
+
+
+def get_batch_response_items(client: genai.Client, batch_job: object) -> list[object]:
+    """Load response items from a succeeded batch job.
+
+    Args:
+        client: GenAI client for file download fallback.
+        batch_job: Batch job object returned by SDK.
+
+    Returns:
+        List of response items.
+    """
     destination = getattr(batch_job, "dest", None)
-    responses = getattr(destination, "inlined_responses", None)
-    if not responses:
-        raise RuntimeError("Batch job succeeded without inline responses.")
+    inlined_responses = getattr(destination, "inlined_responses", None)
+    if isinstance(inlined_responses, list) and inlined_responses:
+        return inlined_responses
 
-    outputs: list[str] = [""] * len(inline_requests)
+    file_name = getattr(destination, "file_name", None)
+    if isinstance(file_name, str) and file_name:
+        payload = client.files.download(file=file_name)
+        decoded = payload.decode("utf-8")
+        parsed_items: list[object] = []
+        for line_number, line in enumerate(decoded.splitlines(), start=1):
+            if not line.strip():
+                continue
+            parsed_items.extend(decode_json_line(line=line, line_number=line_number))
+        if parsed_items:
+            return parsed_items
+
+    raise RuntimeError("Batch job succeeded without retrievable responses.")
+
+
+def get_item_value(item: object, key: str) -> object | None:
+    """Read a key from response item objects or dicts.
+
+    Args:
+        item: Batch response item.
+        key: Field name.
+
+    Returns:
+        Field value if present.
+    """
+    if isinstance(item, dict):
+        return item.get(key)
+    return getattr(item, key, None)
+
+
+def parse_batch_outputs(
+    responses: Iterable[object],
+    expected_count: int,
+) -> tuple[list[str], set[int], dict[int, str]]:
+    """Parse batch responses into ordered output strings.
+
+    Args:
+        responses: Batch response items.
+        expected_count: Number of expected request outputs.
+
+    Returns:
+        Tuple of outputs, seen request indexes, and failed reasons by index.
+    """
+    response_list = list(responses)
+    outputs: list[str] = [""] * expected_count
     seen_indexes: set[int] = set()
-    failed_indexes: set[int] = set()
     failed_reasons: dict[int, str] = {}
+    encountered_indexes: set[int] = set()
 
-    for item in responses:
-        metadata = getattr(item, "metadata", None)
+    raw_indexes: list[str | None] = []
+    for item in response_list:
+        metadata = get_item_value(item=item, key="metadata")
         request_index_raw = metadata.get("request_index") if isinstance(metadata, dict) else None
-        if request_index_raw is None:
-            raise RuntimeError("Batch response item is missing request_index metadata.")
-        try:
-            request_index = int(request_index_raw)
-        except ValueError as exc:
-            raise RuntimeError(f"Invalid request_index metadata: {request_index_raw}") from exc
-        if request_index < 0 or request_index >= len(outputs):
-            raise RuntimeError(f"Out-of-range request_index metadata: {request_index}")
-        if request_index in seen_indexes:
-            raise RuntimeError(f"Duplicate request_index metadata: {request_index}")
+        raw_indexes.append(request_index_raw if isinstance(request_index_raw, str) else None)
+    has_any_metadata = any(index is not None for index in raw_indexes)
+    has_all_metadata = all(index is not None for index in raw_indexes)
+    if has_any_metadata and not has_all_metadata:
+        raise RuntimeError("Batch responses mix metadata and non-metadata rows.")
 
-        response_error = getattr(item, "error", None)
-        if response_error is not None:
-            failed_indexes.add(request_index)
+    for response_position, item in enumerate(response_list):
+        request_index: int
+        if has_all_metadata:
+            request_index_raw = raw_indexes[response_position]
+            assert request_index_raw is not None
+            try:
+                request_index = int(request_index_raw)
+            except ValueError as exc:
+                raise RuntimeError(f"Invalid request_index metadata: {request_index_raw}") from exc
+        else:
+            request_index = response_position
+
+        if request_index < 0 or request_index >= expected_count:
+            raise RuntimeError(f"Out-of-range request index: {request_index}")
+        if request_index in encountered_indexes:
+            raise RuntimeError(f"Duplicate request index: {request_index}")
+        encountered_indexes.add(request_index)
+
+        response_error = get_item_value(item=item, key="error")
+        if response_error not in (None, {}):
             failed_reasons[request_index] = str(response_error)
             continue
-        response = getattr(item, "response", None)
-        outputs[request_index] = clean_model_output(
-            extract_response_text(response=response)
-        )
+
+        response = get_item_value(item=item, key="response")
+        outputs[request_index] = clean_model_output(extract_response_text(response=response))
         seen_indexes.add(request_index)
 
+    for missing_index in sorted(set(range(expected_count)) - seen_indexes - set(failed_reasons.keys())):
+        failed_reasons[missing_index] = "Missing response for request index."
+    return outputs, seen_indexes, failed_reasons
+
+
+def retry_failed_batch_outputs(
+    client: genai.Client,
+    model: TransformConfig,
+    inline_requests: list[dict[str, object]],
+    outputs: list[str],
+    seen_indexes: set[int],
+    failed_reasons: dict[int, str],
+) -> None:
+    """Retry failed batch indexes with direct model calls.
+
+    Args:
+        client: GenAI client.
+        model: Transform config.
+        inline_requests: Original inline requests.
+        outputs: Output buffer updated in place.
+        seen_indexes: Seen output indexes updated in place.
+        failed_reasons: Failure reasons keyed by request index.
+    """
+    if not failed_reasons:
+        return
+    print(f"Retrying {len(failed_reasons)} failed batch item(s) with direct calls.", flush=True)
+
+    for failed_index in sorted(failed_reasons):
+        inline_request = inline_requests[failed_index]
+        inline_contents = cast(Any, inline_request.get("contents"))
+        inline_config = cast(Any, inline_request.get("config"))
+        last_error: Exception | None = None
+        for attempt in range(1, model.retry_limit + 1):
+            try:
+                direct_response = client.models.generate_content(
+                    model=model.model_id,
+                    contents=inline_contents,
+                    config=inline_config,
+                )
+                outputs[failed_index] = clean_model_output(
+                    extract_response_text(response=direct_response)
+                )
+                seen_indexes.add(failed_index)
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                time.sleep(model.retry_sleep_seconds * attempt)
+        if failed_index not in seen_indexes:
+            reason = failed_reasons.get(failed_index, "Unknown batch response error.")
+            raise RuntimeError(
+                "Failed to recover batch item after retries. "
+                f"request_index={failed_index} batch_error={reason}"
+            ) from last_error
+
+
+def resolve_batch_outputs(
+    client: genai.Client,
+    model: TransformConfig,
+    inline_requests: list[dict[str, object]],
+    responses: Iterable[object],
+) -> list[str]:
+    """Resolve batch responses into complete output list.
+
+    Args:
+        client: GenAI client.
+        model: Transform config.
+        inline_requests: Original request payloads.
+        responses: Batch response items.
+
+    Returns:
+        Cleaned outputs aligned with request order.
+    """
+    outputs, seen_indexes, failed_reasons = parse_batch_outputs(
+        responses=responses,
+        expected_count=len(inline_requests),
+    )
+    retry_failed_batch_outputs(
+        client=client,
+        model=model,
+        inline_requests=inline_requests,
+        outputs=outputs,
+        seen_indexes=seen_indexes,
+        failed_reasons=failed_reasons,
+    )
+
     all_indexes = set(range(len(outputs)))
-    missing_indexes = sorted(all_indexes - seen_indexes - failed_indexes)
-    if missing_indexes:
-        for missing_index in missing_indexes:
-            failed_indexes.add(missing_index)
-            failed_reasons[missing_index] = "Missing inlined response for request index."
-
-    if failed_indexes:
-        print(
-            f"Retrying {len(failed_indexes)} failed batch item(s) with direct calls.",
-            flush=True,
-        )
-        for failed_index in sorted(failed_indexes):
-            inline_request = inline_requests[failed_index]
-            inline_contents = cast(Any, inline_request.get("contents"))
-            inline_config = cast(Any, inline_request.get("config"))
-            last_error: Exception | None = None
-            for attempt in range(1, model.retry_limit + 1):
-                try:
-                    direct_response = client.models.generate_content(
-                        model=model.model_id,
-                        contents=inline_contents,
-                        config=inline_config,
-                    )
-                    outputs[failed_index] = clean_model_output(
-                        extract_response_text(response=direct_response)
-                    )
-                    seen_indexes.add(failed_index)
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    last_error = exc
-                    time.sleep(model.retry_sleep_seconds * attempt)
-            if failed_index not in seen_indexes:
-                reason = failed_reasons.get(failed_index, "Unknown batch response error.")
-                raise RuntimeError(
-                    "Failed to recover batch item after retries. "
-                    f"request_index={failed_index} batch_error={reason}"
-                ) from last_error
-
     if len(seen_indexes) != len(outputs):
         unresolved_indexes = sorted(all_indexes - seen_indexes)
         raise RuntimeError(
             f"Unresolved batch outputs after retry. Missing indexes: {unresolved_indexes[:10]}"
         )
-
     return outputs
+
+
+def run_existing_batch_requests(
+    client: genai.Client,
+    model: TransformConfig,
+    inline_requests: list[dict[str, object]],
+    batch_job_name: str,
+) -> BatchRunResult:
+    """Resolve outputs from an already-submitted batch job.
+
+    Args:
+        client: GenAI client.
+        model: Transform config.
+        inline_requests: Original inline requests.
+        batch_job_name: Existing batch ID or `batches/<id>` name.
+
+    Returns:
+        Outputs and recovered batch job name.
+    """
+    if not inline_requests:
+        return BatchRunResult(outputs=[], batch_job_name="")
+
+    normalized_name = normalize_batch_job_name(batch_job_name=batch_job_name)
+    batch_job = client.batches.get(name=normalized_name)
+    state_obj = getattr(batch_job, "state", None)
+    state_name = getattr(state_obj, "name", str(state_obj))
+    print(f"Recovering existing batch: name={normalized_name} state={state_name}", flush=True)
+    if state_name != "JOB_STATE_SUCCEEDED":
+        raise RuntimeError(
+            "Existing batch job is not succeeded. "
+            f"name={normalized_name} state={state_name}"
+        )
+
+    responses = get_batch_response_items(client=client, batch_job=batch_job)
+    outputs = resolve_batch_outputs(
+        client=client,
+        model=model,
+        inline_requests=inline_requests,
+        responses=responses,
+    )
+    return BatchRunResult(outputs=outputs, batch_job_name=normalized_name)
 
 
 def apply_transforms_to_rows(
@@ -1468,6 +1688,7 @@ def run_transform_stage(
     prompts: PromptConfig,
     paths: PipelinePaths,
     runtime: RuntimeConfig,
+    batch_job_name: str | None = None,
 ) -> dict[str, object]:
     """Run transform stage from stratified sample to transformed output.
 
@@ -1476,6 +1697,7 @@ def run_transform_stage(
         prompts: Prompt paths.
         paths: Pipeline paths.
         runtime: Runtime options.
+        batch_job_name: Existing batch job to recover outputs from.
 
     Returns:
         Stage metadata.
@@ -1523,6 +1745,7 @@ def run_transform_stage(
             "rows_selected": len(rows_to_transform),
             "think_blocks": total_think_blocks,
             "batch": model.batch,
+            "batch_job": batch_job_name,
         }
 
     if not runtime.resume and paths.transformed_path.exists():
@@ -1531,6 +1754,9 @@ def run_transform_stage(
     system_prompt = load_prompt_text(path=prompts.system_prompt_path)
     user_template = load_prompt_text(path=prompts.user_prompt_path)
     client = build_client(model=model)
+    if batch_job_name and not model.batch:
+        raise SystemExit("--batch-job requires batch mode. Remove --no-batch or omit --batch-job.")
+    source_batch_job_name: str | None = None
 
     if model.batch:
         requests, _ = build_inline_batch_requests(
@@ -1539,12 +1765,25 @@ def run_transform_stage(
             user_template=user_template,
             model=model,
         )
-        outputs = run_batch_requests(
-            client=client,
-            model=model,
-            inline_requests=requests,
+        batch_result = (
+            run_existing_batch_requests(
+                client=client,
+                model=model,
+                inline_requests=requests,
+                batch_job_name=batch_job_name,
+            )
+            if batch_job_name
+            else run_batch_requests(
+                client=client,
+                model=model,
+                inline_requests=requests,
+            )
         )
-        updated_rows = apply_transforms_to_rows(rows=rows_to_transform, outputs=outputs)
+        source_batch_job_name = batch_result.batch_job_name or None
+        updated_rows = apply_transforms_to_rows(
+            rows=rows_to_transform,
+            outputs=batch_result.outputs,
+        )
     else:
         updated_rows = []
         progress = tqdm(rows_to_transform, desc="Transforming rows", unit="row")
@@ -1583,7 +1822,7 @@ def run_transform_stage(
 
     for row in updated_rows:
         output_row = dict(row)
-        output_row["transform_meta"] = {
+        transform_meta: dict[str, object] = {
             "model": model.model_id,
             "mode": model.mode,
             "batch": model.batch,
@@ -1592,6 +1831,9 @@ def run_transform_stage(
             "system_prompt_path": str(prompts.system_prompt_path),
             "user_prompt_path": str(prompts.user_prompt_path),
         }
+        if source_batch_job_name:
+            transform_meta["source_batch"] = source_batch_job_name
+        output_row["transform_meta"] = transform_meta
         write_jsonl(output_path=paths.transformed_path, row=output_row)
 
     return {
@@ -1601,6 +1843,7 @@ def run_transform_stage(
         "rows_emitted": len(updated_rows),
         "think_blocks": total_think_blocks,
         "batch": model.batch,
+        "source_batch": source_batch_job_name,
     }
 
 
@@ -1651,6 +1894,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rows", type=int, default=DEFAULT_MAX_ROWS)
     parser.add_argument("--batch", action="store_true", default=DEFAULT_BATCH)
     parser.add_argument("--no-batch", dest="batch", action="store_false")
+    parser.add_argument(
+        "--batch-job",
+        default=None,
+        help="Reuse an existing succeeded batch job (ID or batches/<id>) for transform stage.",
+    )
 
     parser.add_argument("--system-prompt", type=Path, default=DEFAULT_SYSTEM_PROMPT)
     parser.add_argument("--user-prompt", type=Path, default=DEFAULT_USER_PROMPT)
@@ -1783,11 +2031,13 @@ def main() -> None:
         next_stage = choose_auto_stage(completed=completed)
         stages_to_run = [next_stage] if next_stage else []
     else:
-        stages_to_run = [runtime.stage]
+        stages_to_run = [cast(Stage, runtime.stage)]
 
     if not stages_to_run:
         print("All stages are already complete for current configuration.")
         return
+    if args.batch_job and "transform" not in stages_to_run:
+        raise SystemExit("--batch-job can only be used when running the transform stage.")
 
     for stage in stages_to_run:
         print(f"Running stage: {stage}")
@@ -1798,7 +2048,13 @@ def main() -> None:
         elif stage == "stratify":
             metadata = run_stratify_stage(stratify=stratify, paths=paths, runtime=runtime)
         elif stage == "transform":
-            metadata = run_transform_stage(model=transform, prompts=prompts, paths=paths, runtime=runtime)
+            metadata = run_transform_stage(
+                model=transform,
+                prompts=prompts,
+                paths=paths,
+                runtime=runtime,
+                batch_job_name=args.batch_job,
+            )
         else:
             raise SystemExit(f"Unsupported stage: {stage}")
 
