@@ -5,6 +5,8 @@ Tools for building and transforming a sampled SFT dataset from `allenai/Dolci-Th
 ## Project layout
 
 - `BuildSFTDataset/`: staged pipeline CLI and Streamlit viewer.
+- `SFTTraining/`: supervised fine-tuning training project.
+- `Eval/`: standalone benchmark evaluation project (`lm_eval` + custom AIME `avg@k`).
 
 ## Quick start
 

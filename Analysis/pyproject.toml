@@ -1,0 +1,29 @@
+[project]
+name = "decomposed-reasoning-analysis"
+version = "0.1.0"
+description = "Steer-aware branching analyzer for vLLM OpenAI-compatible APIs."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "google-genai>=0.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "black>=24.8.0",
+  "pyright>=1.1.390",
+  "pytest>=8.3.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.pyright]
+include = ["*.py", "tests"]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
+
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"

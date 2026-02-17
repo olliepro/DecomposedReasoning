@@ -1,0 +1,42 @@
+[project]
+name = "sft-training"
+version = "0.1.0"
+description = "SFT training and canonical checkpoint benchmark evaluation."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "datasets>=3.0.0",
+  "hf-transfer>=0.1.9",
+  "pyyaml>=6.0.0",
+  "torch>=2.4.0",
+  "transformers>=4.51.0",
+  "trl>=0.11.0",
+  "wandb>=0.17.0",
+]
+
+[project.optional-dependencies]
+train = [
+  "deepspeed==0.17.6",
+  "peft>=0.14.0",
+  "setuptools>=68.0.0",
+]
+dev = [
+  "pyright>=1.1.390",
+  "pytest>=8.3.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.pyright]
+include = ["sft_training", "tests"]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
+
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sft_training*"]

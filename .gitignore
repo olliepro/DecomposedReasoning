@@ -29,3 +29,12 @@ BuildSFTDataset/output_nonbatch5/
 
 # Streamlit cache
 .streamlit/
+
+# Weights & Biases
+wandb/
+
+# Cluster and experiment run artifacts
+slurm-*.out
+Analysis/output/
+Eval/benchmark_evals_base/
+SFTTraining/benchmark_evals_base/

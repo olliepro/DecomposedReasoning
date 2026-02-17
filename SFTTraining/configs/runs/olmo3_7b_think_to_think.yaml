@@ -1,0 +1,5 @@
+run_name: olmo3_7b_think_to_think
+model_name_or_path: allenai/Olmo-3-7B-Think
+output_dir: /fs/scratch/PAA0201/ollieproudman/DecomposedReasoning/SFTTraining/outputs/olmo3_7b_think_to_think
+base_config: base_sft.yaml
+lm_eval: lm_eval_vllm.yaml

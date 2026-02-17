@@ -1,0 +1,5 @@
+run_name: qwen3_8b_to_think
+model_name_or_path: Qwen/Qwen3-8B
+output_dir: /fs/scratch/PAA0201/ollieproudman/DecomposedReasoning/SFTTraining/outputs/qwen3_8b_to_think
+base_config: base_sft.yaml
+lm_eval: lm_eval_vllm.yaml
