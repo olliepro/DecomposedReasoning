@@ -1,424 +1,78 @@
-"""UI style and script blocks for the static steer report."""
-
-STYLE_BLOCK = """
-<style>
-:root {
-  --bg0: #070a15;
-  --bg1: #0f1836;
-  --bg2: #16294b;
-  --panel: rgba(15, 23, 42, 0.76);
-  --panel-border: rgba(148, 163, 184, 0.26);
-  --text: #e2e8f0;
-  --muted: #9fb0ca;
-  --accent: #38bdf8;
-  --accent2: #22c55e;
-  --danger: #fb7185;
-}
-* { box-sizing: border-box; }
-html, body {
-  margin: 0; min-height: 100vh; overscroll-behavior: none; background-color: var(--bg0);
-  color: var(--text);
-  font-family: "Space Grotesk", "IBM Plex Sans", "Segoe UI", sans-serif;
-  background:
-    radial-gradient(circle at 14% 12%, rgba(56, 189, 248, 0.22), transparent 34%),
-    radial-gradient(circle at 80% 18%, rgba(34, 197, 94, 0.14), transparent 34%),
-    radial-gradient(circle at 54% 92%, rgba(59, 130, 246, 0.14), transparent 45%),
-    linear-gradient(130deg, var(--bg0), var(--bg1) 54%, var(--bg2));
-}
-main { max-width: 1480px; margin: 0 auto; padding: 24px 16px 16px 16px; display: grid; gap: 16px; }
-.workspace-grid { position: relative; }
-body.sidebar-open { overflow: hidden; }
-.menu-toggle { position: fixed; top: 14px; left: 14px; z-index: 2200; width: 40px; height: 40px; border: 1px solid rgba(148, 163, 184, 0.44); border-radius: 12px; background: rgba(2, 6, 23, 0.88); color: #dbeafe; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
-.menu-toggle:hover { border-color: rgba(125, 211, 252, 0.72); background: rgba(14, 116, 144, 0.32); }
-body.sidebar-open .menu-toggle { opacity: 0; pointer-events: none; }
-.sidebar-panel { position: fixed; inset: 0 auto 0 0; width: min(392px, 92vw); height: 100dvh; max-height: 100dvh; z-index: 2300; overflow: hidden; display: flex; flex-direction: column; border-radius: 0 16px 16px 0; transform: translateX(-105%); transition: transform 140ms ease; }
-body.sidebar-open .sidebar-panel { transform: translateX(0); }
-.sidebar-scrim { position: fixed; inset: 0; z-index: 2250; border: 0; margin: 0; padding: 0; opacity: 0; pointer-events: none; background: rgba(2, 6, 23, 0.62); backdrop-filter: blur(2px); transition: opacity 120ms ease; }
-body.sidebar-open .sidebar-scrim { opacity: 1; pointer-events: auto; }
-.sidebar-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px; border-bottom: 1px solid rgba(148, 163, 184, 0.24); }
-.sidebar-title { margin: 0; font-size: 13px; font-weight: 700; color: #dbeafe; letter-spacing: 0.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sidebar-hamb, .sidebar-close-icon { font-size: 15px; line-height: 1; color: #dbeafe; }
-.sidebar-close { width: 32px; height: 32px; border: 1px solid rgba(148, 163, 184, 0.38); border-radius: 10px; background: rgba(2, 6, 23, 0.52); color: #dbeafe; cursor: pointer; padding: 0; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
-.sidebar-close:hover { border-color: rgba(251, 113, 133, 0.62); background: rgba(159, 18, 57, 0.22); }
-.sidebar-body { padding: 12px; display: grid; gap: 12px; overflow: auto; }
-.panel { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 16px; box-shadow: 0 22px 56px rgba(2, 6, 23, 0.45); backdrop-filter: blur(12px); }
-.hero { padding: 20px; display: grid; gap: 11px; }
-h1 { margin: 0; font-size: 28px; letter-spacing: 0.02em; }
-h2 { margin: 0; font-size: 16px; color: #dbeafe; }
-h3 { margin: 0; font-size: 13px; color: #bfdbfe; letter-spacing: 0.07em; text-transform: uppercase; }
-.muted { color: var(--muted); font-size: 13px; }
-#meta { display: grid; gap: 12px; }
-.meta-block { border: 1px solid rgba(148, 163, 184, 0.26); border-radius: 12px; background: rgba(2, 6, 23, 0.42); padding: 10px; display: grid; gap: 8px; height: 100%; }
-.meta { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-.meta-pill { border: 1px solid rgba(148, 163, 184, 0.33); padding: 5px 9px; border-radius: 999px; font-size: 12px; background: rgba(15, 23, 42, 0.62); }
-.mode-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
-.mode-btn { border: 1px solid rgba(148, 163, 184, 0.38); border-radius: 999px; background: rgba(2, 6, 23, 0.6); color: #bfdbfe; font-size: 11px; padding: 3px 10px; cursor: pointer; }
-.mode-btn.active { border-color: rgba(56, 189, 248, 0.72); color: #dbeafe; background: rgba(14, 116, 144, 0.32); }
-.content-grid { display: grid; gap: 16px; grid-template-columns: minmax(0, var(--main-col-width, 50%)) minmax(320px, calc(100% - var(--main-col-width, 50%))); align-items: start; }
-.timeline {
-  position: relative;
-  display: grid;
-  gap: 14px;
-  padding-left: 24px;
-}
-.timeline::before {
-  content: "";
-  position: absolute;
-  left: 10px;
-  top: 0;
-  width: 2px;
-  height: 100%;
-  background: linear-gradient(180deg, rgba(56, 189, 248, 0.6), rgba(34, 197, 94, 0.58));
-}
-.step-card {
-  position: relative;
-  padding: 0;
-  overflow: hidden;
-}
-.step-card::before {
-  content: "";
-  position: absolute;
-  left: -16px;
-  top: 19px;
-  width: 12px;
-  height: 12px;
-  border-radius: 999px;
-  background: linear-gradient(135deg, #67e8f9, #22c55e);
-  box-shadow: 0 0 0 4px rgba(103, 232, 249, 0.2);
-}
-.step-header {
-  border: 0;
-  width: 100%;
-  color: inherit;
-  text-align: left;
-  cursor: pointer;
-  background: linear-gradient(90deg, rgba(15, 23, 42, 0.92), rgba(15, 23, 42, 0.62));
-  padding: 12px 14px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-.step-head-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.step-index {
-  font-size: 12px;
-  color: #a5f3fc;
-  border: 1px solid rgba(125, 211, 252, 0.42);
-  border-radius: 999px;
-  padding: 3px 8px;
-  white-space: nowrap;
-}
-.step-steer {
-  font-size: 13px;
-  color: #dbeafe;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.step-right { display: flex; gap: 8px; align-items: center; }
-.stat-pill {
-  font-size: 11px;
-  color: #bfdbfe;
-  border: 1px solid rgba(148, 163, 184, 0.42);
-  border-radius: 999px;
-  padding: 2px 8px;
-  background: rgba(15, 23, 42, 0.62);
-}
-.step-chevron { color: #93c5fd; font-size: 13px; }
-.step-body { padding: 12px 14px 14px 14px; display: grid; gap: 12px; }
-.step-body.collapsed { display: none; }
-.cluster-grid { display: grid; gap: 7px; }
-.cluster-row {
-  border: 1px solid rgba(148, 163, 184, 0.3);
-  border-radius: 11px;
-  background: rgba(15, 23, 42, 0.56);
-  overflow: hidden;
-}
-.cluster-row[open] {
-  border-color: rgba(52, 211, 153, 0.72);
-  box-shadow: 0 0 0 1px rgba(52, 211, 153, 0.36) inset;
-}
-.cluster-row.top-cluster {
-  border-color: rgba(34, 197, 94, 0.9);
-  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.4) inset;
-}
-.cluster-row.top-cluster[open] {
-  border-color: rgba(148, 163, 184, 0.3);
-  box-shadow: none;
-}
-.cluster-row > summary {
-  list-style: none;
-  cursor: pointer;
-  padding: 8px 10px;
-  position: relative;
-  overflow: hidden;
-}
-.cluster-row > summary::before {
-  content: "";
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: var(--fill, 0%);
-  background: linear-gradient(90deg, rgba(56, 189, 248, 0.30), rgba(34, 197, 94, 0.28));
-  pointer-events: none;
-}
-.cluster-row > summary > * {
-  position: relative;
-  z-index: 1;
-}
-.cluster-row > summary::-webkit-details-marker { display: none; }
-.cluster-row > summary::marker { content: ""; }
-.cluster-row:hover { border-color: rgba(125, 211, 252, 0.62); }
-.cluster-row.top-cluster:hover { border-color: rgba(34, 197, 94, 0.95); }
-.cluster-row.top-cluster[open]:hover { border-color: rgba(125, 211, 252, 0.62); }
-.cluster-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 9px;
-  border: 1px solid rgba(34, 197, 94, 0.54);
-  border-radius: 8px;
-  padding: 4px 6px;
-}
-.cluster-name-wrap {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  min-width: 0;
-}
-.cluster-caret {
-  color: #a5f3fc;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-  font-size: 13px;
-  font-weight: 800;
-  flex: 0 0 auto;
-  transition: transform 120ms ease;
-}
-.cluster-row[open] .cluster-caret { transform: rotate(90deg); }
-.cluster-name {
-  font-size: 13px;
-  color: #dbeafe;
-  font-weight: 700;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.cluster-body {
-  display: grid;
-  gap: 8px;
-  padding: 8px 10px 10px 10px;
-}
-.cluster-tags { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-.cluster-count,
-.cluster-unique {
-  font-size: 11px;
-  border: 1px solid rgba(96, 165, 250, 0.46);
-  border-radius: 999px;
-  color: #93c5fd;
-  padding: 2px 7px;
-}
-.cluster-selected {
-  font-size: 11px;
-  border: 1px solid rgba(34, 197, 94, 0.66);
-  border-radius: 999px;
-  color: #86efac;
-  background: rgba(2, 44, 34, 0.6);
-  padding: 2px 7px;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-}
-.candidate-panel {
-  border: 1px solid rgba(148, 163, 184, 0.25);
-  border-radius: 12px;
-  background: rgba(2, 6, 23, 0.55);
-  padding: 9px 10px;
-  display: grid;
-  gap: 8px;
-}
-.candidate-panel.chosen {
-  border-color: rgba(34, 197, 94, 0.62);
-  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.34) inset;
-}
-.candidate-panel.selected {
-  border-color: rgba(34, 197, 94, 0.9);
-  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.44) inset;
-}
-.chosen-structure {
-  border: 1px dashed rgba(148, 163, 184, 0.36);
-  border-radius: 10px;
-  background: rgba(15, 23, 42, 0.48);
-  padding: 8px;
-  display: grid;
-  gap: 4px;
-}
-.chosen-tag {
-  color: #e2e8f0;
-  font-size: 12px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-}
-.chosen-token-strip {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.42;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-}
-.chosen-exec-strip.clamped {
-  max-height: calc(1.42em * 4);
-  overflow: hidden;
-}
-.chosen-exec-fallback {
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: #dbeafe;
-}
-.chosen-exec-fallback.clamped {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 4;
-  overflow: hidden;
-}
-.see-more-btn {
-  justify-self: start;
-  border: 1px solid rgba(148, 163, 184, 0.42);
-  border-radius: 8px;
-  background: rgba(2, 6, 23, 0.7);
-  color: #bfdbfe;
-  font-size: 11px;
-  padding: 2px 8px;
-  cursor: pointer;
-}
-.see-more-btn:hover {
-  border-color: rgba(125, 211, 252, 0.62);
-  color: #dbeafe;
-}
-.candidate-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.candidate-inline { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
-.candidate-inline-strip { flex: 1; min-width: 0; }
-.tag {
-  border: 1px solid rgba(148, 163, 184, 0.36);
-  border-radius: 999px;
-  color: #bfdbfe;
-  background: rgba(15, 23, 42, 0.73);
-  font-size: 11px;
-  padding: 2px 7px;
-}
-.token-strip {
-  display: block;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-}
-.token-chip {
-  display: inline;
-  border: 0;
-  padding: 0;
-  margin: 0;
-  border-radius: 0;
-  font-size: 12px;
-  font-family: inherit;
-  color: #0f172a;
-  cursor: pointer;
-}
-.exec-md {
-  margin-top: 7px;
-  color: #dbeafe;
-  font-size: 12px;
-  line-height: 1.45;
-}
-.exec-md pre {
-  margin: 6px 0;
-  overflow: auto;
-  background: rgba(2, 6, 23, 0.72);
-  border: 1px solid rgba(148, 163, 184, 0.24);
-  border-radius: 8px;
-  padding: 8px;
-}
-.exec-md code {
-  background: rgba(2, 6, 23, 0.62);
-  border-radius: 4px;
-  padding: 1px 4px;
-}
-.side-column { position: sticky; top: 16px; height: calc(100vh - 32px); overflow: hidden; display: grid; gap: 12px; grid-template-rows: auto minmax(0, 1fr); }
-.side-column [data-trajectory-panel] { min-height: 0; overflow: auto; }
-.trajectory-pre { margin: 0; white-space: pre-wrap; word-break: break-word; color: #dbeafe; font-size: 12px; line-height: 1.45; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
-.trajectory-pre.clamped { max-height: calc(1.45em * 4); overflow: hidden; }
-.tooltip {
-  position: fixed;
-  z-index: 2100;
-  min-width: 130px;
-  max-width: 190px;
-  pointer-events: none;
-  border-radius: 12px;
-  padding: 5px;
-  border: 1px solid rgba(125, 211, 252, 0.45);
-  background: rgba(2, 6, 23, 0.97);
-  color: #e2e8f0;
-  box-shadow: 0 16px 44px rgba(2, 6, 23, 0.58);
-}
-.tooltip.hidden { display: none; }
-.alt-grid { display: grid; gap: 5px; }
-.alt-row {
-  position: relative;
-  overflow: hidden;
-  display: grid;
-  grid-template-columns: 7px 1fr auto;
-  gap: 7px;
-  align-items: center;
-  font-size: 11px;
-  padding: 3px 6px;
-  border-radius: 6px;
-  background: rgba(15, 23, 42, 0.65);
-  border: 1px solid rgba(148, 163, 184, 0.2);
-}
-.alt-row::before {
-  content: "";
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: var(--fill, 0%);
-  background: linear-gradient(90deg, rgba(56, 189, 248, 0.28), rgba(34, 197, 94, 0.22));
-  pointer-events: none;
-}
-.alt-row.selected {
-  border-color: rgba(34, 197, 94, 0.9);
-  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.5) inset;
-}
-.alt-row > * {
-  position: relative;
-  z-index: 1;
-}
-.alt-swatch { width: 7px; height: 16px; border-radius: 3px; }
-.alt-token {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  color: #e2e8f0;
-}
-.alt-prob { color: #bfdbfe; font-variant-numeric: tabular-nums; }
-.hidden-note { font-size: 12px; color: #93c5fd; border: 1px dashed rgba(148, 163, 184, 0.34); border-radius: 9px; padding: 8px; }
-.hidden-block { display: none; }
-@media (max-width: 960px) {
-  main { padding: 16px 10px 16px 10px; }
-  .menu-toggle { top: 10px; left: 10px; width: 36px; height: 36px; }
-  .sidebar-panel { width: min(94vw, 360px); }
-  .content-grid { grid-template-columns: 1fr; }
-  .side-column { position: static; height: auto; max-height: none; overflow: visible; }
-  .timeline { padding-left: 18px; }
-  .timeline::before { left: 7px; }
-  .step-card::before { left: -12px; }
-  .step-steer { max-width: 44vw; }
-}
-</style>
-""".strip()
-
-SCRIPT_BLOCK = r"""
-<script>
-const dataNode = document.getElementById("report-data");
-const data = dataNode ? JSON.parse(dataNode.textContent || "{}") : {};
+const dataNode = document.getElementById("report-bundle-data");
+const rawBundle = dataNode ? JSON.parse(dataNode.textContent || "{}") : {};
 const byId = (id) => document.getElementById(id);
-const state = { expanded: {}, colorMode: "entropy", entropyMode: "95_5", mainColWidth: 50 };
-const clusterBubbleMax = Math.max(1, ...((data.step_views || []).map((step) => Number(step.cluster_count || 0))));
-const uniqueBubbleMax = Math.max(1, ...((data.step_views || []).map((step) => (step.clusters || []).reduce((sum, cluster) => sum + Number(cluster.unique_count || 0), 0))));
-const rolloutProbabilitySamples = sortedRolloutProbabilities(data.rollout_probabilities || []);
-const rolloutEntropySamples = (data.rollout_entropies || []).map((value) => Math.max(0, Number(value))).filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
+const normalizedBundle = normalizeBundle(rawBundle);
+const state = {
+  expandedByOutput: {},
+  selectedOutputId: defaultOutputId(normalizedBundle),
+  activeView: "home",
+  colorMode: "entropy",
+  entropyMode: "95_5",
+  mainColWidth: 50,
+};
+
+function normalizeBundle(bundle) {
+  const outputs = Array.isArray(bundle.outputs) ? bundle.outputs : [];
+  if (outputs.length > 0) return bundle;
+  if (bundle.step_views) {
+    return {
+      outputs: [
+        {
+          id: "default-output",
+          label: "Default Output",
+          prompt: String(((bundle.config || {}).prompt || "")),
+          run_dir: "",
+          report: bundle,
+        },
+      ],
+      algorithm_overview: "",
+    };
+  }
+  return { outputs: [], algorithm_overview: "" };
+}
+
+function defaultOutputId(bundle) {
+  const outputs = Array.isArray(bundle.outputs) ? bundle.outputs : [];
+  return outputs.length > 0 ? String(outputs[0].id || "default-output") : null;
+}
+
+function outputs() {
+  return Array.isArray(normalizedBundle.outputs) ? normalizedBundle.outputs : [];
+}
+
+function selectedOutput() {
+  const currentId = String(state.selectedOutputId || "");
+  const match = outputs().find((output) => String(output.id) === currentId);
+  if (match) return match;
+  return outputs()[0] || null;
+}
+
+function activeData() {
+  const output = selectedOutput();
+  return output ? (output.report || {}) : {};
+}
+
+function stepViews(data) {
+  return Array.isArray(data.step_views) ? data.step_views : [];
+}
+
+function expandedState() {
+  const output = selectedOutput();
+  const outputId = output ? String(output.id) : "__none__";
+  if (!state.expandedByOutput[outputId]) state.expandedByOutput[outputId] = {};
+  return state.expandedByOutput[outputId];
+}
+
+function rolloutProbabilitySamples(data) {
+  return sortedRolloutProbabilities(data.rollout_probabilities || []);
+}
+
+function rolloutEntropySamples(data) {
+  return (data.rollout_entropies || [])
+    .map((value) => Math.max(0, Number(value)))
+    .filter((value) => Number.isFinite(value))
+    .sort((left, right) => left - right);
+}
 function esc(value) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -448,16 +102,20 @@ function upperBound(sortedValues, target) {
 }
 
 function probabilityPercentile(probability) {
+  const samples = rolloutProbabilitySamples(activeData());
   const p = Math.max(0, Math.min(1, Number(probability || 0)));
-  if (!rolloutProbabilitySamples.length) return p;
-  const rank = upperBound(rolloutProbabilitySamples, p);
-  return Math.max(0, Math.min(1, rank / rolloutProbabilitySamples.length));
+  if (!samples.length) return p;
+  const rank = upperBound(samples, p);
+  return Math.max(0, Math.min(1, rank / samples.length));
 }
 function colorScore(probability, entropy) {
   if (state.colorMode === "none") return null;
   if (state.colorMode === "entropy") {
+    const entropySamples = rolloutEntropySamples(activeData());
     const entropyValue = Math.max(0, Number(entropy || 0));
-    const entropyPercentile = rolloutEntropySamples.length ? Math.max(0, Math.min(1, upperBound(rolloutEntropySamples, entropyValue) / rolloutEntropySamples.length)) : (entropyValue / (1 + entropyValue));
+    const entropyPercentile = entropySamples.length
+      ? Math.max(0, Math.min(1, upperBound(entropySamples, entropyValue) / entropySamples.length))
+      : (entropyValue / (1 + entropyValue));
     const entropyBinaryThresholds = { "80_20": 0.8, "90_10": 0.9, "95_5": 0.95 };
     const binaryCutoff = entropyBinaryThresholds[state.entropyMode];
     const yellowCutoffPercentile = 0.8;
@@ -533,18 +191,23 @@ function hideTooltip() {
 }
 
 function renderMeta() {
-  const cfg = data.config || {};
+  if (state.activeView !== "report") {
+    byId("meta").innerHTML = "";
+    return;
+  }
+  const reportData = activeData();
+  const cfg = reportData.config || {};
   document.documentElement.style.setProperty("--main-col-width", `${state.mainColWidth}%`);
   const pills = [
     `model: ${esc(cfg.model || "")}`,
     `mode: ${esc((cfg.api_mode_config || {}).default_mode || "")}`,
     `branch_factor: ${esc(cfg.branch_factor || "")}`,
-    `trajectory_tokens: ${esc(data.trajectory_token_count || 0)}`,
-    `cluster_mode: ${esc(data.cluster_mode || "")}`,
+    `trajectory_tokens: ${esc(reportData.trajectory_token_count || 0)}`,
+    `cluster_mode: ${esc(reportData.cluster_mode || "")}`,
   ];
   const modeButton = (value, label) => (`<button class="mode-btn${state.colorMode === value ? " active" : ""}" data-mode="${value}">${label}</button>`);
   const entropyModeButton = (value, label) => (`<button class="mode-btn${state.entropyMode === value ? " active" : ""}" data-entropy-mode="${value}">${label}</button>`);
-  const warnings = data.cluster_warnings || [];
+  const warnings = reportData.cluster_warnings || [];
   const warning = warnings.length ? `<div class="muted">cluster warning: ${esc(warnings.join(" | "))}</div>` : "";
   const entropySubmodeRow = state.colorMode === "entropy"
     ? `<div class="mode-row"><span class="muted">Entropy Style:</span>${entropyModeButton("continuous", "Continuous")}${entropyModeButton("80_20", "80/20")}${entropyModeButton("90_10", "90/10")}${entropyModeButton("95_5", "95/5")}</div>`
@@ -809,8 +472,9 @@ function buildCandidatePanel(entry, chosen) {
 }
 
 function ensureStepState(step) {
+  const expanded = expandedState();
   const key = String(step.step_index);
-  if (!(key in state.expanded)) state.expanded[key] = Number(step.step_index) === 0;
+  if (!(key in expanded)) expanded[key] = Number(step.step_index) === 0;
 }
 
 function uniqueCandidateCount(step) {
@@ -915,8 +579,19 @@ function renderClusterRows(step, container) {
 
 function buildStepCard(step) {
   ensureStepState(step);
+  const reportData = activeData();
+  const views = stepViews(reportData);
+  const clusterBubbleMax = Math.max(
+    1,
+    ...(views.map((view) => Number(view.cluster_count || 0)))
+  );
+  const uniqueBubbleMax = Math.max(
+    1,
+    ...(views.map((view) => (view.clusters || []).reduce((sum, cluster) => sum + Number(cluster.unique_count || 0), 0)))
+  );
+  const expanded = expandedState();
   const key = String(step.step_index);
-  const expanded = Boolean(state.expanded[key]);
+  const isExpanded = Boolean(expanded[key]);
   const card = document.createElement("section");
   card.className = "panel step-card";
   const stepNumber = Number(step.step_index) + 1;
@@ -932,16 +607,16 @@ function buildStepCard(step) {
     <div class="step-right">
       <span class="stat-pill" style="${clusterStyle}">${esc(step.cluster_count)} clusters</span>
       <span class="stat-pill" style="${uniqueStyle}">${esc(uniqueCandidateCount(step))} unique</span>
-      <span class="step-chevron">${expanded ? "▾" : "▸"}</span>
+      <span class="step-chevron">${isExpanded ? "▾" : "▸"}</span>
     </div>
   `;
   header.onclick = () => {
-    state.expanded[key] = !expanded;
+    expanded[key] = !isExpanded;
     renderTimeline();
   };
   card.appendChild(header);
   const body = document.createElement("div");
-  body.className = expanded ? "step-body" : "step-body collapsed";
+  body.className = isExpanded ? "step-body" : "step-body collapsed";
   const clusterHeader = document.createElement("h3");
   clusterHeader.textContent = "Candidate Clusters";
   body.appendChild(clusterHeader);
@@ -953,13 +628,21 @@ function buildStepCard(step) {
   return card;
 }
 
-function renderTimeline() { const timeline = byId("timeline"); timeline.innerHTML = ""; for (const step of (data.step_views || [])) timeline.appendChild(buildStepCard(step)); }
+function renderTimeline() {
+  const timeline = byId("timeline");
+  timeline.innerHTML = "";
+  if (state.activeView !== "report") return;
+  for (const step of stepViews(activeData())) timeline.appendChild(buildStepCard(step));
+}
 function renderFinalAnswer() {
   const panel = byId("final-answer");
-  const prompt = String(((data.config || {}).prompt || "")).trim();
-  const trajectory = String(data.final_text || "").trim();
-  const trajectoryTokens = Array.isArray(data.trajectory_tokens) ? data.trajectory_tokens : [];
-  const answer = String(data.final_answer_text || "").trim();
+  panel.innerHTML = "";
+  if (state.activeView !== "report") return;
+  const reportData = activeData();
+  const prompt = String(((reportData.config || {}).prompt || "")).trim();
+  const trajectory = String(reportData.final_text || "").trim();
+  const trajectoryTokens = Array.isArray(reportData.trajectory_tokens) ? reportData.trajectory_tokens : [];
+  const answer = String(reportData.final_answer_text || "").trim();
   panel.className = "side-column";
   panel.innerHTML = `<section class="panel hero"><h2>Prompt</h2><pre class="trajectory-pre clamped" data-prompt-text>${esc(prompt || "No prompt captured.")}</pre><button type="button" class="see-more-btn" data-prompt-toggle>+ see more</button></section><section class="panel hero" data-trajectory-panel><h2>Trajectory</h2></section><section class="panel hero" data-final-answer-panel><h2>Final Answer</h2></section>`;
   const promptText = panel.querySelector("[data-prompt-text]"); const promptToggle = panel.querySelector("[data-prompt-toggle]");
@@ -971,6 +654,72 @@ function renderFinalAnswer() {
   finalAnswerPanel.innerHTML += answer ? `<div class="exec-md">${markdownToHtml(answer)}</div>` : `<div class="muted">No final answer captured.</div>`;
 }
 function setSidebarOpen({ openButton, closeButton, sidebar, scrim, open, focusTarget }) { document.body.classList.toggle("sidebar-open", open); openButton.setAttribute("aria-expanded", open ? "true" : "false"); sidebar.setAttribute("aria-hidden", open ? "false" : "true"); scrim.setAttribute("aria-hidden", open ? "false" : "true"); if (focusTarget) focusTarget.focus({ preventScroll: true }); }
+
+function outputLabel(output) {
+  const prompt = String(output.prompt || "").trim();
+  if (prompt) return prompt;
+  const fallback = String(output.label || "").trim();
+  return fallback || "(no prompt)";
+}
+
+function renderSidebarOutputs() {
+  const container = byId("sidebar-output-list");
+  if (!container) return;
+  const currentId = String((selectedOutput() || {}).id || "");
+  const outputButtons = outputs().map((output) => {
+    const outputId = String(output.id || "");
+    const activeClass = state.activeView === "report" && outputId === currentId ? " active" : "";
+    return `<button type="button" class="sidebar-output-btn${activeClass}" data-select-output="${esc(outputId)}">${esc(outputLabel(output))}</button>`;
+  }).join("");
+  container.innerHTML = `<section class="meta-block"><h3>Outputs</h3><div class="output-list"><button type="button" class="sidebar-output-btn${state.activeView === "home" ? " active" : ""}" data-show-home>Home</button>${outputButtons || "<div class='muted'>No outputs found.</div>"}</div></section>`;
+  const homeButton = container.querySelector("[data-show-home]");
+  if (homeButton) homeButton.onclick = () => { state.activeView = "home"; renderApp(); };
+  for (const button of container.querySelectorAll("[data-select-output]")) {
+    button.onclick = () => {
+      const nextId = String(button.getAttribute("data-select-output") || "");
+      state.selectedOutputId = nextId;
+      state.activeView = "report";
+      renderApp();
+    };
+  }
+}
+
+function renderHome() {
+  const homePanel = byId("home-view");
+  const algorithmText = String(normalizedBundle.algorithm_overview || "").trim()
+    || "The analysis process branches steers, clusters candidate behavior, selects a trajectory, and tracks token-level uncertainty metrics.";
+  const cards = outputs().map((output) => {
+    const outputId = String(output.id || "");
+    const runDir = String(output.run_dir || "").trim();
+    return `<article class="panel home-output-card"><h2>${esc(outputLabel(output))}</h2><div class="muted">${esc(runDir || "run directory not captured")}</div><button type="button" class="mode-btn" data-open-output="${esc(outputId)}">Open output</button></article>`;
+  }).join("");
+  homePanel.innerHTML = `<h1>Steer Branching Explorer</h1><section class="meta-block"><h3>How generation works</h3><div class="muted">${esc(algorithmText)}</div><div class="muted">Use this app to compare candidate clusters, selected <exec> execution blocks, and uncertainty metrics across outputs.</div></section><section class="home-grid">${cards || "<div class='muted'>No outputs found in this bundle.</div>"}</section>`;
+  for (const button of homePanel.querySelectorAll("[data-open-output]")) {
+    button.onclick = () => {
+      state.selectedOutputId = String(button.getAttribute("data-open-output") || "");
+      state.activeView = "report";
+      renderApp();
+    };
+  }
+}
+
+function applyActiveView() {
+  const showHome = state.activeView === "home";
+  const homePanel = byId("home-view");
+  const reportPanel = byId("report-view");
+  if (homePanel) homePanel.classList.toggle("hidden-block", !showHome);
+  if (reportPanel) reportPanel.classList.toggle("hidden-block", showHome);
+}
+
+function renderApp() {
+  applyActiveView();
+  renderSidebarOutputs();
+  renderHome();
+  renderMeta();
+  renderTimeline();
+  renderFinalAnswer();
+}
+
 function initSidebar() {
   const openButton = document.querySelector("[data-sidebar-open]"); const closeButton = document.querySelector("[data-sidebar-close]"); const sidebar = document.querySelector(".sidebar-panel"); const scrim = byId("sidebar-scrim");
   if (!openButton || !closeButton || !sidebar || !scrim) return;
@@ -983,9 +732,8 @@ function initSidebar() {
 }
 function bootstrap() {
   initSidebar();
-  renderMeta();
-  renderTimeline();
-  renderFinalAnswer();
+  if (!outputs().length) state.activeView = "home";
+  renderApp();
 }
 try {
   bootstrap();
@@ -993,5 +741,3 @@ try {
   const message = (error && error.message) ? error.message : String(error);
   document.body.innerHTML = `<main><section class='panel hero'><h1>Report Render Error</h1><div class='muted'>${esc(message)}</div></section></main>`;
 }
-</script>
-""".strip()

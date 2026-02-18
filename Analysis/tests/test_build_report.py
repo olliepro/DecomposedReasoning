@@ -52,11 +52,13 @@ def test_build_report_from_run_dir(tmp_path: Path) -> None:
     write_jsonl(path=tmp_path / "steer_candidates.jsonl", rows=[])
     write_jsonl(path=tmp_path / "token_stats.jsonl", rows=[])
     write_json(path=tmp_path / "final_text.json", payload={"assistant_text": "ok"})
-    output_path = build_report(run_dir=tmp_path, output_path=None)
+    output_path = build_report(run_dirs=[tmp_path], output_path=None)
     assert output_path.exists()
     report_html = output_path.read_text(encoding="utf-8")
-    assert "id='report-data'" in report_html
-    assert "JSON.parse" in report_html
+    assert "id='report-bundle-data'" in report_html
+    assert "report_assets/app.js" in report_html
+    assert (tmp_path / "report_assets" / "app.js").exists()
+    assert (tmp_path / "report_assets" / "styles.css").exists()
 
 
 def test_build_report_with_missing_optional_jsonl(tmp_path: Path) -> None:
@@ -72,10 +74,10 @@ def test_build_report_with_missing_optional_jsonl(tmp_path: Path) -> None:
     )
     write_jsonl(path=tmp_path / "steps.jsonl", rows=[])
     write_json(path=tmp_path / "final_text.json", payload={"assistant_text": "ok"})
-    output_path = build_report(run_dir=tmp_path, output_path=None)
+    output_path = build_report(run_dirs=[tmp_path], output_path=None)
     assert output_path.exists()
     report_html = output_path.read_text(encoding="utf-8")
-    assert "id='report-data'" in report_html
+    assert "id='report-bundle-data'" in report_html
 
 
 def test_default_env_paths_prioritize_project_root_env(tmp_path: Path) -> None:
@@ -83,3 +85,31 @@ def test_default_env_paths_prioritize_project_root_env(tmp_path: Path) -> None:
     project_root = project_root_dir()
     paths = default_env_paths(run_dir=tmp_path)
     assert paths[0] == project_root / ".env"
+
+
+def test_build_report_bundles_multiple_run_outputs(tmp_path: Path) -> None:
+    """Bundled report should include multiple selectable outputs."""
+
+    run_one = tmp_path / "run_one"
+    run_two = tmp_path / "run_two"
+    run_one.mkdir()
+    run_two.mkdir()
+    for run_dir, prompt in ((run_one, "Prompt one"), (run_two, "Prompt two")):
+        write_json(
+            path=run_dir / "config.json",
+            payload={
+                "model": "m",
+                "prompt": prompt,
+                "api_mode_config": {"default_mode": "completions"},
+                "branch_factor": 100,
+                "seed": 0,
+            },
+        )
+        write_jsonl(path=run_dir / "steps.jsonl", rows=[])
+        write_json(path=run_dir / "final_text.json", payload={"assistant_text": "ok"})
+    output_path = build_report(
+        run_dirs=[run_one, run_two], output_path=tmp_path / "bundle.html"
+    )
+    html = output_path.read_text(encoding="utf-8")
+    assert "Prompt one" in html
+    assert "Prompt two" in html

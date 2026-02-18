@@ -260,7 +260,7 @@ def build_run_kwargs(*, args: argparse.Namespace, prompt: str) -> RunKwargs:
 
 
 def main() -> None:
-    """Run CLI pipeline and build static report.
+    """Run CLI pipeline and build report viewer.
 
     Args:
         None.
@@ -272,7 +272,7 @@ def main() -> None:
     config = build_run_config(args=args)
     artifacts = run_branching_analysis(config=config)
     report_path = build_report(
-        run_dir=artifacts.run_dir, output_path=artifacts.report_path
+        run_dirs=[artifacts.run_dir], output_path=artifacts.report_path
     )
     print(str(artifacts.run_dir))
     print(str(report_path))

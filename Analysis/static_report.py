@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Any
 
 from candidate_clustering import (
@@ -13,7 +15,6 @@ from candidate_clustering import (
     strip_steer_suffix,
     trailing_steer_suffix_span,
 )
-from report_ui_assets import SCRIPT_BLOCK, STYLE_BLOCK
 
 STEER_CLOSE_PATTERN = re.compile(r"</steer>", flags=re.IGNORECASE)
 THINK_CLOSE_PATTERN = re.compile(r"</think\s*>", flags=re.IGNORECASE)
@@ -1027,17 +1028,100 @@ def safe_json_for_html_script(*, payload: dict[str, Any]) -> str:
     return encoded.replace("\u2029", "\\u2029")
 
 
-def render_report_html(*, report_payload: dict[str, Any]) -> str:
-    """Render full static HTML report from payload.
+@dataclass(frozen=True)
+class ReportOutput:
+    """One selectable report output in the viewer bundle.
 
     Args:
-        report_payload: Serialized report payload.
+        output_id: Stable viewer id for this output.
+        prompt: Input prompt text for display.
+        run_dir: Source run directory path.
+        report_payload: Serialized report payload for one run.
 
     Returns:
-        Complete HTML string.
+        `ReportOutput` instance.
     """
 
-    payload_json = safe_json_for_html_script(payload=report_payload)
+    output_id: str
+    prompt: str
+    run_dir: str
+    report_payload: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize report output for the browser bundle.
+
+        Args:
+            None.
+
+        Returns:
+            JSON-safe mapping for one output entry.
+        """
+
+        prompt_text = self.prompt.strip()
+        prompt_label = prompt_text or "(no prompt)"
+        short_prompt = (
+            prompt_label if len(prompt_label) <= 96 else f"{prompt_label[:93]}..."
+        )
+        return {
+            "id": self.output_id,
+            "prompt": prompt_text,
+            "label": short_prompt,
+            "run_dir": self.run_dir,
+            "report": self.report_payload,
+        }
+
+
+def report_bundle_payload(*, outputs: list[ReportOutput]) -> dict[str, Any]:
+    """Build viewer bundle payload for one or more outputs.
+
+    Args:
+        outputs: Ordered report output entries.
+
+    Returns:
+        JSON payload consumed by the browser app.
+    """
+
+    return {
+        "outputs": [output.to_dict() for output in outputs],
+        "algorithm_overview": (
+            "Each run branches at every step, clusters candidate steers, chooses one "
+            "trajectory path, and tracks rollout token metrics for uncertainty analysis."
+        ),
+    }
+
+
+def render_report_html(
+    *,
+    report_bundle: dict[str, Any] | None = None,
+    report_payload: dict[str, Any] | None = None,
+) -> str:
+    """Render static viewer shell HTML with external CSS/JS assets.
+
+    Args:
+        report_bundle: Bundle payload for multiple outputs.
+        report_payload: Backward-compatible single output payload.
+
+    Returns:
+        Complete viewer HTML string.
+    """
+
+    if report_bundle is not None:
+        resolved_bundle = report_bundle
+    else:
+        assert (
+            report_payload is not None
+        ), "Expected `report_bundle` or `report_payload`."
+        resolved_bundle = report_bundle_payload(
+            outputs=[
+                ReportOutput(
+                    output_id="default-output",
+                    prompt=str((report_payload.get("config") or {}).get("prompt", "")),
+                    run_dir="",
+                    report_payload=report_payload,
+                )
+            ]
+        )
+    payload_json = safe_json_for_html_script(payload=resolved_bundle)
     return "\n".join(
         [
             "<!doctype html>",
@@ -1046,7 +1130,7 @@ def render_report_html(*, report_payload: dict[str, Any]) -> str:
             "<meta charset='utf-8'>",
             "<meta name='viewport' content='width=device-width, initial-scale=1'>",
             "<title>Steer Branching Explorer</title>",
-            STYLE_BLOCK,
+            "<link rel='stylesheet' href='report_assets/styles.css'>",
             "</head>",
             "<body>",
             "<main>",
@@ -1054,17 +1138,18 @@ def render_report_html(*, report_payload: dict[str, Any]) -> str:
             "<button type='button' class='menu-toggle' data-sidebar-open aria-expanded='false' aria-controls='report-sidebar' aria-label='Open menu'><span class='sidebar-hamb' aria-hidden='true'>&#9776;</span></button><button type='button' id='sidebar-scrim' class='sidebar-scrim' aria-hidden='true' aria-label='Close menu'></button>",
             "<aside id='report-sidebar' class='panel sidebar-panel' aria-hidden='true'>",
             "<section class='sidebar-header'><h2 class='sidebar-title'>Explorer Sidebar</h2><button type='button' class='sidebar-close' data-sidebar-close aria-label='Close menu'><span class='sidebar-close-icon' aria-hidden='true'>&#10005;</span></button></section>",
-            "<section class='sidebar-body'><h1>Steer Branching Explorer</h1>",
-            "<section class='meta-block'><h3>Report</h3><div class='muted'>This report follows the model's reasoning step by step: each chosen steer, the alternative modes of behavior considered at that step, and token-level metrics across the full generated trajectory. Use it to understand how the reasoning path evolved, where uncertainty spiked, the breadth of possible behaviors, and this structure's use in higher level analyses</div></section>",
+            "<section class='sidebar-body'><h1>Steer Branching Explorer</h1><div id='sidebar-output-list'></div>",
+            "<section class='meta-block'><h3>Report</h3><div class='muted'>Candidate Clusters show behavior modes for each step. Explore chosen <exec> blocks and token-level uncertainty across runs.</div></section>",
             "<div id='meta'></div>",
             "</section>",
             "</aside>",
-            "<section class='content-grid'><section id='final-answer' class='side-column'></section><section id='timeline' class='timeline'></section></section>",
+            "<section id='home-view' class='panel hero'></section>",
+            "<section id='report-view' class='hidden-block'><section class='content-grid'><section id='final-answer' class='side-column'></section><section id='timeline' class='timeline'></section></section></section>",
             "</section>",
             "</main>",
             "<div id='tooltip' class='tooltip hidden'></div>",
-            f"<script id='report-data' type='application/json'>{payload_json}</script>",
-            SCRIPT_BLOCK,
+            f"<script id='report-bundle-data' type='application/json'>{payload_json}</script>",
+            "<script src='report_assets/app.js'></script>",
             "</body>",
             "</html>",
         ]

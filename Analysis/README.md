@@ -1,6 +1,6 @@
 # Analysis
 
-Steer-aware branching sampler and static report builder for vLLM OpenAI-compatible serving.
+Steer-aware branching sampler and modular report viewer builder for vLLM OpenAI-compatible serving.
 
 ## Setup
 
@@ -26,12 +26,23 @@ Outputs are written under `output/<run_id>/`:
 - `token_stats.jsonl`
 - `report.html`
 - `final_text.json`
+- `report_assets/`
 
 ## Rebuild report from artifacts
 
 ```bash
 cd Analysis
 uv run python build_report.py --run-dir output/<run_id>
+```
+
+Bundle multiple outputs in one viewer:
+
+```bash
+cd Analysis
+uv run python build_report.py \
+  --run-dir output/<run_id_a> \
+  --run-dir output/<run_id_b> \
+  --output output/report_bundle.html
 ```
 
 To tune clustering behavior:
@@ -53,7 +64,9 @@ Clustering uses Gemini structured-output prompting on deduplicated steer strings
 When previous selected steps exist, up to 5 are included as context with `>>` separators.
 Prompt responses are cached by default at `<run_dir>/cluster_prompt_cache.json`.
 
-Interactive report behavior:
+Viewer behavior:
+- Home page explains the generation algorithm and lists available outputs.
+- Sidebar includes Home plus per-output selection named by input prompt.
 - Steps are collapsible and labeled with selected steer text.
 - Clusters are single-click selectable.
 - Chosen candidate is always visible.
