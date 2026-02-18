@@ -14,7 +14,7 @@ uv sync --extra dev
 ```bash
 cd Analysis
 uv run python run_steer_branching.py \
-  --model qwen3_8b_lora \
+  --model qwen3_8b_to_think \
   --prompt "Find all a which satisfy a^4 + a^3 + a^2 = 100" \
   --base-url http://127.0.0.1:8000/v1
 ```

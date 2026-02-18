@@ -1,4 +1,4 @@
-"""Minimal vLLM OpenAI-compatible client for chat and completions endpoints."""
+"""Minimal vLLM OpenAI-compatible client for completions and tokenization."""
 
 from __future__ import annotations
 
@@ -31,13 +31,16 @@ class ParsedToken:
 
 @dataclass(frozen=True)
 class GenerationChoice:
-    """One parsed generation choice from chat/completions endpoints.
+    """One parsed generation choice from `/v1/completions`.
 
     Args:
         index: Choice index.
         text: Generated text.
         finish_reason: Choice finish reason.
+        stop_reason: Stop reason returned by vLLM, when available.
         tokens: Parsed generated token details.
+        prompt_token_ids: Prompt token IDs used for this request.
+        token_ids: Output token IDs generated for this choice.
 
     Returns:
         Dataclass containing one choice output.
@@ -46,7 +49,10 @@ class GenerationChoice:
     index: int
     text: str
     finish_reason: str
+    stop_reason: int | str | None
     tokens: tuple[ParsedToken, ...]
+    prompt_token_ids: tuple[int, ...] | None
+    token_ids: tuple[int, ...] | None
 
 
 class VllmRequestError(RuntimeError):
@@ -61,7 +67,7 @@ class VllmClient:
         timeout_seconds: HTTP request timeout seconds.
 
     Returns:
-        Client used for chat/completions requests.
+        Client used for completions requests and tokenization.
 
     Example:
         >>> client = VllmClient(base_url="http://127.0.0.1:8000/v1")
@@ -72,12 +78,14 @@ class VllmClient:
     def __init__(self, *, base_url: str, timeout_seconds: float = 120.0) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.supports_prompt_token_ids: bool | None = None
 
     def completions(
         self,
         *,
         model: str,
-        prompt: str,
+        prompt: str | None,
+        prompt_token_ids: tuple[int, ...] | None,
         temperature: float,
         top_p: float,
         max_tokens: int,
@@ -90,7 +98,8 @@ class VllmClient:
 
         Args:
             model: Model name.
-            prompt: Prompt text.
+            prompt: Prompt text when prompting via text.
+            prompt_token_ids: Prompt token IDs when prompting via token space.
             temperature: Sampling temperature.
             top_p: Nucleus sampling value.
             max_tokens: Max generated tokens per choice.
@@ -105,6 +114,7 @@ class VllmClient:
         payload = build_completions_payload(
             model=model,
             prompt=prompt,
+            prompt_token_ids=prompt_token_ids,
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
@@ -116,51 +126,31 @@ class VllmClient:
         response_payload = self._post(path="/completions", payload=payload)
         return parse_completions_choices(response_payload=response_payload)
 
-    def chat(
+    def tokenize(
         self,
         *,
         model: str,
-        messages: list[dict[str, Any]],
-        temperature: float,
-        top_p: float,
-        max_tokens: int,
-        n: int,
-        seed: int,
-        stop: tuple[str, ...] | None,
-        top_logprobs: int,
-        template_fields: dict[str, Any],
-    ) -> tuple[GenerationChoice, ...]:
-        """Call `/v1/chat/completions` and parse choices.
+        text: str,
+        add_special_tokens: bool = False,
+    ) -> tuple[int, ...]:
+        """Tokenize one text fragment with vLLM server tokenizer.
 
         Args:
             model: Model name.
-            messages: OpenAI-format message list.
-            temperature: Sampling temperature.
-            top_p: Nucleus sampling value.
-            max_tokens: Max generated tokens per choice.
-            n: Number of choices.
-            seed: Seed value.
-            stop: Optional stop markers.
-            top_logprobs: Top alternatives count.
-            template_fields: Extra chat-template fields.
+            text: Text fragment to tokenize.
+            add_special_tokens: Whether tokenizer should add special tokens.
 
         Returns:
-            Parsed generation choices.
+            Token IDs for the fragment.
         """
-        payload = build_chat_payload(
+        payload = build_tokenize_payload(
             model=model,
-            messages=messages,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            n=n,
-            seed=seed,
-            stop=stop,
-            top_logprobs=top_logprobs,
-            template_fields=template_fields,
+            text=text,
+            add_special_tokens=add_special_tokens,
         )
-        response_payload = self._post(path="/chat/completions", payload=payload)
-        return parse_chat_choices(response_payload=response_payload)
+        response_payload = self._post_root(path="/tokenize", payload=payload)
+        token_ids = parse_tokenize_ids(response_payload=response_payload)
+        return token_ids
 
     def _post(self, *, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Execute JSON POST request and parse JSON response.
@@ -173,9 +163,39 @@ class VllmClient:
             Parsed JSON payload.
         """
         url = self.base_url + path
+        return self._post_url(url=url, payload=payload)
+
+    def _post_root(self, *, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Execute JSON POST request against server root instead of base-url endpoint.
+
+        Args:
+            path: API path relative to server root.
+            payload: JSON payload.
+
+        Returns:
+            Parsed JSON payload.
+        """
+        root_url = self.base_url
+        if root_url.endswith("/v1"):
+            root_url = root_url[:-3]
+        url = root_url + path
+        return self._post_url(url=url, payload=payload)
+
+    def _post_url(self, *, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Execute JSON POST request to an explicit URL and parse response.
+
+        Args:
+            url: Absolute request URL.
+            payload: JSON payload.
+
+        Returns:
+            Parsed JSON payload.
+        """
         body = json.dumps(payload).encode("utf-8")
         request = urllib_request.Request(
-            url=url, data=body, headers={"Content-Type": "application/json"}
+            url=url,
+            data=body,
+            headers={"Content-Type": "application/json"},
         )
         try:
             with urllib_request.urlopen(
@@ -195,7 +215,8 @@ class VllmClient:
 def build_completions_payload(
     *,
     model: str,
-    prompt: str,
+    prompt: str | None,
+    prompt_token_ids: tuple[int, ...] | None,
     temperature: float,
     top_p: float,
     max_tokens: int,
@@ -208,7 +229,8 @@ def build_completions_payload(
 
     Args:
         model: Model name.
-        prompt: Prompt text.
+        prompt: Prompt text when using text prompting.
+        prompt_token_ids: Prompt IDs when using token-space prompting.
         temperature: Sampling temperature.
         top_p: Nucleus sampling value.
         max_tokens: Max generated tokens.
@@ -220,68 +242,54 @@ def build_completions_payload(
     Returns:
         JSON-ready request payload.
     """
+    has_prompt_text = prompt is not None
+    has_prompt_ids = prompt_token_ids is not None
+    assert (
+        has_prompt_text != has_prompt_ids
+    ), "provide exactly one prompt representation"
     payload: dict[str, Any] = {
         "model": model,
-        "prompt": prompt,
         "temperature": temperature,
         "top_p": top_p,
         "max_tokens": max_tokens,
         "n": n,
         "seed": seed,
+        "return_token_ids": True,
     }
+    if prompt is not None:
+        payload["prompt"] = prompt
+    if prompt_token_ids is not None:
+        # vLLM legacy `/v1/completions` accepts token prompts through `prompt`.
+        payload["prompt"] = list(prompt_token_ids)
     if top_logprobs > 0:
         payload["logprobs"] = top_logprobs
     if stop is not None:
         payload["stop"] = list(stop)
+        payload["include_stop_str_in_output"] = True
     return payload
 
 
-def build_chat_payload(
+def build_tokenize_payload(
     *,
     model: str,
-    messages: list[dict[str, Any]],
-    temperature: float,
-    top_p: float,
-    max_tokens: int,
-    n: int,
-    seed: int,
-    stop: tuple[str, ...] | None,
-    top_logprobs: int,
-    template_fields: dict[str, Any],
+    text: str,
+    add_special_tokens: bool,
 ) -> dict[str, Any]:
-    """Build payload for `/v1/chat/completions`.
+    """Build payload for `/tokenize`.
 
     Args:
         model: Model name.
-        messages: OpenAI-style message list.
-        temperature: Sampling temperature.
-        top_p: Nucleus sampling value.
-        max_tokens: Max generated tokens.
-        n: Number of choices.
-        seed: Seed value.
-        stop: Optional stop markers.
-        top_logprobs: Top alternatives count.
-        template_fields: Extra chat-template request fields.
+        text: Text to tokenize.
+        add_special_tokens: Whether special tokens should be added.
 
     Returns:
         JSON-ready request payload.
     """
-    payload: dict[str, Any] = {
+    return {
         "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "top_p": top_p,
-        "max_tokens": max_tokens,
-        "n": n,
-        "seed": seed,
+        "prompt": text,
+        "add_special_tokens": add_special_tokens,
     }
-    payload.update(template_fields)
-    if top_logprobs > 0:
-        payload["logprobs"] = True
-        payload["top_logprobs"] = top_logprobs
-    if stop is not None:
-        payload["stop"] = list(stop)
-    return payload
 
 
 def parse_completions_choices(
@@ -296,26 +304,31 @@ def parse_completions_choices(
         Parsed generation choices.
     """
     raw_choices = _require_choices(response_payload=response_payload)
+    prompt_ids = _parse_token_ids(raw_value=response_payload.get("prompt_token_ids"))
     parsed_choices = [
-        _parse_one_completion_choice(choice=choice) for choice in raw_choices
+        _parse_one_completion_choice(
+            choice=choice,
+            fallback_prompt_token_ids=prompt_ids,
+        )
+        for choice in raw_choices
     ]
     return tuple(parsed_choices)
 
 
-def parse_chat_choices(
-    *, response_payload: dict[str, Any]
-) -> tuple[GenerationChoice, ...]:
-    """Parse chat choices from response payload.
+def parse_tokenize_ids(*, response_payload: dict[str, Any]) -> tuple[int, ...]:
+    """Parse token IDs from `/tokenize` response payload.
 
     Args:
-        response_payload: JSON payload from `/v1/chat/completions`.
+        response_payload: JSON payload from `/tokenize`.
 
     Returns:
-        Parsed generation choices.
+        Parsed token ID tuple.
     """
-    raw_choices = _require_choices(response_payload=response_payload)
-    parsed_choices = [_parse_one_chat_choice(choice=choice) for choice in raw_choices]
-    return tuple(parsed_choices)
+    for key in ("token_ids", "tokens", "ids"):
+        parsed = _parse_token_ids(raw_value=response_payload.get(key))
+        if parsed is not None:
+            return parsed
+    raise AssertionError("tokenize response missing token IDs")
 
 
 def _require_choices(*, response_payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -332,11 +345,16 @@ def _require_choices(*, response_payload: dict[str, Any]) -> list[dict[str, Any]
     return [choice for choice in choices if isinstance(choice, dict)]
 
 
-def _parse_one_completion_choice(*, choice: dict[str, Any]) -> GenerationChoice:
+def _parse_one_completion_choice(
+    *,
+    choice: dict[str, Any],
+    fallback_prompt_token_ids: tuple[int, ...] | None,
+) -> GenerationChoice:
     """Parse one completion choice.
 
     Args:
         choice: One choice payload from `/v1/completions`.
+        fallback_prompt_token_ids: Request-level prompt IDs when provided.
 
     Returns:
         Parsed generation choice.
@@ -347,37 +365,80 @@ def _parse_one_completion_choice(*, choice: dict[str, Any]) -> GenerationChoice:
         if isinstance(logprobs_candidate, dict)
         else {}
     )
+    stop_reason = _parse_stop_reason(raw_value=choice.get("stop_reason"))
+    prompt_token_ids = _parse_token_ids(raw_value=choice.get("prompt_token_ids"))
+    if prompt_token_ids is None:
+        prompt_token_ids = fallback_prompt_token_ids
+    token_ids = _parse_choice_token_ids(choice=choice)
     tokens = _parse_completion_tokens(raw_logprobs=raw_logprobs)
     text = str(choice.get("text", ""))
     finish_reason = str(choice.get("finish_reason", "unknown"))
     index = int(choice.get("index", 0))
     return GenerationChoice(
-        index=index, text=text, finish_reason=finish_reason, tokens=tokens
+        index=index,
+        text=text,
+        finish_reason=finish_reason,
+        stop_reason=stop_reason,
+        tokens=tokens,
+        prompt_token_ids=prompt_token_ids,
+        token_ids=token_ids,
     )
 
 
-def _parse_one_chat_choice(*, choice: dict[str, Any]) -> GenerationChoice:
-    """Parse one chat completion choice.
+def _parse_choice_token_ids(*, choice: dict[str, Any]) -> tuple[int, ...] | None:
+    """Parse generated token IDs from one completion choice payload.
 
     Args:
-        choice: One choice payload from `/v1/chat/completions`.
+        choice: Choice payload from `/v1/completions`.
 
     Returns:
-        Parsed generation choice.
+        Output token IDs, when available.
     """
-    message_candidate = choice.get("message")
-    message = (
-        cast(dict[str, Any], message_candidate)
-        if isinstance(message_candidate, dict)
-        else {}
-    )
-    text = str(message.get("content", ""))
-    finish_reason = str(choice.get("finish_reason", "unknown"))
-    index = int(choice.get("index", 0))
-    tokens = _parse_chat_tokens(choice=choice)
-    return GenerationChoice(
-        index=index, text=text, finish_reason=finish_reason, tokens=tokens
-    )
+    for key in ("token_ids", "output_token_ids"):
+        parsed = _parse_token_ids(raw_value=choice.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_stop_reason(*, raw_value: object) -> int | str | None:
+    """Parse stop-reason field from completion choice payload.
+
+    Args:
+        raw_value: Raw stop-reason value.
+
+    Returns:
+        Parsed stop reason as `int`, `str`, or `None`.
+    """
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, (int, str)):
+        return raw_value
+    return str(raw_value)
+
+
+def _parse_token_ids(*, raw_value: object) -> tuple[int, ...] | None:
+    """Parse token ID arrays from possibly nested payload shapes.
+
+    Args:
+        raw_value: Raw JSON field candidate.
+
+    Returns:
+        Parsed token IDs, or `None` when unavailable.
+    """
+    if isinstance(raw_value, list) and raw_value and isinstance(raw_value[0], list):
+        inner = raw_value[0]
+        if not isinstance(inner, list):
+            return None
+        return _parse_token_ids(raw_value=inner)
+    if not isinstance(raw_value, list):
+        return None
+    token_ids: list[int] = []
+    for item in raw_value:
+        if not isinstance(item, (int, float, str)):
+            return None
+        token_ids.append(int(item))
+    return tuple(token_ids)
 
 
 def _parse_completion_tokens(
@@ -405,50 +466,18 @@ def _parse_completion_tokens(
     parsed_tokens: list[ParsedToken] = []
     for token_index, token in enumerate(raw_tokens):
         logprob = _logprob_at(
-            raw_token_logprobs=raw_token_logprobs, token_index=token_index
+            raw_token_logprobs=raw_token_logprobs,
+            token_index=token_index,
         )
         top_entries = canonicalize_top_logprobs(
             raw_top_logprobs=_at(raw_list=raw_top_logprobs, token_index=token_index)
         )
         parsed_tokens.append(
             ParsedToken(
-                token=str(token), logprob=logprob, top_entries=tuple(top_entries)
+                token=str(token),
+                logprob=logprob,
+                top_entries=tuple(top_entries),
             )
-        )
-    return tuple(parsed_tokens)
-
-
-def _parse_chat_tokens(*, choice: dict[str, Any]) -> tuple[ParsedToken, ...]:
-    """Parse token records from chat logprob payload shape.
-
-    Args:
-        choice: Choice payload from `/v1/chat/completions`.
-
-    Returns:
-        Parsed token sequence.
-    """
-    logprobs_candidate = choice.get("logprobs")
-    logprobs_payload = (
-        cast(dict[str, Any], logprobs_candidate)
-        if isinstance(logprobs_candidate, dict)
-        else {}
-    )
-    content_items = (
-        logprobs_payload.get("content", [])
-        if isinstance(logprobs_payload.get("content"), list)
-        else []
-    )
-    parsed_tokens: list[ParsedToken] = []
-    for item in content_items:
-        if not isinstance(item, dict):
-            continue
-        token = str(item.get("token", ""))
-        logprob = float(item.get("logprob", -1e9))
-        top_entries = canonicalize_top_logprobs(
-            raw_top_logprobs=item.get("top_logprobs")
-        )
-        parsed_tokens.append(
-            ParsedToken(token=token, logprob=logprob, top_entries=tuple(top_entries))
         )
     return tuple(parsed_tokens)
 
@@ -486,16 +515,3 @@ def _at(*, raw_list: list[object], token_index: int) -> object | None:
     if token_index < 0 or token_index >= len(raw_list):
         return None
     return raw_list[token_index]
-
-
-def is_chat_template_error(*, error_text: str) -> bool:
-    """Detect template-related chat API errors for fallback decisions.
-
-    Args:
-        error_text: Error response body text.
-
-    Returns:
-        `True` when error appears template-related.
-    """
-    lowered = error_text.lower()
-    return "template" in lowered and "chat" in lowered

@@ -2,81 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-ApiMode = Literal["completions", "chat"]
 SelectionPolicy = Literal["random"]
-ContentFormat = Literal["string", "openai"]
-
-
-@dataclass(frozen=True)
-class ApiModeConfig:
-    """API mode and capability guards.
-
-    Args:
-        default_mode: Primary endpoint mode used for requests.
-        allow_fallback: Enables fallback from chat to completions mode.
-        max_server_logprobs: Upper bound enforced for requested top logprobs.
-
-    Returns:
-        Dataclass storing API behavior controls.
-    """
-
-    default_mode: ApiMode = "completions"
-    allow_fallback: bool = True
-    max_server_logprobs: int = 20
-
-    def capped_top_logprobs(self, *, requested_top_logprobs: int) -> int:
-        """Cap requested top-logprob count to server limits.
-
-        Args:
-            requested_top_logprobs: Requested number of alternatives per token.
-
-        Returns:
-            Effective top-logprob count after capping.
-        """
-        assert requested_top_logprobs >= 0, "requested_top_logprobs must be >= 0"
-        return min(requested_top_logprobs, self.max_server_logprobs)
-
-
-@dataclass(frozen=True)
-class TemplateConfig:
-    """Prompt-template controls for chat and completions request modes.
-
-    Args:
-        use_raw_im_template: Uses raw `<|im_start|>` prompt strings in completions.
-        add_generation_prompt: Requests server-side generation prompt for chat mode.
-        continue_final_message: Continue final assistant message in chat mode.
-        chat_template: Optional explicit template string.
-        chat_template_kwargs: Optional server template kwargs.
-        content_format: Chat content format (`string` or `openai`).
-
-    Returns:
-        Dataclass storing prompt templating controls.
-    """
-
-    use_raw_im_template: bool = True
-    add_generation_prompt: bool = True
-    continue_final_message: bool = False
-    chat_template: str | None = None
-    chat_template_kwargs: dict[str, object] = field(default_factory=dict)
-    content_format: ContentFormat = "string"
-
-    def validate(self) -> None:
-        """Validate mutually exclusive chat templating options.
-
-        Args:
-            None.
-
-        Returns:
-            None.
-        """
-        invalid_combo = self.add_generation_prompt and self.continue_final_message
-        assert (
-            not invalid_combo
-        ), "add_generation_prompt and continue_final_message conflict"
 
 
 @dataclass(frozen=True)
@@ -88,8 +18,6 @@ class RunConfig:
         model: Model identifier passed to vLLM.
         prompt: User prompt content.
         output_root: Directory where `run_id` output is written.
-        api_mode_config: Endpoint mode and capability settings.
-        template_config: Prompt-template behavior.
         temperature: Sampling temperature.
         top_p: Nucleus sampling value.
         max_total_tokens: Aggregate generation budget for run.
@@ -99,25 +27,23 @@ class RunConfig:
         max_steer_tokens: Max tokens sampled per steer candidate.
         max_steps: Max number of branch events.
         top_logprobs: Requested top alternatives per generated token.
+        max_server_logprobs: Server upper bound for top-logprob requests.
         seed: RNG seed for reproducibility.
         rollout_chunk_tokens: Tokens per rollout chunk before rescanning tags.
-        boundary_pattern: Regex marking branch boundary.
 
     Returns:
         Dataclass storing one end-to-end run configuration.
 
     Example:
         >>> cfg = RunConfig(base_url="http://127.0.0.1:8000/v1", model="m", prompt="p")
-        >>> cfg.branch_factor
-        100
+        >>> cfg.rollout_chunk_tokens
+        512
     """
 
     base_url: str
     model: str
     prompt: str
     output_root: Path = Path("output")
-    api_mode_config: ApiModeConfig = ApiModeConfig()
-    template_config: TemplateConfig = TemplateConfig()
     temperature: float = 0.6
     top_p: float = 0.95
     max_total_tokens: int = 32768
@@ -127,9 +53,9 @@ class RunConfig:
     max_steer_tokens: int = 15
     max_steps: int = 100
     top_logprobs: int = 20
+    max_server_logprobs: int = 20
     seed: int = 0
-    rollout_chunk_tokens: int = 256
-    boundary_pattern: str = r"<steer\b[^>]*>"
+    rollout_chunk_tokens: int = 512
 
     def validate(self) -> None:
         """Validate configuration values.
@@ -143,14 +69,16 @@ class RunConfig:
         assert self.base_url.strip(), "base_url must be non-empty"
         assert self.model.strip(), "model must be non-empty"
         assert self.prompt.strip(), "prompt must be non-empty"
-        assert 0.0 <= self.temperature, "temperature must be >= 0"
+        assert self.temperature >= 0.0, "temperature must be >= 0"
         assert 0.0 < self.top_p <= 1.0, "top_p must be in (0, 1]"
         assert self.max_total_tokens >= 1, "max_total_tokens must be >= 1"
         assert self.branch_factor >= 1, "branch_factor must be >= 1"
         assert self.n_keep == 1, "current implementation requires n_keep == 1"
         assert self.max_steer_tokens >= 1, "max_steer_tokens must be >= 1"
         assert self.max_steps >= 1, "max_steps must be >= 1"
-        self.template_config.validate()
+        assert self.top_logprobs >= 0, "top_logprobs must be >= 0"
+        assert self.max_server_logprobs >= 0, "max_server_logprobs must be >= 0"
+        assert self.rollout_chunk_tokens >= 1, "rollout_chunk_tokens must be >= 1"
 
     def capped_top_logprobs(self) -> int:
         """Resolve effective top-logprob request.
@@ -161,9 +89,7 @@ class RunConfig:
         Returns:
             Capped top-logprob request.
         """
-        return self.api_mode_config.capped_top_logprobs(
-            requested_top_logprobs=self.top_logprobs
-        )
+        return min(self.top_logprobs, self.max_server_logprobs)
 
 
 @dataclass(frozen=True)
@@ -342,6 +268,7 @@ class RunArtifactsIndex:
         steps_path: Step metadata JSONL path.
         candidates_path: Candidate metadata JSONL path.
         token_stats_path: Token statistics JSONL path.
+        chosen_path_log_path: Decoded chosen-path snapshot log path.
         report_path: Static HTML report path.
 
     Returns:
@@ -354,6 +281,7 @@ class RunArtifactsIndex:
     steps_path: Path
     candidates_path: Path
     token_stats_path: Path
+    chosen_path_log_path: Path
     report_path: Path
 
     def as_dict(self) -> dict[str, str]:
@@ -372,5 +300,6 @@ class RunArtifactsIndex:
             "steps_path": str(self.steps_path),
             "candidates_path": str(self.candidates_path),
             "token_stats_path": str(self.token_stats_path),
+            "chosen_path_log_path": str(self.chosen_path_log_path),
             "report_path": str(self.report_path),
         }

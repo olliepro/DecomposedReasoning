@@ -41,6 +41,7 @@ def build_artifacts_index(*, output_root: Path, run_id: str) -> RunArtifactsInde
         steps_path=run_dir / "steps.jsonl",
         candidates_path=run_dir / "steer_candidates.jsonl",
         token_stats_path=run_dir / "token_stats.jsonl",
+        chosen_path_log_path=run_dir / "chosen_path.log",
         report_path=run_dir / "report.html",
     )
 
@@ -86,6 +87,21 @@ def append_jsonl(*, path: Path, payload: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False))
         handle.write("\n")
+
+
+def append_text(*, path: Path, content: str) -> None:
+    """Append plain text content to a file.
+
+    Args:
+        path: Output text path.
+        content: Text content to append.
+
+    Returns:
+        None.
+    """
+    ensure_parent_dir(path=path)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(content)
 
 
 def read_json(*, path: Path) -> dict[str, Any]:

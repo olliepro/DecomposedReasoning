@@ -200,7 +200,7 @@ function renderMeta() {
   document.documentElement.style.setProperty("--main-col-width", `${state.mainColWidth}%`);
   const pills = [
     `model: ${esc(cfg.model || "")}`,
-    `mode: ${esc((cfg.api_mode_config || {}).default_mode || "")}`,
+    `mode: ${esc(cfg.mode || "completions")}`,
     `branch_factor: ${esc(cfg.branch_factor || "")}`,
     `trajectory_tokens: ${esc(reportData.trajectory_token_count || 0)}`,
     `cluster_mode: ${esc(reportData.cluster_mode || "")}`,
