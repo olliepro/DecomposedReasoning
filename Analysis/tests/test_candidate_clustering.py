@@ -33,18 +33,33 @@ def test_build_cluster_prompt_previous_context_behavior() -> None:
 
     items = (DedupItem(item_id=1, text="Try substitution", count=3),)
     with_context = build_cluster_prompt(
-        previous_count=2,
-        previous_chain="Factor >> Substitute",
+        previous_selected_count=2,
+        previous_selected_chain="Factor >> Substitute",
+        previous_execution_tail="check units and multiply by 3600",
         items=items,
     )
     without_context = build_cluster_prompt(
-        previous_count=0,
-        previous_chain="",
+        previous_selected_count=0,
+        previous_selected_chain="",
+        previous_execution_tail="",
         items=items,
     )
     assert "Current step index" not in with_context
-    assert "Previous 2 selected steps: Factor >> Substitute" in with_context
-    assert "Previous 0 selected steps" not in without_context
+    assert "## Rules" in with_context
+    assert "## Context on the current process" in with_context
+    assert "## Options to group:" in with_context
+    assert "Previous 2 selected steps:" in with_context
+    assert "- Factor" in with_context
+    assert "  >> Substitute" in with_context
+    assert (
+        'The last few words of the previous step\'s execution are:\n'
+        '"check units and multiply by 3600"'
+    ) in with_context
+    assert "## Context on the current process" not in without_context
+    assert (
+        "The last few words of the previous step's execution are:"
+        not in without_context
+    )
 
 
 def test_coerce_assignments_fills_missing_with_other() -> None:

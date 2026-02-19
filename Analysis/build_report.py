@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -147,6 +149,70 @@ def project_root_dir() -> Path:
     """
 
     return Path(__file__).resolve().parent.parent
+
+
+def normalize_prompt_key(*, prompt: str) -> str:
+    """Normalize prompt text key used for title lookup.
+
+    Args:
+        prompt: Raw prompt string.
+
+    Returns:
+        Prompt with collapsed internal whitespace.
+
+    Example:
+        >>> normalize_prompt_key(prompt="  hello   world  ")
+        'hello world'
+    """
+
+    return " ".join(str(prompt).split())
+
+
+def default_prompt_titles_path() -> Path:
+    """Resolve bundled default prompt-title mapping file path.
+
+    Returns:
+        Absolute path to `Analysis/default_prompts.json`.
+    """
+
+    return (Path(__file__).resolve().parent / "default_prompts.json").resolve()
+
+
+def load_prompt_titles(*, path: Path | None = None) -> dict[str, str]:
+    """Load normalized prompt-title mapping for report sidebar/home labels.
+
+    Args:
+        path: Optional JSON mapping path; defaults to `default_prompts.json`.
+
+    Returns:
+        Mapping from normalized prompt text to title text.
+
+    Example:
+        >>> mapping = load_prompt_titles(path=Path("missing.json"))
+        >>> mapping["hello"]
+        'Hello World'
+    """
+
+    resolved_path = path or default_prompt_titles_path()
+    titles: dict[str, str] = {}
+    if resolved_path.exists():
+        raw = json.loads(resolved_path.read_text(encoding="utf-8"))
+        if isinstance(raw, list):
+            for row in raw:
+                if not isinstance(row, dict):
+                    continue
+                prompt = normalize_prompt_key(prompt=str(row.get("prompt", "")))
+                title = str(row.get("title", "")).strip()
+                if prompt and title:
+                    titles[prompt] = title
+        elif isinstance(raw, dict):
+            for prompt_value, title_value in raw.items():
+                prompt = normalize_prompt_key(prompt=str(prompt_value))
+                title = str(title_value).strip()
+                if prompt and title:
+                    titles[prompt] = title
+    titles[normalize_prompt_key(prompt="hello")] = "Hello World"
+    return titles
 
 
 def default_env_paths(*, run_dir: Path) -> tuple[Path, ...]:
@@ -358,6 +424,7 @@ def build_report_payload_for_run(
         candidates=candidates,
         config=cluster_config,
         steps=steps,
+        final_text=final_text,
     )
     return build_report_payload(
         config=config,
@@ -478,6 +545,76 @@ def copy_report_assets(*, output_path: Path) -> None:
         shutil.copy2(source_dir / filename, destination_dir / filename)
 
 
+def safe_output_stem(*, output_id: str, index: int) -> str:
+    """Create a filesystem-safe file stem for one bundled output.
+
+    Args:
+        output_id: Viewer output id.
+        index: Zero-based output index used as fallback.
+
+    Returns:
+        Safe output stem containing only `[A-Za-z0-9._-]`.
+    """
+
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", output_id).strip("-")
+    if cleaned:
+        return cleaned
+    return f"output-{int(index) + 1}"
+
+
+def split_bundle_reports(*, parent_dir: Path, bundle: dict[str, Any]) -> dict[str, Any]:
+    """Write per-output report payload files and return lightweight manifest.
+
+    Args:
+        parent_dir: Directory containing `report.html`.
+        bundle: Full report bundle containing output report payloads.
+
+    Returns:
+        Manifest bundle with `report_file` per output and empty inline reports.
+    """
+
+    raw_outputs = bundle.get("outputs")
+    outputs = raw_outputs if isinstance(raw_outputs, list) else []
+    output_dir = parent_dir / "report_outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_outputs: list[dict[str, Any]] = []
+    for index, raw_output in enumerate(outputs):
+        if not isinstance(raw_output, dict):
+            continue
+        output_id = str(raw_output.get("id", ""))
+        report_payload = raw_output.get("report")
+        report = report_payload if isinstance(report_payload, dict) else {}
+        stem = safe_output_stem(output_id=output_id, index=index)
+        filename = f"{stem}.json"
+        report_path = output_dir / filename
+        report_path.write_text(
+            json.dumps(report, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        manifest_outputs.append(
+            {
+                **raw_output,
+                "report": {},
+                "report_file": f"report_outputs/{filename}",
+            }
+        )
+
+    return {
+        "outputs": manifest_outputs,
+        "algorithm_overview": str(bundle.get("algorithm_overview", "")),
+        "prompt_titles": (
+            {
+                str(normalize_prompt_key(prompt=str(key))): str(value)
+                for key, value in bundle.get("prompt_titles", {}).items()
+                if str(value).strip()
+            }
+            if isinstance(bundle.get("prompt_titles"), dict)
+            else {}
+        ),
+    }
+
+
 def build_report(
     *,
     run_dirs: list[Path],
@@ -527,9 +664,24 @@ def build_report(
         env_files=env_files or [],
     )
     bundle = report_bundle_payload(outputs=outputs)
-    report_html = render_report_html(report_bundle=bundle)
+    bundle["prompt_titles"] = load_prompt_titles()
+
+    # Resolve output paths
     resolved_output = output_path or (resolved_run_dirs[0] / "report.html")
+    parent_dir = resolved_output.parent
+    parent_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_bundle = split_bundle_reports(parent_dir=parent_dir, bundle=bundle)
+
+    # Write lightweight manifest file
+    data_path = parent_dir / "report_data.json"
+    with open(data_path, "w", encoding="utf-8") as f:
+        json.dump(manifest_bundle, f, separators=(",", ":"), ensure_ascii=False)
+
+    # Write HTML shell with embedded manifest fallback.
+    report_html = render_report_html(report_bundle=manifest_bundle)
     resolved_output.write_text(report_html, encoding="utf-8")
+
     copy_report_assets(output_path=resolved_output)
     return resolved_output
 

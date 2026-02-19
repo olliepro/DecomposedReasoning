@@ -10,11 +10,132 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+import array
+import base64
 from candidate_clustering import (
     ClusteringArtifacts,
     strip_steer_suffix,
     trailing_steer_suffix_span,
 )
+
+
+class TokenDictionary:
+    """Accumulate unique tokens and encode sequences as indices."""
+
+    def __init__(self) -> None:
+        self.token_to_id: dict[str, int] = {}
+        self.tokens: list[str] = []
+
+    def get_id(self, token: str) -> int:
+        if token not in self.token_to_id:
+            self.token_to_id[token] = len(self.tokens)
+            self.tokens.append(token)
+        return self.token_to_id[token]
+
+    def encode(self, tokens: list[str]) -> str:
+        """Encode list of tokens to Base64 Uint32 array."""
+        # 'I' is 4-byte unsigned int
+        indices = [self.get_id(t) for t in tokens]
+        arr = array.array("I", indices)
+        return base64.b64encode(arr.tobytes()).decode("ascii")
+
+    def encode_ids(self, ids: list[int]) -> str:
+        """Encode list of token IDs to Base64 Uint32 array."""
+        arr = array.array("I", ids)
+        return base64.b64encode(arr.tobytes()).decode("ascii")
+
+
+def encode_float_array(values: list[float]) -> str:
+    """Encode float list to Base64 Float32 array."""
+    # 'f' is 4-byte float
+    arr = array.array("f", values)
+    return base64.b64encode(arr.tobytes()).decode("ascii")
+
+
+def encode_uint8_array(values: list[int]) -> str:
+    """Encode int list to Base64 Uint8 array."""
+    # 'B' is 1-byte unsigned char
+    arr = array.array("B", values)
+    return base64.b64encode(arr.tobytes()).decode("ascii")
+
+
+def compress_token_rows(
+    *, rows: list[dict[str, Any]], token_dict: TokenDictionary
+) -> dict[str, Any]:
+    """Compress token rows into SoA format with Base64 arrays.
+
+    Args:
+        rows: Source token rows.
+        token_dict: Shared token dictionary.
+
+    Returns:
+        Compressed token block.
+    """
+    if not rows:
+        return {}
+    tokens = [str(r.get("token", "")) for r in rows]
+    probs = [float(r.get("probability", 0.0)) for r in rows]
+    entropies = [float(r.get("entropy", 0.0)) for r in rows]
+
+    # Process top_logprobs
+    top_ids = []
+    top_probs = []
+    top_counts = []
+
+    for row in rows:
+        # Robust probability extraction with fallback
+        prob = float(row.get("probability", 0.0))
+        if prob == 0.0:
+            # Fallback 1: Try logprob
+            if "logprob" in row:
+                try:
+                    import math
+
+                    prob = math.exp(float(row["logprob"]))
+                except Exception:
+                    pass
+
+            # Fallback 2: Try to find selected token in alternatives
+            if prob == 0.0:
+                selected_token = str(row.get("token", "")).strip()
+                alternatives = row.get("alternatives", [])
+                for alt in alternatives:
+                    if str(alt.get("token", "")).strip() == selected_token:
+                        # Found it!
+                        prob = float(alt.get("probability", 0.0))
+                        if prob == 0.0 and "logprob" in alt:
+                            try:
+                                import math
+
+                                prob = math.exp(float(alt["logprob"]))
+                            except Exception:
+                                pass
+                        break
+
+        probs.append(prob)
+
+        tops = row.get("alternatives", []) or []
+        top_counts.append(len(tops))
+        for t in tops:
+            top_ids.append(token_dict.get_id(str(t.get("token", ""))))
+            # Alternatives use 'probability' not 'logprob', but fallback for robustness
+            prob = float(t.get("probability", 0.0))
+            if prob == 0.0 and "logprob" in t:
+                # If probability is missing or zero, try to recover from logprob
+                import math
+
+                prob = math.exp(float(t["logprob"]))
+            top_probs.append(prob)
+
+    return {
+        "ids": token_dict.encode(tokens),
+        "probs": encode_float_array(probs),
+        "entropies": encode_float_array(entropies),
+        "top_ids": token_dict.encode_ids(top_ids),
+        "top_probs": encode_float_array(top_probs),
+        "top_counts": encode_uint8_array(top_counts),
+    }
+
 
 STEER_CLOSE_PATTERN = re.compile(r"</steer>", flags=re.IGNORECASE)
 THINK_CLOSE_PATTERN = re.compile(r"</think\s*>", flags=re.IGNORECASE)
@@ -174,6 +295,7 @@ def candidate_token_rows(
                 "token_index": token_index,
                 "token": str(row.get("token", "")),
                 "probability": float(row.get("probability", 0.0)),
+                "logprob": float(row.get("logprob", 0.0)),
                 "entropy": float(row.get("entropy", 0.0)),
                 "alternatives": build_alternative_rows(raw=row.get("alternatives")),
             }
@@ -208,6 +330,7 @@ def rollout_token_rows_by_step(
                 "token_index": token_index,
                 "token": str(row.get("token", "")),
                 "probability": float(row.get("probability", 0.0)),
+                "logprob": float(row.get("logprob", 0.0)),
                 "entropy": float(row.get("entropy", 0.0)),
                 "alternatives": build_alternative_rows(raw=row.get("alternatives")),
             }
@@ -699,23 +822,28 @@ def candidate_base_entry(
         clean_text = assignment.clean_text
     cluster_id = assignment.cluster_id if assignment is not None else -1
     cluster_name = assignment.cluster_name if assignment is not None else "Unclustered"
-    payload = payloads.get((step_index, candidate_index), {"tokens": []})
+    payload = payloads.get((step_index, candidate_index), {})
+    tokens = payload.get("tokens") or row.get("tokens") or []
+    full_tokens = payload.get("full_tokens") or row.get("full_tokens") or tokens
     return {
         "candidate_index": candidate_index,
         "text": clean_text,
-        "selected": candidate_index == selected_index,
+        "selected": bool(candidate_index == selected_index),
         "cluster_id": cluster_id,
         "cluster_name": cluster_name,
-        "tokens": payload["tokens"],
-        "full_tokens": payload.get("full_tokens", payload["tokens"]),
+        "tokens": tokens,
+        "full_tokens": full_tokens,
     }
 
 
-def dedupe_cluster_entries(*, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def dedupe_cluster_entries(
+    *, entries: list[dict[str, Any]], token_dict: TokenDictionary
+) -> list[dict[str, Any]]:
     """Deduplicate candidate entries by text and count occurrences.
 
     Args:
         entries: Candidate entries within one cluster.
+        token_dict: Shared token dictionary.
 
     Returns:
         Deduplicated candidate rows with occurrence counts.
@@ -732,9 +860,12 @@ def dedupe_cluster_entries(*, entries: list[dict[str, Any]]) -> list[dict[str, A
                 "text": text,
                 "count": len(group),
                 "selected": any(bool(item["selected"]) for item in group),
-                "tokens": representative["tokens"],
-                "full_tokens": representative.get(
-                    "full_tokens", representative["tokens"]
+                "tokens": compress_token_rows(
+                    rows=representative["tokens"], token_dict=token_dict
+                ),
+                "full_tokens": compress_token_rows(
+                    rows=representative.get("full_tokens", representative["tokens"]),
+                    token_dict=token_dict,
                 ),
                 "candidate_indices": [int(item["candidate_index"]) for item in group],
             }
@@ -766,7 +897,11 @@ def representative_entry(*, entries: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def cluster_rows_for_step(
-    *, entries: list[dict[str, Any]], clustering: ClusteringArtifacts, step_index: int
+    *,
+    entries: list[dict[str, Any]],
+    clustering: ClusteringArtifacts,
+    step_index: int,
+    token_dict: TokenDictionary,
 ) -> list[dict[str, Any]]:
     """Build cluster payload rows containing deduped candidate entries.
 
@@ -774,6 +909,7 @@ def cluster_rows_for_step(
         entries: Base candidate entries for one step.
         clustering: Clustering metadata.
         step_index: Step index.
+        token_dict: Shared token dictionary.
 
     Returns:
         Cluster rows with deduped candidate items.
@@ -788,7 +924,9 @@ def cluster_rows_for_step(
     }
     clusters: list[dict[str, Any]] = []
     for cluster_id in sorted(grouped):
-        deduped = dedupe_cluster_entries(entries=grouped[cluster_id])
+        deduped = dedupe_cluster_entries(
+            entries=grouped[cluster_id], token_dict=token_dict
+        )
         clusters.append(
             {
                 "cluster_id": cluster_id,
@@ -832,6 +970,7 @@ def step_view(
     rollout_tokens_by_step: dict[int, list[dict[str, Any]]],
     execution_text_by_step: dict[int, str],
     clustering: ClusteringArtifacts,
+    token_dict: TokenDictionary,
 ) -> dict[str, Any]:
     """Build one collapsible step payload row for report UI.
 
@@ -846,6 +985,7 @@ def step_view(
             Rollout step `i + 1` carries `<exec>...</exec>` for selected steer `i`.
         execution_text_by_step: Step-indexed execution text from `final_text`.
         clustering: Clustering metadata.
+        token_dict: Shared token dictionary.
 
     Returns:
         One step payload mapping.
@@ -866,7 +1006,10 @@ def step_view(
         if entry is not None:
             base_entries.append(entry)
     clusters = cluster_rows_for_step(
-        entries=base_entries, clustering=clustering, step_index=step_index
+        entries=base_entries,
+        clustering=clustering,
+        step_index=step_index,
+        token_dict=token_dict,
     )
     selected_text = selected_text_map.get(step_index, "")
     chosen = chosen_entry(clusters=clusters)
@@ -874,7 +1017,10 @@ def step_view(
         selected_text = str(chosen["text"])
         chosen = {
             **chosen,
-            "rollout_tokens": rollout_tokens_by_step.get(step_index + 1, []),
+            "rollout_tokens": compress_token_rows(
+                rows=rollout_tokens_by_step.get(step_index + 1, []),
+                token_dict=token_dict,
+            ),
             "execution_text": execution_text_by_step.get(step_index, ""),
         }
     status = status_map.get(step_index, {"terminated": False, "termination_reason": ""})
@@ -978,6 +1124,7 @@ def build_report_payload(
         final_text=final_text,
         selected_text_by_step_index=selected_text_map,
     )
+    token_dict = TokenDictionary()
     raw_views = [
         step_view(
             step_index=step_index,
@@ -989,6 +1136,7 @@ def build_report_payload(
             rollout_tokens_by_step=rollout_tokens,
             execution_text_by_step=execution_by_step,
             clustering=resolved_clustering,
+            token_dict=token_dict,
         )
         for step_index in step_indices(
             selected_map=selected_map,
@@ -1003,12 +1151,17 @@ def build_report_payload(
         "step_views": views,
         "final_text": final_text,
         "final_answer_text": final_answer_after_think(final_text=final_text),
-        "rollout_probabilities": rollout_probabilities,
-        "rollout_entropies": rollout_entropies,
-        "trajectory_tokens": trajectory_tokens,
+        "rollout_probabilities": encode_float_array(
+            rollout_probabilities
+        ),  # Compress this too
+        "rollout_entropies": encode_float_array(rollout_entropies),  # Compress this too
+        "trajectory_tokens": compress_token_rows(
+            rows=trajectory_tokens, token_dict=token_dict
+        ),
         "trajectory_token_count": len(rollout_probabilities),
         "cluster_mode": resolved_clustering.mode,
         "cluster_warnings": list(resolved_clustering.warnings),
+        "token_list": token_dict.tokens,
     }
 
 
@@ -1105,23 +1258,10 @@ def render_report_html(
         Complete viewer HTML string.
     """
 
-    if report_bundle is not None:
-        resolved_bundle = report_bundle
-    else:
-        assert (
-            report_payload is not None
-        ), "Expected `report_bundle` or `report_payload`."
-        resolved_bundle = report_bundle_payload(
-            outputs=[
-                ReportOutput(
-                    output_id="default-output",
-                    prompt=str((report_payload.get("config") or {}).get("prompt", "")),
-                    run_dir="",
-                    report_payload=report_payload,
-                )
-            ]
-        )
-    payload_json = safe_json_for_html_script(payload=resolved_bundle)
+    # Note: The build_report script still writes report_data.json for large bundles.
+    embedded_payload = report_bundle if report_bundle is not None else report_payload
+    embedded_json = safe_json_for_html_script(payload=embedded_payload or {})
+
     return "\n".join(
         [
             "<!doctype html>",
@@ -1130,25 +1270,42 @@ def render_report_html(
             "<meta charset='utf-8'>",
             "<meta name='viewport' content='width=device-width, initial-scale=1'>",
             "<title>Steer Branching Explorer</title>",
+            "<link rel='preconnect' href='https://fonts.googleapis.com'>",
+            "<link rel='preconnect' href='https://fonts.gstatic.com' crossorigin>",
+            "<link href='https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:ital,wght@0,500;0,600;1,500&display=swap' rel='stylesheet'>",
+            "<link href='https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,400,0,0' rel='stylesheet'>",
+            "<link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css'>",
+            "<link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/markdown-it-texmath@1.0.0/css/texmath.min.css'>",
             "<link rel='stylesheet' href='report_assets/styles.css'>",
             "</head>",
             "<body>",
+            "<header class='top-chrome'>",
+            "<section class='top-chrome-inner'>",
+            "<button type='button' class='menu-toggle chrome-icon-btn' data-sidebar-open aria-expanded='false' aria-controls='report-sidebar' aria-label='Open menu'><span class='material-symbols-rounded chrome-icon' aria-hidden='true'>menu</span></button>",
+            "<button type='button' class='home-toggle chrome-icon-btn' data-show-home aria-label='Go home'><span class='material-symbols-rounded chrome-icon' aria-hidden='true'>home</span></button>",
+            "<div class='top-chrome-title'>Steer Branching Explorer</div>",
+            "<div id='top-controls-wrap' class='top-controls-wrap'><button type='button' id='top-settings-toggle' class='chrome-icon-btn' aria-label='Open settings' aria-expanded='false'><span class='material-symbols-rounded chrome-icon' aria-hidden='true'>tune</span></button><section id='top-controls-popover' class='top-controls-popover hidden' aria-hidden='true'><div id='top-controls' class='meta-block controls-host'></div></section></div>",
+            "</section>",
+            "</header>",
             "<main>",
             "<section class='workspace-grid'>",
-            "<button type='button' class='menu-toggle' data-sidebar-open aria-expanded='false' aria-controls='report-sidebar' aria-label='Open menu'><span class='sidebar-hamb' aria-hidden='true'>&#9776;</span></button><button type='button' id='sidebar-scrim' class='sidebar-scrim' aria-hidden='true' aria-label='Close menu'></button>",
+            "<button type='button' id='sidebar-scrim' class='sidebar-scrim' aria-hidden='true' aria-label='Close menu'></button>",
             "<aside id='report-sidebar' class='panel sidebar-panel' aria-hidden='true'>",
-            "<section class='sidebar-header'><h2 class='sidebar-title'>Explorer Sidebar</h2><button type='button' class='sidebar-close' data-sidebar-close aria-label='Close menu'><span class='sidebar-close-icon' aria-hidden='true'>&#10005;</span></button></section>",
-            "<section class='sidebar-body'><h1>Steer Branching Explorer</h1><div id='sidebar-output-list'></div>",
-            "<section class='meta-block'><h3>Report</h3><div class='muted'>Candidate Clusters show behavior modes for each step. Explore chosen <exec> blocks and token-level uncertainty across runs.</div></section>",
-            "<div id='meta'></div>",
+            "<section class='sidebar-header'><h2 class='sidebar-header-title'>Steer Branching Explorer</h2><button type='button' class='sidebar-close' data-sidebar-close aria-label='Close menu'><span class='sidebar-close-icon' aria-hidden='true'>&#10005;</span></button></section>",
+            "<section class='sidebar-body'><button type='button' class='sidebar-home-btn' data-show-home aria-label='Go home'><span class='material-symbols-rounded sidebar-home-icon' aria-hidden='true'>home</span><span>Home</span></button><section id='sidebar-controls' class='meta-block controls-host'></section><div id='sidebar-output-list'></div>",
             "</section>",
             "</aside>",
             "<section id='home-view' class='panel hero'></section>",
-            "<section id='report-view' class='hidden-block'><section class='content-grid'><section id='final-answer' class='side-column'></section><section id='timeline' class='timeline'></section></section></section>",
+            "<section id='report-view' class='hidden-block'><section class='content-grid'><section id='final-answer' class='side-column'></section><div id='column-divider' class='column-divider' role='separator' aria-label='Resize columns' aria-orientation='vertical'></div><section id='timeline' class='timeline'></section></section></section>",
             "</section>",
             "</main>",
             "<div id='tooltip' class='tooltip hidden'></div>",
-            f"<script id='report-bundle-data' type='application/json'>{payload_json}</script>",
+            "<div id='trajectory-overlay' class='trajectory-overlay hidden' aria-hidden='true'><section id='trajectory-overlay-panel' class='trajectory-overlay-panel panel'><button type='button' class='trajectory-overlay-close' data-trajectory-overlay-close aria-label='Close trajectory fullscreen'><span class='material-symbols-rounded' aria-hidden='true'>close</span></button><h2 class='trajectory-overlay-title' data-trajectory-overlay-title>Trajectory</h2><div class='trajectory-overlay-body' data-trajectory-overlay-body></div></section></div>",
+            f"<script id='report-bundle-data' type='application/json'>{embedded_json}</script>",
+            "<!-- Data is loaded externally from report_data.json and overrides embedded fallback. -->",
+            "<script src='https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js'></script>",
+            "<script src='https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js'></script>",
+            "<script src='https://cdn.jsdelivr.net/npm/markdown-it-texmath@1.0.0/texmath.min.js'></script>",
             "<script src='report_assets/app.js'></script>",
             "</body>",
             "</html>",

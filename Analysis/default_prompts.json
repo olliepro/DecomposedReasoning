@@ -32,6 +32,10 @@
         "prompt": "Find the number of functions $\\pi$ mapping the set $A =\\{1,2,3,4,5,6\\}$ onto $A$ such that for every $a \\in A,$ \\[ \\pi(\\pi(\\pi(\\pi(\\pi(\\pi(a)))))) = a. \\]"
     },
     {
+        "title": "Hello World",
+        "prompt": "hello"
+    },
+    {
         "title": "Physics Conceptual (Tunnel Through Earth)",
         "prompt": "What would happen if an object could fall straight through the Earth?"
     }

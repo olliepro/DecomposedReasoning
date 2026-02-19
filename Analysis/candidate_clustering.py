@@ -32,6 +32,10 @@ NON_SNAKE_PATTERN = re.compile(r"[^a-z0-9]+")
 CODE_BLOCK_JSON_PATTERN = re.compile(
     r"```(?:json)?\s*(\{.*\})\s*```", flags=re.IGNORECASE | re.DOTALL
 )
+STEER_EXEC_PAIR_PATTERN = re.compile(
+    r"<steer\b[^>]*>(.*?)</steer>\s*<exec\b[^>]*>(.*?)</exec>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 OTHER_CLUSTER_NAME = "other"
 MODEL_ALIAS_FALLBACKS = {
     "gemini-3-flash": ("gemini-3-flash-preview",),
@@ -486,6 +490,110 @@ def previous_steps_chain(
     return len(history), " >> ".join(history)
 
 
+def normalize_steer_text(*, text: str) -> str:
+    """Normalize steer text for alignment comparisons.
+
+    Args:
+        text: Raw steer text.
+
+    Returns:
+        Canonically normalized steer text.
+    """
+
+    collapsed = re.sub(r"\s+", " ", strip_steer_suffix(text=text))
+    return collapsed.strip().lower()
+
+
+def steer_exec_pairs_from_final_text(*, final_text: str) -> list[tuple[str, str]]:
+    """Extract ordered `(steer_text, execution_text)` pairs from final text.
+
+    Args:
+        final_text: Final assistant text with steer/exec tags.
+
+    Returns:
+        Ordered steer/exec pairs.
+    """
+
+    return [
+        (str(steer).strip(), str(execution).strip())
+        for steer, execution in STEER_EXEC_PAIR_PATTERN.findall(final_text)
+    ]
+
+
+def execution_text_by_step_from_final_text(
+    *, final_text: str, selected_text_by_step_index: dict[int, str]
+) -> dict[int, str]:
+    """Align execution blocks to steps by matching steer text in order.
+
+    Args:
+        final_text: Final assistant text containing `<steer>/<exec>` blocks.
+        selected_text_by_step_index: Selected steer text keyed by step index.
+
+    Returns:
+        Mapping from zero-based step index to execution text.
+    """
+
+    pairs = steer_exec_pairs_from_final_text(final_text=final_text)
+    if not pairs:
+        return {}
+    mapped: dict[int, str] = {}
+    cursor = 0
+    for step_index in sorted(selected_text_by_step_index):
+        target = normalize_steer_text(
+            text=selected_text_by_step_index.get(step_index, "")
+        )
+        if not target:
+            continue
+        for pair_index in range(cursor, len(pairs)):
+            pair_steer, pair_execution = pairs[pair_index]
+            if normalize_steer_text(text=pair_steer) != target:
+                continue
+            mapped[step_index] = str(pair_execution).strip()
+            cursor = pair_index + 1
+            break
+    return mapped
+
+
+def tail_words(*, text: str, word_count: int) -> str:
+    """Return the last `word_count` whitespace-delimited words from text.
+
+    Args:
+        text: Source text.
+        word_count: Number of trailing words to keep.
+
+    Returns:
+        Trailing words joined by single spaces.
+    """
+
+    words = [word for word in re.split(r"\s+", text.strip()) if word]
+    if not words:
+        return ""
+    return " ".join(words[-max(1, int(word_count)) :])
+
+
+def previous_execution_tail(
+    *, step_index: int, execution_texts: dict[int, str], tail_word_count: int
+) -> tuple[int, str]:
+    """Build previous-step execution context using a trailing word window.
+
+    Args:
+        step_index: Current step index.
+        execution_texts: Execution text keyed by step index.
+        tail_word_count: Number of trailing words to include.
+
+    Returns:
+        Tuple of context count and context string.
+    """
+
+    previous_step_index = step_index - 1
+    if previous_step_index < 0:
+        return 0, ""
+    previous_execution = str(execution_texts.get(previous_step_index, "")).strip()
+    if not previous_execution:
+        return 0, ""
+    return 1, tail_words(text=previous_execution, word_count=tail_word_count)
+
+
 def dedup_items_for_step(*, rows: list[CandidateRow]) -> tuple[DedupItem, ...]:
     """Deduplicate step rows by steer text.
 
@@ -505,38 +613,71 @@ def dedup_items_for_step(*, rows: list[CandidateRow]) -> tuple[DedupItem, ...]:
 
 
 def build_cluster_prompt(
-    *, previous_count: int, previous_chain: str, items: tuple[DedupItem, ...]
+    *,
+    previous_selected_count: int,
+    previous_selected_chain: str,
+    previous_execution_tail: str,
+    items: tuple[DedupItem, ...],
 ) -> str:
     """Build strict-JSON clustering prompt for one step.
 
     Args:
-        previous_count: Number of prior selected steps included.
-        previous_chain: Previous selected-step chain.
+        previous_selected_count: Number of prior selected steps included.
+        previous_selected_chain: Previous selected-step chain.
+        previous_execution_tail: Last few words from previous step execution.
         items: Deduplicated candidate strings for the step.
 
     Returns:
         Prompt text.
 
     Example:
-        >>> prompt = build_cluster_prompt(previous_count=0, previous_chain="", items=(DedupItem(item_id=1, text="Try factoring", count=2),))
+        >>> prompt = build_cluster_prompt(previous_selected_count=0, previous_selected_chain="", previous_execution_tail="", items=(DedupItem(item_id=1, text="Try factoring", count=2),))
         >>> "Current step index" in prompt
         False
     """
 
     lines = [
         "When asked what to do next in a few words people said these things.",
-        "Cluster them into high-level reasoning groups.",
+        "Cluster them into functionally identical groups.",
         "Return strict JSON only with this exact shape:",
         '{"clusters":[{"name":"high_level_group_name","member_ids":[1,2]}]}',
-        "Rules:",
+        "",
+        "## Rules",
         "- use lowercase snake_case names with max 3 words",
         "- include all ids exactly once across all member_ids",
         "- do not invent ids",
         "- if uncertain, place items into other",
+        "- return 1 cluster when there is no functional variety",
+        "- return 3-8 clusters for moderate variety with clear themes",
+        "- return 9-15 clusters for tons of variety",
+        "- avoid overfitting to surface text;  e.g. 2+2=4 shouldn't be clustered with 2+3=5 despite looking similar",
     ]
-    if previous_count > 0:
-        lines.append(f"Previous {previous_count} selected steps: {previous_chain}")
-    lines.append("Items:")
+    context_lines: list[str] = []
+    if previous_selected_count > 0 and previous_selected_chain:
+        parts = [
+            part.strip()
+            for part in previous_selected_chain.split(" >> ")
+            if part.strip()
+        ]
+        if parts:
+            context_lines.append(f"Previous {previous_selected_count} selected steps:")
+            context_lines.append(f"- {parts[0]}")
+            context_lines.extend(f"  >> {part}" for part in parts[1:])
+    if previous_execution_tail:
+        if context_lines:
+            context_lines.append("")
+        context_lines.append("The last few words of the previous step's execution are:")
+        context_lines.append(f'"{previous_execution_tail}"')
+    if context_lines:
+        lines.extend(
+            [
+                "",
+                "## Context on the current process",
+                "",
+                *context_lines,
+            ]
+        )
+    lines.extend(["", "## Options to group:"])
     lines.extend(item.prompt_line() for item in items)
     return "\n".join(lines)
 
@@ -719,7 +860,7 @@ def call_gemini_once(
 
     client = genai.Client(api_key=api_key)
     thinking_config = (
-        types.ThinkingConfig(thinking_level=cast(Any, "LOW"))
+        types.ThinkingConfig(thinking_level=cast(Any, "MINIMAL"))
         if "gemini-3" in model_id
         else None
     )
@@ -893,6 +1034,7 @@ def cluster_step_result(
     step_index: int,
     step_rows: list[CandidateRow],
     selected_texts: dict[int, str],
+    execution_texts: dict[int, str],
     config: ClusteringConfig,
     api_key: str | None,
     mode: str,
@@ -904,6 +1046,7 @@ def cluster_step_result(
         step_index: Step index.
         step_rows: Candidate rows for the step.
         selected_texts: Selected steer text map for prompt context.
+        execution_texts: Step-indexed execution text for prompt context.
         config: Clustering configuration.
         api_key: Gemini API key when available.
         mode: Clustering mode label.
@@ -916,14 +1059,20 @@ def cluster_step_result(
     items = dedup_items_for_step(rows=step_rows)
     warning: str | None = None
     if mode == "prompt_gemini" and api_key is not None:
-        previous_count, previous_chain = previous_steps_chain(
+        previous_selected_count, previous_selected_chain = previous_steps_chain(
             step_index=step_index,
             selected_texts=selected_texts,
             window=config.previous_steps_window,
         )
+        _, previous_execution_tail_text = previous_execution_tail(
+            step_index=step_index,
+            execution_texts=execution_texts,
+            tail_word_count=20,
+        )
         prompt = build_cluster_prompt(
-            previous_count=previous_count,
-            previous_chain=previous_chain,
+            previous_selected_count=previous_selected_count,
+            previous_selected_chain=previous_selected_chain,
+            previous_execution_tail=previous_execution_tail_text,
             items=items,
         )
         try:
@@ -960,6 +1109,7 @@ async def cluster_steps_async(
     *,
     rows_by_step: dict[int, list[CandidateRow]],
     selected_texts: dict[int, str],
+    execution_texts: dict[int, str],
     config: ClusteringConfig,
     api_key: str,
     cache: ClusteringCache | None,
@@ -969,6 +1119,7 @@ async def cluster_steps_async(
     Args:
         rows_by_step: Candidate rows grouped by step.
         selected_texts: Selected steer text map.
+        execution_texts: Step-indexed execution text.
         config: Clustering configuration.
         api_key: Gemini API key.
         cache: Optional cluster-response cache.
@@ -986,6 +1137,7 @@ async def cluster_steps_async(
                 step_index=step_index,
                 step_rows=rows_by_step[step_index],
                 selected_texts=selected_texts,
+                execution_texts=execution_texts,
                 config=config,
                 api_key=api_key,
                 mode="prompt_gemini",
@@ -1001,6 +1153,7 @@ def cluster_candidates_by_step(
     candidates: list[dict[str, Any]],
     config: ClusteringConfig,
     steps: list[dict[str, Any]] | None = None,
+    final_text: str = "",
 ) -> ClusteringArtifacts:
     """Cluster candidates step-by-step using Gemini prompting.
 
@@ -1008,6 +1161,7 @@ def cluster_candidates_by_step(
         candidates: Candidate artifact rows.
         config: Clustering configuration.
         steps: Optional step rows to provide previous-step context.
+        final_text: Final assistant text with `<steer>/<exec>` blocks.
 
     Returns:
         Clustering artifacts used by the report builder.
@@ -1023,6 +1177,10 @@ def cluster_candidates_by_step(
     for row in rows:
         rows_by_step[row.step_index].append(row)
     selected_texts = selected_text_by_step(steps=steps or [])
+    execution_texts = execution_text_by_step_from_final_text(
+        final_text=final_text,
+        selected_text_by_step_index=selected_texts,
+    )
     warnings: list[str] = []
     api_key = resolve_api_key(env_paths=config.env_paths)
     cache = load_clustering_cache(path=config.cache_path)
@@ -1040,6 +1198,7 @@ def cluster_candidates_by_step(
             cluster_steps_async(
                 rows_by_step=rows_by_step,
                 selected_texts=selected_texts,
+                execution_texts=execution_texts,
                 config=config,
                 api_key=api_key,
                 cache=cache,
@@ -1051,6 +1210,7 @@ def cluster_candidates_by_step(
                 step_index=step_index,
                 step_rows=rows_by_step[step_index],
                 selected_texts=selected_texts,
+                execution_texts=execution_texts,
                 config=config,
                 api_key=api_key,
                 mode=mode,
