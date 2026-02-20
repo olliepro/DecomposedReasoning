@@ -76,6 +76,18 @@ def test_parse_eval_config_rejects_invalid_aime_avg_k(tmp_path: Path) -> None:
         parse_eval_config(config_path=config_path)
 
 
+def test_parse_eval_config_rejects_invalid_vllm_log_stats_interval(tmp_path: Path) -> None:
+    """Parser should reject non-positive `vllm_log_stats_interval` values."""
+    config_path = tmp_path / "lm_eval.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"model_type": "vllm", "vllm_log_stats_interval": 0.0}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError):
+        parse_eval_config(config_path=config_path)
+
+
 def test_parse_run_config_supports_base_merge_and_lm_eval_path(tmp_path: Path) -> None:
     """Parser should merge base config and resolve lm_eval path pointers.
 

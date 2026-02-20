@@ -1,8 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=sft-train
+#SBATCH --account=PAS3268
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=4
+#SBATCH --gres=gpu:4
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=12
 #SBATCH --time=4-00:00:00
@@ -17,9 +18,19 @@ if [[ $# -lt 1 ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REPO_ROOT="$(cd "${PROJECT_DIR}/.." && pwd)"
-EVAL_PROJECT_DIR="${REPO_ROOT}/Eval"
+DEFAULT_PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_DIR="${SFT_PROJECT_DIR:-}"
+if [[ -z "${PROJECT_DIR}" ]]; then
+  if [[ -n "${SLURM_SUBMIT_DIR:-}" ]] && [[ -d "${SLURM_SUBMIT_DIR}/sft_training" ]]; then
+    PROJECT_DIR="${SLURM_SUBMIT_DIR}"
+  elif [[ -n "${SLURM_SUBMIT_DIR:-}" ]] && [[ -d "${SLURM_SUBMIT_DIR}/SFTTraining/sft_training" ]]; then
+    PROJECT_DIR="${SLURM_SUBMIT_DIR}/SFTTraining"
+  else
+    PROJECT_DIR="${DEFAULT_PROJECT_DIR}"
+  fi
+fi
+REPO_ROOT="${REPO_ROOT:-$(cd "${PROJECT_DIR}/.." && pwd)}"
+EVAL_PROJECT_DIR="${EVAL_PROJECT_DIR:-${REPO_ROOT}/Eval}"
 RUN_CONFIG="$1"
 shift
 RUN_CONFIG="$(realpath -m "${RUN_CONFIG}")"
@@ -62,8 +73,14 @@ if [[ ! -d "${EVAL_PROJECT_DIR}" ]]; then
   echo "Eval project directory not found: ${EVAL_PROJECT_DIR}"
   exit 1
 fi
+EVAL_STANDALONE_SCRIPT="${EVAL_PROJECT_DIR}/scripts/run_standalone_eval.sh"
+if [[ ! -x "${EVAL_STANDALONE_SCRIPT}" ]]; then
+  echo "Eval standalone script not found or not executable: ${EVAL_STANDALONE_SCRIPT}"
+  exit 1
+fi
 
-mkdir -p "${PROJECT_DIR}/logs"
+LOG_ROOT_DIR="${SLURM_SUBMIT_DIR:-${PROJECT_DIR}}"
+mkdir -p "${LOG_ROOT_DIR}/logs"
 
 cd "${PROJECT_DIR}"
 
@@ -147,22 +164,57 @@ run_standalone_eval() {
 
   echo "Running standalone benchmark eval from: ${checkpoint_dir}"
   echo "W&B shared run name: ${SFT_WANDB_RUN_NAME}"
-  "${EVAL_PYTHON_BIN}" -m eval_runner.standalone \
+  EVAL_PYTHON_BIN="${EVAL_PYTHON_BIN}" "${EVAL_STANDALONE_SCRIPT}" \
     --checkpoint "${checkpoint_dir}" \
     --config "${RUN_CONFIG}" \
     --output "${output_json_path}" \
     "${EVAL_LIMIT_ARGS[@]}"
 }
 
+prepare_hf_checkpoint_for_eval() {
+  local checkpoint_dir="$1"
+  local output_dir="${checkpoint_dir}-hf"
+  local converter_script="${checkpoint_dir}/zero_to_fp32.py"
+
+  if [[ ! -f "${converter_script}" ]]; then
+    echo "Expected conversion script not found: ${converter_script}"
+    exit 1
+  fi
+
+  if [[ ! -f "${output_dir}/model.safetensors.index.json" ]]; then
+    echo "Converting checkpoint to HF format: ${checkpoint_dir} -> ${output_dir}"
+    mkdir -p "${output_dir}"
+    rsync -a \
+      --exclude 'global_step*' \
+      --exclude 'latest' \
+      --exclude 'zero_to_fp32.py' \
+      --exclude 'trainer_state.json' \
+      --exclude 'training_args.bin' \
+      --exclude 'pytorch_model*' \
+      --exclude 'model*.safetensors*' \
+      "${checkpoint_dir}/" "${output_dir}/"
+    "${TRAIN_PYTHON_BIN}" "${converter_script}" "${checkpoint_dir}" "${output_dir}" \
+      --safe_serialization \
+      --max_shard_size 5GB
+  else
+    echo "HF checkpoint already exists, skipping conversion: ${output_dir}"
+  fi
+
+  echo "${output_dir}"
+}
+
 mapfile -t CHECKPOINT_DIRS < <(
-  find "${RUN_OUTPUT_DIR}" -maxdepth 1 -mindepth 1 -type d -name "checkpoint-*" | sort -V
+  find "${RUN_OUTPUT_DIR}" -maxdepth 1 -mindepth 1 -type d -name "checkpoint-*" \
+    | grep -E '/checkpoint-[0-9]+$' \
+    | sort -V
 )
 
-echo "Training complete. Running standalone benchmark eval for all checkpoints."
+echo "Training complete. Converting checkpoints to HF format and running standalone benchmark eval."
 for checkpoint_dir in "${CHECKPOINT_DIRS[@]}"; do
-  checkpoint_label="$(basename "${checkpoint_dir}")"
+  checkpoint_label="$(basename "${checkpoint_dir}")-hf"
   checkpoint_output_json="${EVAL_OUTPUT_DIR}/${checkpoint_label}.json"
+  hf_checkpoint_dir="$(prepare_hf_checkpoint_for_eval "${checkpoint_dir}")"
   run_standalone_eval \
-    "${checkpoint_dir}" \
+    "${hf_checkpoint_dir}" \
     "${checkpoint_output_json}"
 done

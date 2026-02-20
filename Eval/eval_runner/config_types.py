@@ -26,6 +26,9 @@ class LmEvalConfig:
         temperature: Default generation temperature passed via `--gen_kwargs`.
         top_p: Default nucleus sampling value passed via `--gen_kwargs`.
         max_gen_toks: Default max generated tokens passed via `--gen_kwargs`.
+        vllm_disable_log_stats: Forwarded to vLLM engine to control throughput logs.
+        vllm_log_stats_interval: vLLM stats log heartbeat interval in seconds.
+        vllm_logging_level: vLLM logger level (`INFO`, `DEBUG`, ...).
     """
 
     tasks: tuple[str, ...] = ("minerva_math500", "aime24", "aime25")
@@ -43,6 +46,9 @@ class LmEvalConfig:
     temperature: float = 0.6
     top_p: float = 0.95
     max_gen_toks: int = 32768
+    vllm_disable_log_stats: bool = False
+    vllm_log_stats_interval: float = 10.0
+    vllm_logging_level: str = "INFO"
 
 
 @dataclass(frozen=True)
@@ -190,6 +196,8 @@ def _build_lm_eval_config(lm_eval_payload: dict[str, Any]) -> LmEvalConfig:
     """
     aime_avg_k = int(lm_eval_payload.get("aime_avg_k", 32))
     assert aime_avg_k >= 1, "`lm_eval.aime_avg_k` must be >= 1."
+    vllm_log_stats_interval = float(lm_eval_payload.get("vllm_log_stats_interval", 10.0))
+    assert vllm_log_stats_interval > 0.0, "`lm_eval.vllm_log_stats_interval` must be > 0."
     return LmEvalConfig(
         tasks=tuple(lm_eval_payload.get("tasks", LmEvalConfig.tasks)),
         batch_size=lm_eval_payload.get("batch_size", 4),
@@ -208,6 +216,9 @@ def _build_lm_eval_config(lm_eval_payload: dict[str, Any]) -> LmEvalConfig:
         temperature=float(lm_eval_payload.get("temperature", 0.6)),
         top_p=float(lm_eval_payload.get("top_p", 0.95)),
         max_gen_toks=int(lm_eval_payload.get("max_gen_toks", 32768)),
+        vllm_disable_log_stats=bool(lm_eval_payload.get("vllm_disable_log_stats", False)),
+        vllm_log_stats_interval=vllm_log_stats_interval,
+        vllm_logging_level=str(lm_eval_payload.get("vllm_logging_level", "INFO")).upper(),
     )
 
 

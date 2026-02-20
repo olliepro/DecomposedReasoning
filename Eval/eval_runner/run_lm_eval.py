@@ -174,6 +174,7 @@ def build_model_args(checkpoint_path: Path, config: LmEvalConfig) -> ModelArgs:
                 "tensor_parallel_size": config.tensor_parallel_size,
                 "gpu_memory_utilization": config.gpu_memory_utilization,
                 "data_parallel_size": config.data_parallel_size,
+                "disable_log_stats": config.vllm_disable_log_stats,
             }
         )
     else:

@@ -16,6 +16,12 @@ GPU0 X PIX 0-63 0
 GPU1 PIX X 0-63 0
 """
 
+NODE_LINK_CROSS_NUMA_TOPOLOGY = """
+GPU0 GPU1 NIC0 CPU Affinity NUMA Affinity GPU NUMA ID
+GPU0 X NODE NODE 32-42 2 N/A
+GPU1 NODE X NODE 7 N/A
+"""
+
 
 def test_is_cross_numa_topology_detects_sys_links() -> None:
     """SYS links between GPU rows should be treated as cross-NUMA.
@@ -41,6 +47,18 @@ def test_is_cross_numa_topology_rejects_non_sys_links() -> None:
     assert not topology_env.is_cross_numa_topology(topology_text=SINGLE_NUMA_TOPOLOGY)
 
 
+def test_is_cross_numa_topology_detects_split_numa_affinity_without_sys() -> None:
+    """Split NUMA affinity values should trigger cross-NUMA even without SYS.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+    """
+    assert topology_env.is_cross_numa_topology(topology_text=NODE_LINK_CROSS_NUMA_TOPOLOGY)
+
+
 def test_maybe_set_cross_numa_vllm_env_applies_expected_values() -> None:
     """Policy should set all required env vars for vLLM on cross-NUMA.
 
@@ -55,6 +73,7 @@ def test_maybe_set_cross_numa_vllm_env_applies_expected_values() -> None:
         model_type="vllm",
         env=fake_env,
         topology_text=CROSS_NUMA_TOPOLOGY,
+        gpu_product_names=["NVIDIA A100-SXM4-80GB", "NVIDIA A100-SXM4-80GB"],
     )
 
     assert applied is True
@@ -78,6 +97,7 @@ def test_maybe_set_cross_numa_vllm_env_skips_for_non_cross_numa() -> None:
         model_type="vllm",
         env=fake_env,
         topology_text=SINGLE_NUMA_TOPOLOGY,
+        gpu_product_names=["NVIDIA A100-SXM4-80GB", "NVIDIA A100-SXM4-80GB"],
     )
 
     assert applied is False
@@ -104,6 +124,7 @@ def test_maybe_set_cross_numa_vllm_env_handles_missing_topology(monkeypatch) -> 
         model_type="vllm",
         env=fake_env,
         topology_text=None,
+        gpu_product_names=["NVIDIA A100-SXM4-80GB", "NVIDIA A100-SXM4-80GB"],
     )
 
     assert applied is False
@@ -125,8 +146,37 @@ def test_maybe_set_cross_numa_vllm_env_skips_for_hf_model() -> None:
         model_type="hf",
         env=fake_env,
         topology_text=CROSS_NUMA_TOPOLOGY,
+        gpu_product_names=["NVIDIA A100-SXM4-80GB", "NVIDIA A100-SXM4-80GB"],
     )
 
     assert applied is False
     assert reason == "model_type is not vllm"
     assert fake_env == {}
+
+
+def test_maybe_set_cross_numa_vllm_env_requires_exactly_two_a100_gpus() -> None:
+    """Policy should be inactive when GPU shape is not exactly 2xA100."""
+    fake_env: dict[str, str] = {}
+    applied, reason = topology_env.maybe_set_cross_numa_vllm_env(
+        model_type="vllm",
+        env=fake_env,
+        topology_text=CROSS_NUMA_TOPOLOGY,
+        gpu_product_names=["NVIDIA A100-SXM4-80GB"],
+    )
+
+    assert applied is False
+    assert reason == "requires exactly 2 A100 GPUs"
+    assert fake_env == {}
+
+
+def test_has_required_cross_numa_gpu_shape_accepts_two_a100_gpus() -> None:
+    """Helper should accept only the required 2xA100 host shape."""
+    assert topology_env.has_required_cross_numa_gpu_shape(
+        gpu_product_names=["NVIDIA A100-SXM4-40GB", "NVIDIA A100-SXM4-80GB"]
+    )
+    assert not topology_env.has_required_cross_numa_gpu_shape(
+        gpu_product_names=["NVIDIA A100-SXM4-80GB", "NVIDIA H100-SXM5-80GB"]
+    )
+    assert not topology_env.has_required_cross_numa_gpu_shape(
+        gpu_product_names=["NVIDIA A100-SXM4-80GB"]
+    )

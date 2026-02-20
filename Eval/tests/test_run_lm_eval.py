@@ -92,6 +92,7 @@ def test_build_model_args_for_vllm_includes_parallel_and_sampling_fields(
     assert model_args["tensor_parallel_size"] == 2
     assert model_args["gpu_memory_utilization"] == 0.8
     assert model_args["data_parallel_size"] == 1
+    assert model_args["disable_log_stats"] is False
     assert model_args["trust_remote_code"] is True
     assert model_args["think_end_token"] == "</think>"
 

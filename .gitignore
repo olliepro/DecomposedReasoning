@@ -38,3 +38,4 @@ slurm-*.out
 Analysis/output/
 Eval/benchmark_evals_base/
 SFTTraining/benchmark_evals_base/
+logs/

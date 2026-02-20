@@ -5,6 +5,7 @@ description = "Standalone benchmark evaluation runner using lm-eval Python API."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "hf-transfer>=0.1.9",
   "lm-eval[hf,vllm,math]>=0.4.7",
   "pyyaml>=6.0.0",
   "wandb>=0.17.0",
