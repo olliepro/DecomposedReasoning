@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from analysis_types import RunConfig
 from vllm_client import (
     VllmClient,
     build_completions_payload,
+    build_detokenize_payload,
     parse_completions_choices,
+    parse_detokenize_text,
     parse_tokenize_ids,
 )
 
@@ -53,6 +56,7 @@ def test_build_completions_payload_for_text_prompt() -> None:
         seed=11,
         stop=("<steer",),
         top_logprobs=12,
+        priority=17,
     )
     assert payload["prompt"] == "p"
     assert payload["temperature"] == 0.7
@@ -64,6 +68,7 @@ def test_build_completions_payload_for_text_prompt() -> None:
     assert payload["stop"] == ["<steer"]
     assert payload["include_stop_str_in_output"] is True
     assert payload["return_token_ids"] is True
+    assert payload["priority"] == 17
 
 
 def test_build_completions_payload_for_token_prompt() -> None:
@@ -89,12 +94,26 @@ def test_build_completions_payload_for_token_prompt() -> None:
     assert payload["logprobs"] == 9
     assert "prompt_token_ids" not in payload
     assert "include_stop_str_in_output" not in payload
+    assert "priority" not in payload
 
 
 def test_parse_tokenize_ids_accepts_standard_key() -> None:
     """Tokenize parser should read token IDs from standard payload key."""
     token_ids = parse_tokenize_ids(response_payload={"token_ids": [1, 3, 5]})
     assert token_ids == (1, 3, 5)
+
+
+def test_build_detokenize_payload_shape() -> None:
+    """Detokenize payload should map token IDs to `tokens` request key."""
+
+    payload = build_detokenize_payload(model="m", token_ids=(7, 8, 9))
+    assert payload == {"model": "m", "tokens": [7, 8, 9]}
+
+
+def test_parse_detokenize_text_accepts_prompt_key() -> None:
+    """Detokenize parser should read decoded text from `prompt` field."""
+
+    assert parse_detokenize_text(response_payload={"prompt": "abc"}) == "abc"
 
 
 def test_tokenize_posts_to_root_endpoint_only() -> None:
@@ -118,6 +137,30 @@ def test_tokenize_posts_to_root_endpoint_only() -> None:
     assert client.root_paths == ["/tokenize"]
 
 
+def test_detokenize_posts_to_root_endpoint_only() -> None:
+    """Detokenize path should be sent to root `/detokenize` endpoint."""
+
+    class RootDetokenizeClient(VllmClient):
+        def __init__(self) -> None:
+            super().__init__(base_url="http://127.0.0.1:8000/v1")
+            self.root_paths: list[str] = []
+            self.last_payload: dict[str, Any] = {}
+
+        def _post(self, *, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+            raise AssertionError("detokenize should not call v1-relative endpoint")
+
+        def _post_root(self, *, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+            self.root_paths.append(path)
+            self.last_payload = payload
+            return {"prompt": "<exec>\n"}
+
+    client = RootDetokenizeClient()
+    decoded = client.detokenize(model="m", token_ids=(12, 34))
+    assert decoded == "<exec>\n"
+    assert client.root_paths == ["/detokenize"]
+    assert client.last_payload == {"model": "m", "tokens": [12, 34]}
+
+
 def test_top_logprobs_cap_enforced() -> None:
     """Run config should cap requested top-logprobs at server max value."""
     config = RunConfig(
@@ -128,3 +171,57 @@ def test_top_logprobs_cap_enforced() -> None:
         max_server_logprobs=7,
     )
     assert config.capped_top_logprobs() == 7
+
+
+def test_async_completions_posts_to_v1_endpoint() -> None:
+    """Async completions should call `/v1/completions` via `_post_async`."""
+
+    class AsyncCompletionsClient(VllmClient):
+        def __init__(self) -> None:
+            super().__init__(base_url="http://127.0.0.1:8000/v1")
+            self.paths: list[str] = []
+
+        def _post(self, *, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+            raise AssertionError("completions_async should not use sync _post")
+
+        async def _post_async(
+            self, *, path: str, payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            _ = payload
+            self.paths.append(path)
+            return {
+                "prompt_token_ids": [1, 2],
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "stop_reason": None,
+                        "text": "abc",
+                        "token_ids": [10],
+                        "logprobs": {
+                            "tokens": ["a"],
+                            "token_logprobs": [-0.1],
+                            "top_logprobs": [{"a": -0.1}],
+                        },
+                    }
+                ],
+            }
+
+    client = AsyncCompletionsClient()
+    choices = asyncio.run(
+        client.completions_async(
+            model="m",
+            prompt="p",
+            prompt_token_ids=None,
+            temperature=0.6,
+            top_p=0.95,
+            max_tokens=8,
+            n=1,
+            seed=9,
+            stop=("<steer",),
+            top_logprobs=3,
+        )
+    )
+    assert client.paths == ["/completions"]
+    assert len(choices) == 1
+    assert choices[0].text == "abc"

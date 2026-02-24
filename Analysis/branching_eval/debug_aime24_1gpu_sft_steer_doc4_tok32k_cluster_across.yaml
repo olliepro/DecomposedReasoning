@@ -1,0 +1,55 @@
+tasks:
+  task_names:
+    - aime24
+
+models:
+  - model_id: sft
+    checkpoint_or_repo: /fs/scratch/PAA0201/ollieproudman/DecomposedReasoning/SFTTraining/outputs/qwen3_8b_to_think_aimek4_b1_ga12/checkpoint-102-hf
+    trigger_steer_default: true
+    trigger_entropy_default: false
+
+serve:
+  host: 127.0.0.1
+  base_port: 8020
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.9
+  dtype: auto
+  trust_remote_code: true
+  max_logprobs: 20
+  startup_timeout_seconds: 900.0
+  poll_interval_seconds: 1.0
+
+decoding:
+  temperature: 0.6
+  top_p: 0.95
+  max_gen_toks: 32768
+  top_logprobs: 20
+  decode_chunk_tokens: 512
+
+branching:
+  branch_prob: 0.05
+  max_branch_points_per_rollout: 3
+  num_candidates: 100
+  branch_fanout: 4
+  max_clusters: 4
+  candidate_span_tokens: 15
+  max_steer_tokens: 15
+  entropy_threshold: 1.469524155326639
+  entropy_profile_name: aime24_default
+
+calibration:
+  entropy_threshold_path: calibration/entropy_thresholds.json
+
+artifacts:
+  output_root: output/branching_eval_debug_sft_steer_doc4_tok32k_cluster_across
+  reuse_candidate_pools: true
+
+run_matrix:
+  include_baselines: false
+  baseline_rollouts: 16
+  include_branching: true
+  selectors:
+    - cluster_across
+  seed_values:
+    - 1234
+  default_limit: null

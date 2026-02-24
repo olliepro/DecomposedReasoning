@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import aiohttp
 import json
 from dataclasses import dataclass
 from typing import Any, cast
@@ -64,7 +65,7 @@ class VllmClient:
 
     Args:
         base_url: Base URL ending in `/v1`.
-        timeout_seconds: HTTP request timeout seconds.
+        timeout_seconds: HTTP request timeout seconds. `None` disables timeout.
 
     Returns:
         Client used for completions requests and tokenization.
@@ -75,7 +76,7 @@ class VllmClient:
         True
     """
 
-    def __init__(self, *, base_url: str, timeout_seconds: float = 120.0) -> None:
+    def __init__(self, *, base_url: str, timeout_seconds: float | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.supports_prompt_token_ids: bool | None = None
@@ -93,6 +94,7 @@ class VllmClient:
         seed: int,
         stop: tuple[str, ...] | None,
         top_logprobs: int,
+        priority: int | None = None,
     ) -> tuple[GenerationChoice, ...]:
         """Call `/v1/completions` and parse choices.
 
@@ -107,6 +109,7 @@ class VllmClient:
             seed: Seed value.
             stop: Optional stop markers.
             top_logprobs: Top alternatives count.
+            priority: Optional request priority for scheduler-policy `priority`.
 
         Returns:
             Parsed generation choices.
@@ -122,8 +125,59 @@ class VllmClient:
             seed=seed,
             stop=stop,
             top_logprobs=top_logprobs,
+            priority=priority,
         )
         response_payload = self._post(path="/completions", payload=payload)
+        return parse_completions_choices(response_payload=response_payload)
+
+    async def completions_async(
+        self,
+        *,
+        model: str,
+        prompt: str | None,
+        prompt_token_ids: tuple[int, ...] | None,
+        temperature: float,
+        top_p: float,
+        max_tokens: int,
+        n: int,
+        seed: int,
+        stop: tuple[str, ...] | None,
+        top_logprobs: int,
+        priority: int | None = None,
+    ) -> tuple[GenerationChoice, ...]:
+        """Call `/v1/completions` asynchronously and parse choices.
+
+        Args:
+            model: Model name.
+            prompt: Prompt text when prompting via text.
+            prompt_token_ids: Prompt token IDs when prompting via token space.
+            temperature: Sampling temperature.
+            top_p: Nucleus sampling value.
+            max_tokens: Max generated tokens per choice.
+            n: Number of choices.
+            seed: Seed value.
+            stop: Optional stop markers.
+            top_logprobs: Top alternatives count.
+            priority: Optional request priority for scheduler-policy `priority`.
+
+        Returns:
+            Parsed generation choices.
+        """
+
+        payload = build_completions_payload(
+            model=model,
+            prompt=prompt,
+            prompt_token_ids=prompt_token_ids,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            n=n,
+            seed=seed,
+            stop=stop,
+            top_logprobs=top_logprobs,
+            priority=priority,
+        )
+        response_payload = await self._post_async(path="/completions", payload=payload)
         return parse_completions_choices(response_payload=response_payload)
 
     def tokenize(
@@ -152,6 +206,81 @@ class VllmClient:
         token_ids = parse_tokenize_ids(response_payload=response_payload)
         return token_ids
 
+    async def tokenize_async(
+        self,
+        *,
+        model: str,
+        text: str,
+        add_special_tokens: bool = False,
+    ) -> tuple[int, ...]:
+        """Tokenize one text fragment asynchronously with vLLM tokenizer.
+
+        Args:
+            model: Model name.
+            text: Text fragment to tokenize.
+            add_special_tokens: Whether tokenizer should add special tokens.
+
+        Returns:
+            Token IDs for the fragment.
+        """
+
+        payload = build_tokenize_payload(
+            model=model,
+            text=text,
+            add_special_tokens=add_special_tokens,
+        )
+        response_payload = await self._post_root_async(
+            path="/tokenize", payload=payload
+        )
+        return parse_tokenize_ids(response_payload=response_payload)
+
+    def detokenize(
+        self,
+        *,
+        model: str,
+        token_ids: tuple[int, ...],
+    ) -> str:
+        """Detokenize one token-id sequence with vLLM server tokenizer.
+
+        Args:
+            model: Model name.
+            token_ids: Token IDs to detokenize.
+
+        Returns:
+            Decoded text for the token sequence.
+        """
+        payload = build_detokenize_payload(
+            model=model,
+            token_ids=token_ids,
+        )
+        response_payload = self._post_root(path="/detokenize", payload=payload)
+        return parse_detokenize_text(response_payload=response_payload)
+
+    async def detokenize_async(
+        self,
+        *,
+        model: str,
+        token_ids: tuple[int, ...],
+    ) -> str:
+        """Detokenize one token-id sequence asynchronously with vLLM tokenizer.
+
+        Args:
+            model: Model name.
+            token_ids: Token IDs to detokenize.
+
+        Returns:
+            Decoded text for the token sequence.
+        """
+
+        payload = build_detokenize_payload(
+            model=model,
+            token_ids=token_ids,
+        )
+        response_payload = await self._post_root_async(
+            path="/detokenize", payload=payload
+        )
+        return parse_detokenize_text(response_payload=response_payload)
+
     def _post(self, *, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Execute JSON POST request and parse JSON response.
 
@@ -164,6 +293,22 @@ class VllmClient:
         """
         url = self.base_url + path
         return self._post_url(url=url, payload=payload)
+
+    async def _post_async(
+        self, *, path: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Execute async JSON POST request and parse JSON response.
+
+        Args:
+            path: API path relative to base URL.
+            payload: JSON payload.
+
+        Returns:
+            Parsed JSON payload.
+        """
+
+        url = self.base_url + path
+        return await self._post_url_async(url=url, payload=payload)
 
     def _post_root(self, *, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Execute JSON POST request against server root instead of base-url endpoint.
@@ -181,6 +326,25 @@ class VllmClient:
         url = root_url + path
         return self._post_url(url=url, payload=payload)
 
+    async def _post_root_async(
+        self, *, path: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Execute async JSON POST request against server root endpoint.
+
+        Args:
+            path: API path relative to server root.
+            payload: JSON payload.
+
+        Returns:
+            Parsed JSON payload.
+        """
+
+        root_url = self.base_url
+        if root_url.endswith("/v1"):
+            root_url = root_url[:-3]
+        url = root_url + path
+        return await self._post_url_async(url=url, payload=payload)
+
     def _post_url(self, *, url: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Execute JSON POST request to an explicit URL and parse response.
 
@@ -197,16 +361,51 @@ class VllmClient:
             data=body,
             headers={"Content-Type": "application/json"},
         )
+        request_kwargs: dict[str, Any] = {}
+        if self.timeout_seconds is not None:
+            request_kwargs["timeout"] = self.timeout_seconds
         try:
-            with urllib_request.urlopen(
-                request, timeout=self.timeout_seconds
-            ) as response:
+            with urllib_request.urlopen(request, **request_kwargs) as response:
                 response_text = response.read().decode("utf-8")
         except urllib_error.HTTPError as http_error:
             error_text = http_error.read().decode("utf-8", errors="replace")
             raise VllmRequestError(error_text) from http_error
         except urllib_error.URLError as url_error:
             raise VllmRequestError(str(url_error)) from url_error
+        payload_obj = json.loads(response_text)
+        assert isinstance(payload_obj, dict), "response must be a JSON object"
+        return payload_obj
+
+    async def _post_url_async(
+        self, *, url: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Execute async JSON POST request to an explicit URL.
+
+        Args:
+            url: Absolute request URL.
+            payload: JSON payload.
+
+        Returns:
+            Parsed JSON payload.
+        """
+
+        timeout = (
+            aiohttp.ClientTimeout(total=self.timeout_seconds)
+            if self.timeout_seconds is not None
+            else aiohttp.ClientTimeout(total=None)
+        )
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    url=url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                ) as response:
+                    response_text = await response.text()
+                    if response.status >= 400:
+                        raise VllmRequestError(response_text)
+        except aiohttp.ClientError as client_error:
+            raise VllmRequestError(str(client_error)) from client_error
         payload_obj = json.loads(response_text)
         assert isinstance(payload_obj, dict), "response must be a JSON object"
         return payload_obj
@@ -224,6 +423,7 @@ def build_completions_payload(
     seed: int,
     stop: tuple[str, ...] | None,
     top_logprobs: int,
+    priority: int | None = None,
 ) -> dict[str, Any]:
     """Build payload for `/v1/completions`.
 
@@ -238,6 +438,7 @@ def build_completions_payload(
         seed: Seed value.
         stop: Optional stop markers.
         top_logprobs: Top alternatives count.
+        priority: Optional request priority for scheduler-policy `priority`.
 
     Returns:
         JSON-ready request payload.
@@ -266,6 +467,8 @@ def build_completions_payload(
     if stop is not None:
         payload["stop"] = list(stop)
         payload["include_stop_str_in_output"] = True
+    if priority is not None:
+        payload["priority"] = int(priority)
     return payload
 
 
@@ -289,6 +492,26 @@ def build_tokenize_payload(
         "model": model,
         "prompt": text,
         "add_special_tokens": add_special_tokens,
+    }
+
+
+def build_detokenize_payload(
+    *,
+    model: str,
+    token_ids: tuple[int, ...],
+) -> dict[str, Any]:
+    """Build payload for `/detokenize`.
+
+    Args:
+        model: Model name.
+        token_ids: Token IDs to detokenize.
+
+    Returns:
+        JSON-ready request payload.
+    """
+    return {
+        "model": model,
+        "tokens": list(token_ids),
     }
 
 
@@ -329,6 +552,22 @@ def parse_tokenize_ids(*, response_payload: dict[str, Any]) -> tuple[int, ...]:
         if parsed is not None:
             return parsed
     raise AssertionError("tokenize response missing token IDs")
+
+
+def parse_detokenize_text(*, response_payload: dict[str, Any]) -> str:
+    """Parse decoded text from `/detokenize` response payload.
+
+    Args:
+        response_payload: JSON payload from `/detokenize`.
+
+    Returns:
+        Decoded text.
+    """
+    for key in ("prompt", "text"):
+        value = response_payload.get(key)
+        if isinstance(value, str):
+            return value
+    raise AssertionError("detokenize response missing decoded text")
 
 
 def _require_choices(*, response_payload: dict[str, Any]) -> list[dict[str, Any]]:

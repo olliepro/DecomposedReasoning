@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "google-genai>=0.7.0",
+  "lm-eval[hf,vllm,math]>=0.4.7",
+  "pyyaml>=6.0.0",
 ]
 
 [project.optional-dependencies]
@@ -20,9 +22,13 @@ pythonpath = ["."]
 testpaths = ["tests"]
 
 [tool.pyright]
-include = ["*.py", "tests"]
+include = ["*.py", "branching_eval", "tests"]
 pythonVersion = "3.10"
 typeCheckingMode = "basic"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["branching_eval*"]
 
 [build-system]
 requires = ["setuptools>=68.0.0", "wheel"]

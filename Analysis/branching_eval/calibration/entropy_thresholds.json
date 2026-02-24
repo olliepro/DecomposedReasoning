@@ -1,0 +1,8 @@
+{
+  "aime24_default": {
+    "entropy_threshold": 1.7048368837530428,
+    "percentile": 95.0,
+    "source": "Analysis/output",
+    "sample_count": 41174
+  }
+}

@@ -1,0 +1,61 @@
+tasks:
+  task_names:
+    - aime24
+
+models:
+  - model_id: non_sft
+    checkpoint_or_repo: Qwen/Qwen3-8B
+    trigger_steer_default: false
+    trigger_entropy_default: true
+  - model_id: sft
+    checkpoint_or_repo: /path/to/qwen3_8b_sft_checkpoint
+    trigger_steer_default: true
+    trigger_entropy_default: false
+
+serve:
+  host: 127.0.0.1
+  base_port: 8020
+  tensor_parallel_size: 2
+  gpu_memory_utilization: 0.9
+  dtype: auto
+  trust_remote_code: true
+  max_logprobs: 20
+  startup_timeout_seconds: 180.0
+  poll_interval_seconds: 1.0
+
+decoding:
+  temperature: 0.6
+  top_p: 0.95
+  max_gen_toks: 16384
+  top_logprobs: 20
+  decode_chunk_tokens: 512
+
+branching:
+  branch_prob: 0.05
+  max_branch_points_per_rollout: 2
+  num_candidates: 100
+  branch_fanout: 4
+  max_clusters: 4
+  candidate_span_tokens: 15
+  max_steer_tokens: 15
+  entropy_profile_name: aime24_default
+
+calibration:
+  entropy_threshold_path: calibration/entropy_thresholds.json
+
+artifacts:
+  output_root: output/branching_eval
+  reuse_candidate_pools: true
+
+run_matrix:
+  include_baselines: true
+  baseline_rollouts: 16
+  include_branching: true
+  selectors:
+    - cluster_across
+    - embed_diverse
+    - within_cluster
+    - random
+  seed_values:
+    - 1234
+  default_limit: null

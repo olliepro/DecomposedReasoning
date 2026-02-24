@@ -19,6 +19,33 @@ uv run python run_steer_branching.py \
   --base-url http://127.0.0.1:8000/v1
 ```
 
+## Run branching lm_eval framework (AIME24 default)
+
+```bash
+cd Analysis
+uv run python run_branching_lm_eval.py \
+  --config branching_eval/example_aime24.yaml
+```
+
+Optional overrides:
+
+```bash
+cd Analysis
+uv run python run_branching_lm_eval.py \
+  --config branching_eval/example_aime24.yaml \
+  --limit 2 \
+  --seed 1234 \
+  --selector random \
+  --model non_sft
+```
+
+One-time entropy calibration helper:
+
+```bash
+cd /users/PAA0201/ollieproudman/work/DecomposedReasoning
+python Analysis/scripts/calibrate_entropy_threshold.py
+```
+
 Outputs are written under `output/<run_id>/`:
 - `config.json`
 - `steps.jsonl`
