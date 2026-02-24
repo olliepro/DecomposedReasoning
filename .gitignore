@@ -36,6 +36,8 @@ wandb/
 # Cluster and experiment run artifacts
 slurm-*.out
 Analysis/output/
+Analysis/branching_eval/output/
+Analysis/scripts/_tmp_*.sh
 Eval/benchmark_evals_base/
 SFTTraining/benchmark_evals_base/
 logs/
