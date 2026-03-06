@@ -137,6 +137,11 @@ def append_finished_attempt_with_custom_leaves(
             "verification": 1,
             "stop_reason": "think_end",
         },
+        {
+            "leaf_id": "leaf_incorrect_repetition",
+            "verification": 0,
+            "stop_reason": "repeated_exec_block_loop",
+        },
     ]
     for payload in leaf_payloads:
         store.append_event(
@@ -160,8 +165,8 @@ def append_finished_attempt_with_custom_leaves(
         event_type="doc_finished",
         payload={
             "status": "completed",
-            "leaf_count": 3,
-            "leaf_lengths": [3, 3, 3],
+            "leaf_count": 4,
+            "leaf_lengths": [3, 3, 3, 3],
             "doc_metrics": {"acc": 2 / 3},
             "diagnostics": {"doc_id": doc_id, "selector_mode": "random"},
         },
@@ -196,6 +201,8 @@ def test_event_replay_index_selects_latest_completed_else_partial(
     index_html = (output_dir / "index.html").read_text(encoding="utf-8")
     assert 'class="path-code"' in index_html
     assert 'class="muted path-row"' in index_html
+    assert "<th>correct/incorrect</th>" in index_html
+    assert ">1/0<" in index_html
 
 
 def test_render_snapshot_tree_payload_is_valid_json_script(tmp_path: Path) -> None:
@@ -237,6 +244,7 @@ def test_render_snapshot_tree_payload_is_valid_json_script(tmp_path: Path) -> No
     assert "❌" in html
     assert "🛑" in html
     assert "🏁" in html
+    assert "🔁" in html
 
     match = re.search(
         r'<script type="application/json" id="tree-data">(.*?)</script>',
@@ -274,10 +282,16 @@ def test_render_snapshot_scored_leaf_table_sorts_and_renders_heatmap(
     assert (
         '<h3 style="margin:0.28rem 0 0.55rem 0">Verification x Stop Reason</h3>' in html
     )
-    assert "<th>verify \\ stop</th><th>think_end</th><th>length</th>" in html
+    assert (
+        "<th>verify \\ stop</th><th>🏁 think_end</th><th>🛑 length</th>"
+        "<th>🔁 repeated_exec_block_loop</th>" in html
+    )
     assert html.index("<th scope='row'>correct</th>") < html.index(
         "<th scope='row'>incorrect</th>"
     )
+    assert "🏁 think_end" in html
+    assert "🛑 length" in html
+    assert "🔁 repeated_exec_block_loop" in html
     leaf_ids = re.findall(r"<td><code>(leaf_[^<]+)</code></td>", html)
     assert leaf_ids[:3] == [
         "leaf_correct_think",

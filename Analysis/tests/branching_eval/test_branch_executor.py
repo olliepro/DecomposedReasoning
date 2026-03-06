@@ -50,6 +50,7 @@ class FakeClient:
         stop: tuple[str, ...] | None,
         top_logprobs: int,
         priority: int | None = None,
+        repetition_penalty: float | None = None,
     ) -> tuple[GenerationChoice, ...]:
         _ = (
             model,
@@ -62,6 +63,7 @@ class FakeClient:
             stop,
             top_logprobs,
             priority,
+            repetition_penalty,
         )
         if n == 100:
             self.candidate_calls += 1
@@ -91,6 +93,7 @@ class FakeClient:
         stop: tuple[str, ...] | None,
         top_logprobs: int,
         priority: int | None = None,
+        repetition_penalty: float | None = None,
     ) -> tuple[GenerationChoice, ...]:
         """Async wrapper matching executor async completion interface."""
 
@@ -106,6 +109,7 @@ class FakeClient:
             stop=stop,
             top_logprobs=top_logprobs,
             priority=priority,
+            repetition_penalty=repetition_penalty,
         )
 
     def tokenize(
@@ -155,6 +159,7 @@ class AsyncDecodeClient(FakeClient):
         stop: tuple[str, ...] | None,
         top_logprobs: int,
         priority: int | None = None,
+        repetition_penalty: float | None = None,
     ) -> tuple[GenerationChoice, ...]:
         _ = (
             model,
@@ -167,6 +172,7 @@ class AsyncDecodeClient(FakeClient):
             stop,
             top_logprobs,
             priority,
+            repetition_penalty,
         )
         self.request_start_times.append(time.perf_counter())
         await asyncio.sleep(0.05)
@@ -183,6 +189,7 @@ class AsyncDecodeClient(FakeClient):
                 stop=stop,
                 top_logprobs=top_logprobs,
                 priority=priority,
+                repetition_penalty=repetition_penalty,
             )
         return (
             GenerationChoice(
@@ -1685,6 +1692,353 @@ def test_maxed_path_keeps_steer_normalization_without_branching(
         for row in events
         if row.get("event_type") == "decode_chunk"
     )
+
+
+def test_steer_exec_repeat_loop_terminates_branch(tmp_path: Path, monkeypatch) -> None:
+    """Steer decode should terminate when exec blocks repeat 3 times at >=85% match."""
+
+    monkeypatch.setattr(
+        "branching_eval.branch_executor.REPEAT_TERMINATION_MIN_GENERATED_TOKENS",
+        0,
+    )
+    executor = build_executor(
+        tmp_path=tmp_path,
+        branch_prob=0.0,
+        trigger_steer_enabled=True,
+        trigger_entropy_enabled=False,
+    )
+    repeated_exec_chunk = "Repeat this execution block exactly.</exec>\n\n"
+    call_counts = {"generate": 0, "continued": 0}
+
+    async def fake_generate_choice(
+        *,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+        max_tokens: int,
+        stop: tuple[str, ...] | None,
+        n: int,
+        **kwargs: object,
+    ) -> GenerationChoice:
+        _ = assistant_prefix, prompt_token_ids, max_tokens, stop, n, kwargs
+        call_counts["generate"] += 1
+        assert (
+            call_counts["generate"] <= 3
+        ), "repeat-loop termination should stop decode"
+        return GenerationChoice(
+            index=0,
+            text=repeated_exec_chunk,
+            finish_reason="stop",
+            stop_reason="<steer",
+            tokens=(
+                ParsedToken(
+                    token=repeated_exec_chunk,
+                    logprob=-0.1,
+                    top_entries=(("a", -0.2),),
+                ),
+            ),
+            prompt_token_ids=(1, 2, 3),
+            token_ids=(40 + call_counts["generate"],),
+        )
+
+    async def fake_continue_with_single(
+        *,
+        executor: BranchExecutor,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+        token_ids: tuple[int, ...],
+        token_traces: tuple[TokenTrace, ...],
+        generated_tokens: int,
+        request_stream_id: str,
+    ) -> DecodeOutcome:
+        _ = (
+            executor,
+            prompt_token_ids,
+            token_ids,
+            token_traces,
+            generated_tokens,
+            request_stream_id,
+        )
+        call_counts["continued"] += 1
+        return DecodeOutcome(
+            event_type="continued",
+            trigger_type=None,
+            entropy_value=None,
+            assistant_prefix=f"{assistant_prefix}Repeat steering plan</steer>\n<exec>\n",
+            prompt_token_ids=prompt_token_ids,
+            token_ids=token_ids,
+            token_traces=token_traces,
+            generated_tokens=generated_tokens,
+            stop_reason="",
+        )
+
+    monkeypatch.setattr(executor, "_generate_choice_async", fake_generate_choice)
+    monkeypatch.setattr(
+        "branching_eval.branch_executor.continue_with_single_steer_candidate_async",
+        fake_continue_with_single,
+    )
+    outcome = executor._decode_until_event(
+        tree=_minimal_tree(),
+        state=PathState(
+            node_id="node_root",
+            assistant_prefix="<think><steer>Repeat</steer>\n<exec>",
+            prompt_token_ids=(1, 2, 3),
+            token_ids=(),
+            token_traces=(),
+            branch_points_used=0,
+        ),
+    )
+    assert outcome.event_type == "terminated"
+    assert outcome.stop_reason == "repeated_exec_block_loop"
+    assert call_counts["generate"] == 3
+    assert call_counts["continued"] == 2
+    events = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    repeat_events = [
+        row for row in events if row.get("event_type") == "exec_repeat_terminated"
+    ]
+    assert repeat_events
+    payload = dict(repeat_events[-1].get("payload", {}))
+    assert int(payload["repeated_exec_blocks"]) >= 3
+    assert float(payload["similarity_threshold"]) == 0.85
+    assert int(payload["similarity_lookback_window"]) == 3
+    assert int(payload["termination_block_count"]) == 3
+
+
+def test_steer_exec_repeat_loop_terminates_on_alternating_blocks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Alternating repeat blocks should terminate with lookback-window matching."""
+
+    monkeypatch.setattr(
+        "branching_eval.branch_executor.REPEAT_TERMINATION_MIN_GENERATED_TOKENS",
+        0,
+    )
+    executor = build_executor(
+        tmp_path=tmp_path,
+        branch_prob=0.0,
+        trigger_steer_enabled=True,
+        trigger_entropy_enabled=False,
+    )
+    alternating_exec_chunks = (
+        "Alpha execution loop chunk.</exec>\n\n",
+        "Beta execution loop chunk.</exec>\n\n",
+    )
+    call_counts = {"generate": 0, "continued": 0}
+
+    async def fake_generate_choice(
+        *,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+        max_tokens: int,
+        stop: tuple[str, ...] | None,
+        n: int,
+        **kwargs: object,
+    ) -> GenerationChoice:
+        _ = assistant_prefix, prompt_token_ids, max_tokens, stop, n, kwargs
+        call_counts["generate"] += 1
+        assert (
+            call_counts["generate"] <= 4
+        ), "alternating repeat-loop termination should stop decode"
+        chunk_index = (call_counts["generate"] - 1) % len(alternating_exec_chunks)
+        exec_chunk = alternating_exec_chunks[chunk_index]
+        return GenerationChoice(
+            index=0,
+            text=exec_chunk,
+            finish_reason="stop",
+            stop_reason="<steer",
+            tokens=(
+                ParsedToken(
+                    token=exec_chunk,
+                    logprob=-0.1,
+                    top_entries=(("a", -0.2),),
+                ),
+            ),
+            prompt_token_ids=(1, 2, 3),
+            token_ids=(90 + call_counts["generate"],),
+        )
+
+    async def fake_continue_with_single(
+        *,
+        executor: BranchExecutor,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+        token_ids: tuple[int, ...],
+        token_traces: tuple[TokenTrace, ...],
+        generated_tokens: int,
+        request_stream_id: str,
+    ) -> DecodeOutcome:
+        _ = (
+            executor,
+            prompt_token_ids,
+            token_ids,
+            token_traces,
+            generated_tokens,
+            request_stream_id,
+        )
+        call_counts["continued"] += 1
+        return DecodeOutcome(
+            event_type="continued",
+            trigger_type=None,
+            entropy_value=None,
+            assistant_prefix=f"{assistant_prefix}Alternate steering</steer>\n<exec>\n",
+            prompt_token_ids=prompt_token_ids,
+            token_ids=token_ids,
+            token_traces=token_traces,
+            generated_tokens=generated_tokens,
+            stop_reason="",
+        )
+
+    monkeypatch.setattr(executor, "_generate_choice_async", fake_generate_choice)
+    monkeypatch.setattr(
+        "branching_eval.branch_executor.continue_with_single_steer_candidate_async",
+        fake_continue_with_single,
+    )
+    outcome = executor._decode_until_event(
+        tree=_minimal_tree(),
+        state=PathState(
+            node_id="node_root",
+            assistant_prefix="<think><steer>Alternating</steer>\n<exec>",
+            prompt_token_ids=(1, 2, 3),
+            token_ids=(),
+            token_traces=(),
+            branch_points_used=0,
+        ),
+    )
+    assert outcome.event_type == "terminated"
+    assert outcome.stop_reason == "repeated_exec_block_loop"
+    assert call_counts["generate"] == 3
+    assert call_counts["continued"] == 2
+    events = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    repeat_events = [
+        row for row in events if row.get("event_type") == "exec_repeat_terminated"
+    ]
+    assert repeat_events
+    payload = dict(repeat_events[-1].get("payload", {}))
+    assert int(payload["repeated_exec_blocks"]) >= 3
+    assert float(payload["last_similarity_ratio"]) >= 0.85
+    assert int(payload["similarity_lookback_window"]) == 3
+    assert int(payload["termination_block_count"]) == 3
+
+
+def test_steer_block_repeat_loop_terminates_on_alternating_blocks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Alternating steer blocks should terminate at 4 matches with lookback 3."""
+
+    monkeypatch.setattr(
+        "branching_eval.branch_executor.REPEAT_TERMINATION_MIN_GENERATED_TOKENS",
+        0,
+    )
+    executor = build_executor(
+        tmp_path=tmp_path,
+        branch_prob=0.0,
+        trigger_steer_enabled=True,
+        trigger_entropy_enabled=False,
+    )
+    exec_chunks = (
+        "Red square orbit.</exec>\n\n",
+        "Blue triangle pulse.</exec>\n\n",
+        "Gold spiral vector.</exec>\n\n",
+        "Green prism lattice.</exec>\n\n",
+        "Silver wave tangent.</exec>\n\n",
+    )
+    steer_chunks = ("Alpha steering loop.", "Beta steering loop.")
+    call_counts = {"generate": 0, "continued": 0}
+
+    async def fake_generate_choice(
+        *,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+        max_tokens: int,
+        stop: tuple[str, ...] | None,
+        n: int,
+        **kwargs: object,
+    ) -> GenerationChoice:
+        _ = assistant_prefix, prompt_token_ids, max_tokens, stop, n, kwargs
+        call_counts["generate"] += 1
+        assert call_counts["generate"] <= len(
+            exec_chunks
+        ), "steer repeat-loop termination should stop decode"
+        exec_chunk = exec_chunks[call_counts["generate"] - 1]
+        return GenerationChoice(
+            index=0,
+            text=exec_chunk,
+            finish_reason="stop",
+            stop_reason="<steer",
+            tokens=(
+                ParsedToken(
+                    token=exec_chunk,
+                    logprob=-0.1,
+                    top_entries=(("a", -0.2),),
+                ),
+            ),
+            prompt_token_ids=(1, 2, 3),
+            token_ids=(130 + call_counts["generate"],),
+        )
+
+    async def fake_continue_with_single(
+        *,
+        executor: BranchExecutor,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+        token_ids: tuple[int, ...],
+        token_traces: tuple[TokenTrace, ...],
+        generated_tokens: int,
+        request_stream_id: str,
+    ) -> DecodeOutcome:
+        _ = (
+            executor,
+            prompt_token_ids,
+            token_ids,
+            token_traces,
+            generated_tokens,
+            request_stream_id,
+        )
+        call_counts["continued"] += 1
+        steer_chunk_index = (call_counts["continued"] - 1) % len(steer_chunks)
+        steer_chunk = steer_chunks[steer_chunk_index]
+        return DecodeOutcome(
+            event_type="continued",
+            trigger_type=None,
+            entropy_value=None,
+            assistant_prefix=f"{assistant_prefix}{steer_chunk}</steer>\n<exec>\n",
+            prompt_token_ids=prompt_token_ids,
+            token_ids=token_ids,
+            token_traces=token_traces,
+            generated_tokens=generated_tokens,
+            stop_reason="",
+        )
+
+    monkeypatch.setattr(executor, "_generate_choice_async", fake_generate_choice)
+    monkeypatch.setattr(
+        "branching_eval.branch_executor.continue_with_single_steer_candidate_async",
+        fake_continue_with_single,
+    )
+    outcome = executor._decode_until_event(
+        tree=_minimal_tree(),
+        state=PathState(
+            node_id="node_root",
+            assistant_prefix="<think><steer>Seed steering</steer>\n<exec>",
+            prompt_token_ids=(1, 2, 3),
+            token_ids=(),
+            token_traces=(),
+            branch_points_used=0,
+        ),
+    )
+    assert outcome.event_type == "terminated"
+    assert outcome.stop_reason == "repeated_steer_block_loop"
+    assert call_counts["generate"] == len(exec_chunks)
+    assert call_counts["continued"] == len(exec_chunks)
+    events = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    repeat_events = [
+        row for row in events if row.get("event_type") == "steer_repeat_terminated"
+    ]
+    assert repeat_events
+    payload = dict(repeat_events[-1].get("payload", {}))
+    assert int(payload["repeated_steer_blocks"]) >= 4
+    assert float(payload["similarity_threshold"]) == 0.85
+    assert int(payload["similarity_lookback_window"]) == 3
+    assert int(payload["termination_block_count"]) == 4
+    assert float(payload["last_similarity_ratio"]) >= 0.85
 
 
 def test_single_steer_continuation_keeps_vllm_tokens_and_appends_suffix(

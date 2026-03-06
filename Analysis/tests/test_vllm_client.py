@@ -57,6 +57,7 @@ def test_build_completions_payload_for_text_prompt() -> None:
         stop=("<steer",),
         top_logprobs=12,
         priority=17,
+        repetition_penalty=1.1,
     )
     assert payload["prompt"] == "p"
     assert payload["temperature"] == 0.7
@@ -69,6 +70,7 @@ def test_build_completions_payload_for_text_prompt() -> None:
     assert payload["include_stop_str_in_output"] is True
     assert payload["return_token_ids"] is True
     assert payload["priority"] == 17
+    assert payload["repetition_penalty"] == 1.1
 
 
 def test_build_completions_payload_for_token_prompt() -> None:
@@ -95,6 +97,7 @@ def test_build_completions_payload_for_token_prompt() -> None:
     assert "prompt_token_ids" not in payload
     assert "include_stop_str_in_output" not in payload
     assert "priority" not in payload
+    assert "repetition_penalty" not in payload
 
 
 def test_parse_tokenize_ids_accepts_standard_key() -> None:

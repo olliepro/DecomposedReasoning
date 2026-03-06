@@ -16,9 +16,13 @@ from branching_eval.branch_decode_utils import (
     candidate_from_choice,
     candidate_text_by_id,
     consume_choice_tokens,
+    initialize_exec_repetition_state,
+    initialize_steer_repetition_state,
     is_explicit_steer_stop,
     rollout_stop_markers,
     selected_ids_for_mode,
+    update_exec_repetition_state,
+    update_steer_repetition_state,
     updated_prompt_token_ids,
 )
 from branching_eval.config_types import BranchingConfig, DecodingConfig
@@ -64,6 +68,18 @@ from token_metrics import approximate_entropy
 from vllm_client import GenerationChoice, ParsedToken, VllmClient, VllmRequestError
 
 MAX_LOGPROB_ALTERNATIVES = 4
+EXEC_REPEAT_SIMILARITY_THRESHOLD = 0.85
+EXEC_REPEAT_SIMILARITY_LOOKBACK_WINDOW = 3
+EXEC_REPEAT_TERMINATION_BLOCK_COUNT = 3
+EXEC_REPEAT_STOP_REASON = "repeated_exec_block_loop"
+STEER_REPEAT_SIMILARITY_THRESHOLD = 0.85
+STEER_REPEAT_SIMILARITY_LOOKBACK_WINDOW = 3
+STEER_REPEAT_TERMINATION_BLOCK_COUNT = 4
+STEER_REPEAT_STOP_REASON = "repeated_steer_block_loop"
+REPEAT_TERMINATION_MIN_GENERATED_TOKENS = 10_000
+STEER_REPETITION_REQUEST_KINDS = frozenset(
+    {"candidate_pool_steer_boundary", "steer_single_candidate"}
+)
 NODE_CHILD_ID_PATTERN = re.compile(
     r"^node_(?P<parent_node_id>.+)_(?P<child_offset>\d+)_(?P<candidate_id>\d+)$"
 )
@@ -1254,6 +1270,108 @@ class BranchExecutor:
         )
         branch_prob = self.branching.branch_prob if branching_enabled else 0.0
         rollout_stop = rollout_stop_markers(steer_enabled=trigger_steer_enabled)
+        exec_repetition_state = initialize_exec_repetition_state(
+            text=assistant_prefix,
+            similarity_threshold=EXEC_REPEAT_SIMILARITY_THRESHOLD,
+            similarity_lookback_window=EXEC_REPEAT_SIMILARITY_LOOKBACK_WINDOW,
+        )
+        steer_repetition_state = initialize_steer_repetition_state(
+            text=assistant_prefix,
+            similarity_threshold=STEER_REPEAT_SIMILARITY_THRESHOLD,
+            similarity_lookback_window=STEER_REPEAT_SIMILARITY_LOOKBACK_WINDOW,
+        )
+
+        def update_exec_repetition(*, delta_text: str) -> float | None:
+            """Update exec repetition tracking from one appended text delta."""
+
+            nonlocal exec_repetition_state
+            if not trigger_steer_enabled:
+                return None
+            (
+                exec_repetition_state,
+                similarity_ratio,
+            ) = update_exec_repetition_state(
+                state=exec_repetition_state,
+                chunk_text=delta_text,
+                similarity_threshold=EXEC_REPEAT_SIMILARITY_THRESHOLD,
+                similarity_lookback_window=EXEC_REPEAT_SIMILARITY_LOOKBACK_WINDOW,
+            )
+            return similarity_ratio
+
+        def update_steer_repetition(*, delta_text: str) -> float | None:
+            """Update steer repetition tracking from one appended text delta."""
+
+            nonlocal steer_repetition_state
+            if not trigger_steer_enabled:
+                return None
+            (
+                steer_repetition_state,
+                similarity_ratio,
+            ) = update_steer_repetition_state(
+                state=steer_repetition_state,
+                chunk_text=delta_text,
+                similarity_threshold=STEER_REPEAT_SIMILARITY_THRESHOLD,
+                similarity_lookback_window=STEER_REPEAT_SIMILARITY_LOOKBACK_WINDOW,
+            )
+            return similarity_ratio
+
+        def repeated_block_termination_outcome(
+            *,
+            last_exec_similarity_ratio: float | None,
+            last_steer_similarity_ratio: float | None,
+        ) -> DecodeOutcome | None:
+            """Return repeat-loop termination outcome when threshold is reached."""
+
+            if (
+                trigger_steer_enabled
+                and generated_tokens >= REPEAT_TERMINATION_MIN_GENERATED_TOKENS
+                and exec_repetition_state.repeated_exec_blocks
+                >= EXEC_REPEAT_TERMINATION_BLOCK_COUNT
+            ):
+                self._append_exec_repeat_terminated_event(
+                    tree=tree,
+                    node_id=state.node_id,
+                    repeated_exec_blocks=exec_repetition_state.repeated_exec_blocks,
+                    last_similarity_ratio=last_exec_similarity_ratio,
+                    previous_exec_block=exec_repetition_state.previous_exec_block,
+                )
+                return DecodeOutcome(
+                    event_type="terminated",
+                    trigger_type=None,
+                    entropy_value=None,
+                    assistant_prefix=assistant_prefix,
+                    prompt_token_ids=prompt_token_ids,
+                    token_ids=tuple(token_ids),
+                    token_traces=tuple(token_traces),
+                    generated_tokens=generated_tokens,
+                    stop_reason=EXEC_REPEAT_STOP_REASON,
+                )
+            if (
+                trigger_steer_enabled
+                and generated_tokens >= REPEAT_TERMINATION_MIN_GENERATED_TOKENS
+                and steer_repetition_state.repeated_exec_blocks
+                >= STEER_REPEAT_TERMINATION_BLOCK_COUNT
+            ):
+                self._append_steer_repeat_terminated_event(
+                    tree=tree,
+                    node_id=state.node_id,
+                    repeated_steer_blocks=steer_repetition_state.repeated_exec_blocks,
+                    last_similarity_ratio=last_steer_similarity_ratio,
+                    previous_steer_block=steer_repetition_state.previous_exec_block,
+                )
+                return DecodeOutcome(
+                    event_type="terminated",
+                    trigger_type=None,
+                    entropy_value=None,
+                    assistant_prefix=assistant_prefix,
+                    prompt_token_ids=prompt_token_ids,
+                    token_ids=tuple(token_ids),
+                    token_traces=tuple(token_traces),
+                    generated_tokens=generated_tokens,
+                    stop_reason=STEER_REPEAT_STOP_REASON,
+                )
+            return None
+
         while generated_tokens < self.decoding.max_gen_toks:
             chunk_prefix_before = assistant_prefix
             chunk_prompt_token_ids_before = prompt_token_ids
@@ -1348,6 +1466,30 @@ class BranchExecutor:
                 choice=choice,
                 consumed_tokens=consumed_tokens,
             )
+            decode_chunk_text, _ = self._state_delta(
+                prefix_before=chunk_prefix_before,
+                prefix_after=assistant_prefix,
+                token_ids_before=chunk_token_ids_before,
+                token_ids_after=tuple(token_ids),
+            )
+            last_exec_similarity_ratio = update_exec_repetition(
+                delta_text=decode_chunk_text
+            )
+            last_steer_similarity_ratio = update_steer_repetition(
+                delta_text=decode_chunk_text
+            )
+            repeated_outcome = repeated_block_termination_outcome(
+                last_exec_similarity_ratio=last_exec_similarity_ratio,
+                last_steer_similarity_ratio=last_steer_similarity_ratio,
+            )
+            if repeated_outcome is not None:
+                append_decode_event(
+                    prefix_after=repeated_outcome.assistant_prefix,
+                    prompt_token_ids_after=repeated_outcome.prompt_token_ids,
+                    token_ids_after=repeated_outcome.token_ids,
+                    generated_after=repeated_outcome.generated_tokens,
+                )
+                return repeated_outcome
             if chunk_outcome.event_type == "trigger":
                 if chunk_outcome.trigger_type != "steer_boundary":
                     trigger_outcome = replace(
@@ -1416,6 +1558,14 @@ class BranchExecutor:
                     prompt_token_ids=normalized_prompt_ids,
                     stop_reason="",
                 )
+                explicit_trigger_text, _ = self._state_delta(
+                    prefix_before=assistant_prefix,
+                    prefix_after=explicit_trigger.assistant_prefix,
+                    token_ids_before=tuple(token_ids),
+                    token_ids_after=explicit_trigger.token_ids,
+                )
+                _ = update_exec_repetition(delta_text=explicit_trigger_text)
+                _ = update_steer_repetition(delta_text=explicit_trigger_text)
                 if branching_enabled and should_branch_at_trigger(executor=self):
                     append_decode_event(
                         prefix_after=explicit_trigger.assistant_prefix,
@@ -1456,6 +1606,24 @@ class BranchExecutor:
                     generated_tokens_before_chunk=explicit_trigger.generated_tokens,
                     continued=continued,
                 )
+                steer_chunk_text, _ = self._state_delta(
+                    prefix_before=explicit_trigger.assistant_prefix,
+                    prefix_after=continued.assistant_prefix,
+                    token_ids_before=explicit_trigger.token_ids,
+                    token_ids_after=continued.token_ids,
+                )
+                last_exec_similarity_ratio = update_exec_repetition(
+                    delta_text=steer_chunk_text
+                )
+                last_steer_similarity_ratio = update_steer_repetition(
+                    delta_text=steer_chunk_text
+                )
+                repeated_outcome = repeated_block_termination_outcome(
+                    last_exec_similarity_ratio=last_exec_similarity_ratio,
+                    last_steer_similarity_ratio=last_steer_similarity_ratio,
+                )
+                if repeated_outcome is not None:
+                    return repeated_outcome
                 assistant_prefix = continued.assistant_prefix
                 prompt_token_ids = continued.prompt_token_ids
                 token_ids = list(continued.token_ids)
@@ -1489,6 +1657,14 @@ class BranchExecutor:
                         generated_after=steer_length_outcome.generated_tokens,
                     )
                     return steer_length_outcome
+                steer_length_trigger_text, _ = self._state_delta(
+                    prefix_before=assistant_prefix,
+                    prefix_after=steer_length_outcome.assistant_prefix,
+                    token_ids_before=tuple(token_ids),
+                    token_ids_after=steer_length_outcome.token_ids,
+                )
+                _ = update_exec_repetition(delta_text=steer_length_trigger_text)
+                _ = update_steer_repetition(delta_text=steer_length_trigger_text)
                 continued = await continue_with_single_steer_candidate_async(
                     executor=self,
                     assistant_prefix=steer_length_outcome.assistant_prefix,
@@ -1521,6 +1697,24 @@ class BranchExecutor:
                     generated_tokens_before_chunk=steer_length_outcome.generated_tokens,
                     continued=continued,
                 )
+                steer_chunk_text, _ = self._state_delta(
+                    prefix_before=steer_length_outcome.assistant_prefix,
+                    prefix_after=continued.assistant_prefix,
+                    token_ids_before=steer_length_outcome.token_ids,
+                    token_ids_after=continued.token_ids,
+                )
+                last_exec_similarity_ratio = update_exec_repetition(
+                    delta_text=steer_chunk_text
+                )
+                last_steer_similarity_ratio = update_steer_repetition(
+                    delta_text=steer_chunk_text
+                )
+                repeated_outcome = repeated_block_termination_outcome(
+                    last_exec_similarity_ratio=last_exec_similarity_ratio,
+                    last_steer_similarity_ratio=last_steer_similarity_ratio,
+                )
+                if repeated_outcome is not None:
+                    return repeated_outcome
                 assistant_prefix = continued.assistant_prefix
                 prompt_token_ids = continued.prompt_token_ids
                 token_ids = list(continued.token_ids)
@@ -2036,6 +2230,84 @@ class BranchExecutor:
             },
         )
 
+    def _append_exec_repeat_terminated_event(
+        self,
+        *,
+        tree: BranchTree,
+        node_id: str,
+        repeated_exec_blocks: int,
+        last_similarity_ratio: float | None,
+        previous_exec_block: str | None,
+    ) -> None:
+        """Append one branch-termination event for repeated exec-block loops.
+
+        Args:
+            tree: Active tree.
+            node_id: Node id being terminated.
+            repeated_exec_blocks: Consecutive near-duplicate block count.
+            last_similarity_ratio: Last computed fuzzy similarity ratio.
+            previous_exec_block: Most recent normalized exec block text.
+
+        Returns:
+            None.
+        """
+
+        preview_text = (
+            previous_exec_block[:240] if previous_exec_block is not None else ""
+        )
+        self._append_tree_event(
+            tree=tree,
+            event_type="exec_repeat_terminated",
+            payload={
+                "node_id": node_id,
+                "similarity_threshold": EXEC_REPEAT_SIMILARITY_THRESHOLD,
+                "similarity_lookback_window": (EXEC_REPEAT_SIMILARITY_LOOKBACK_WINDOW),
+                "termination_block_count": EXEC_REPEAT_TERMINATION_BLOCK_COUNT,
+                "repeated_exec_blocks": repeated_exec_blocks,
+                "last_similarity_ratio": last_similarity_ratio,
+                "normalized_exec_block_preview": preview_text,
+            },
+        )
+
+    def _append_steer_repeat_terminated_event(
+        self,
+        *,
+        tree: BranchTree,
+        node_id: str,
+        repeated_steer_blocks: int,
+        last_similarity_ratio: float | None,
+        previous_steer_block: str | None,
+    ) -> None:
+        """Append one branch-termination event for repeated steer-block loops.
+
+        Args:
+            tree: Active tree.
+            node_id: Node id being terminated.
+            repeated_steer_blocks: Consecutive near-duplicate steer-block count.
+            last_similarity_ratio: Last computed fuzzy similarity ratio.
+            previous_steer_block: Most recent normalized steer block text.
+
+        Returns:
+            None.
+        """
+
+        preview_text = (
+            previous_steer_block[:240] if previous_steer_block is not None else ""
+        )
+        self._append_tree_event(
+            tree=tree,
+            event_type="steer_repeat_terminated",
+            payload={
+                "node_id": node_id,
+                "similarity_threshold": STEER_REPEAT_SIMILARITY_THRESHOLD,
+                "similarity_lookback_window": (STEER_REPEAT_SIMILARITY_LOOKBACK_WINDOW),
+                "termination_block_count": STEER_REPEAT_TERMINATION_BLOCK_COUNT,
+                "repeated_steer_blocks": repeated_steer_blocks,
+                "last_similarity_ratio": last_similarity_ratio,
+                "normalized_steer_block_preview": preview_text,
+            },
+        )
+
     def _next_seed(self) -> int:
         self.request_counter += 1
         return 10_000_000 + self.request_counter
@@ -2257,6 +2529,7 @@ class BranchExecutor:
         sample_temperature = (
             self.decoding.temperature if temperature is None else float(temperature)
         )
+        repetition_penalty = self._request_repetition_penalty(request_kind=request_kind)
         generation_seed = self._next_seed()
         stream_id = (
             request_stream_id
@@ -2288,6 +2561,7 @@ class BranchExecutor:
                     request_stream_id=stream_id,
                     prefix_chain_enabled=prefix_chain_enabled,
                     request_priority=request_priority,
+                    repetition_penalty=repetition_penalty,
                 )
                 setattr(self.client, "supports_prompt_token_ids", True)
                 return choices
@@ -2310,6 +2584,7 @@ class BranchExecutor:
             request_stream_id=stream_id,
             prefix_chain_enabled=prefix_chain_enabled,
             request_priority=request_priority,
+            repetition_penalty=repetition_penalty,
         )
 
     async def _request_completions_with_limit(
@@ -2331,6 +2606,7 @@ class BranchExecutor:
         request_stream_id: str,
         prefix_chain_enabled: bool,
         request_priority: _RequestPriority | None = None,
+        repetition_penalty: float | None = None,
     ) -> tuple[GenerationChoice, ...]:
         """Dispatch one async completions request under global inflight limit."""
 
@@ -2368,6 +2644,7 @@ class BranchExecutor:
             request_branch_number=(
                 request_priority.branch_number if request_priority is not None else None
             ),
+            repetition_penalty=repetition_penalty,
         )
         start_time = asyncio.get_running_loop().time()
         async with semaphore:
@@ -2386,6 +2663,7 @@ class BranchExecutor:
                     priority=(
                         request_priority.value if request_priority is not None else None
                     ),
+                    repetition_penalty=repetition_penalty,
                 )
             except Exception as exc:
                 latency_seconds = asyncio.get_running_loop().time() - start_time
@@ -2449,6 +2727,21 @@ class BranchExecutor:
         branch_number = ".".join(str(value) for value in branch_path)
         priority_value = self._priority_value_for_branch_path(branch_path=branch_path)
         return _RequestPriority(value=priority_value, branch_number=branch_number)
+
+    def _request_repetition_penalty(self, *, request_kind: str) -> float | None:
+        """Resolve optional repetition penalty for steer-token generation.
+
+        Args:
+            request_kind: Request kind label for the outbound vLLM call.
+
+        Returns:
+            Configured steer repetition penalty for steer-token request kinds,
+            otherwise `None`.
+        """
+
+        if request_kind in STEER_REPETITION_REQUEST_KINDS:
+            return self.branching.steer_repetition_penalty
+        return None
 
     def _priority_value_for_branch_path(self, *, branch_path: tuple[int, ...]) -> int:
         """Encode one dotted branch path as sortable integer priority."""
@@ -2555,6 +2848,7 @@ class BranchExecutor:
         delta_input_token_ids: tuple[int, ...],
         request_priority_value: int | None = None,
         request_branch_number: str | None = None,
+        repetition_penalty: float | None = None,
     ) -> None:
         context = self._require_event_context()
         self.artifact_store.append_event(
@@ -2574,6 +2868,7 @@ class BranchExecutor:
                 "top_logprobs": top_logprobs,
                 "request_priority": request_priority_value,
                 "request_branch_number": request_branch_number,
+                "repetition_penalty": repetition_penalty,
                 "current_input_token_count": len(current_input_token_ids),
                 "base_prefix_token_count": len(base_prefix_token_ids),
                 "delta_token_count": len(delta_input_token_ids),

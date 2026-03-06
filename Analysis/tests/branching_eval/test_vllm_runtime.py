@@ -28,6 +28,9 @@ def test_build_serve_command_for_plain_checkpoint() -> None:
     command_text = " ".join(command)
     assert "--enable-lora" not in command_text
     assert "--scheduling-policy priority" in command_text
+    assert "--kv-offloading-size 64.0" in command_text
+    assert "--kv-offloading-backend native" in command_text
+    assert "--disable-hybrid-kv-cache-manager" in command_text
     assert "Qwen/Qwen3-8B" in command_text
     assert resolve_generation_model_name(model_spec=model_spec) == "Qwen/Qwen3-8B"
 
@@ -66,6 +69,44 @@ def test_build_serve_command_with_priority_scheduler_policy() -> None:
     )
     command_text = " ".join(command)
     assert "--scheduling-policy priority" in command_text
+
+
+def test_build_serve_command_with_lmcache_kv_offload() -> None:
+    """LMCache backend should include backend flag and hybrid-cache disable switch."""
+
+    model_spec = ModelSpec(model_id="non_sft", checkpoint_or_repo="Qwen/Qwen3-8B")
+    serve_config = ServeConfig(
+        kv_offloading_size_gb=16.0,
+        kv_offloading_backend="lmcache",
+    )
+    command = build_vllm_serve_command(
+        model_spec=model_spec,
+        serve_config=serve_config,
+        port=8023,
+    )
+    command_text = " ".join(command)
+    assert "--kv-offloading-size 16.0" in command_text
+    assert "--kv-offloading-backend lmcache" in command_text
+    assert "--disable-hybrid-kv-cache-manager" in command_text
+
+
+def test_build_serve_command_with_native_kv_offload() -> None:
+    """Native offload backend should also disable hybrid cache manager."""
+
+    model_spec = ModelSpec(model_id="non_sft", checkpoint_or_repo="Qwen/Qwen3-8B")
+    serve_config = ServeConfig(
+        kv_offloading_size_gb=16.0,
+        kv_offloading_backend="native",
+    )
+    command = build_vllm_serve_command(
+        model_spec=model_spec,
+        serve_config=serve_config,
+        port=8024,
+    )
+    command_text = " ".join(command)
+    assert "--kv-offloading-size 16.0" in command_text
+    assert "--kv-offloading-backend native" in command_text
+    assert "--disable-hybrid-kv-cache-manager" in command_text
 
 
 def test_managed_server_starts_and_stops_once(monkeypatch, tmp_path: Path) -> None:

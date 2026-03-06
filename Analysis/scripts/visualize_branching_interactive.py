@@ -845,6 +845,9 @@ def tree_workspace_script() -> str:
   function stopReasonIcon(stopReason) {
     const normalized = String(stopReason || "").trim().toLowerCase();
     if (!normalized) return "";
+    if (normalized.includes("repeated_") && normalized.includes("_block_loop")) {
+      return "🔁";
+    }
     if (normalized.includes("length") || normalized.includes("max_gen_toks_reached")) {
       return "🛑";
     }

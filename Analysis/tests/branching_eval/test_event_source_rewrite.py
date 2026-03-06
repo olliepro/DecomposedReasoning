@@ -49,6 +49,7 @@ class PrefixClient:
         stop: tuple[str, ...] | None,
         top_logprobs: int,
         priority: int | None = None,
+        repetition_penalty: float | None = None,
     ) -> tuple[GenerationChoice, ...]:
         _ = (
             model,
@@ -61,6 +62,7 @@ class PrefixClient:
             seed,
             stop,
             top_logprobs,
+            repetition_penalty,
         )
         self.priorities.append(priority)
         self.calls += 1

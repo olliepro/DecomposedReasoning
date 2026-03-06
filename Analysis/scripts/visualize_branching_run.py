@@ -152,7 +152,7 @@ def render_leaves_panel(*, state: AttemptState) -> str:
             f"<td><code>{escape(leaf.node_id)}</code></td>"
             f"<td>{'' if leaf.verification is None else leaf.verification}</td>"
             f"<td>{'' if leaf.length_tokens_total is None else leaf.length_tokens_total}</td>"
-            f"<td>{escape(leaf.stop_reason)}</td>"
+            f"<td>{escape(stop_reason_display_label(stop_reason=leaf.stop_reason))}</td>"
             f"<td>{escape(metrics_text)}</td>"
             "</tr>"
         )
@@ -232,6 +232,47 @@ def normalized_stop_reason(*, stop_reason: str) -> str:
     return str(stop_reason).strip().lower()
 
 
+def stop_reason_icon(*, stop_reason: str) -> str:
+    """Return stop-reason emoji used in table/heatmap labels.
+
+    Args:
+        stop_reason: Raw stop reason from leaf payloads.
+
+    Returns:
+        Emoji string describing the stop type, or an empty string.
+
+    Example:
+        >>> stop_reason_icon(stop_reason="repeated_exec_block_loop")
+        '🔁'
+    """
+
+    normalized = normalized_stop_reason(stop_reason=stop_reason)
+    if not normalized:
+        return ""
+    if normalized.startswith("repeated_") and normalized.endswith("_block_loop"):
+        return "🔁"
+    if "length" in normalized or normalized == "max_gen_toks_reached":
+        return "🛑"
+    return "🏁"
+
+
+def stop_reason_display_label(*, stop_reason: str) -> str:
+    """Return user-facing stop-reason label with emoji prefix.
+
+    Args:
+        stop_reason: Raw stop reason from leaf payloads.
+
+    Returns:
+        Formatted stop reason label, preserving raw text and adding an icon.
+    """
+
+    reason_text = str(stop_reason).strip()
+    if not reason_text:
+        return ""
+    icon = stop_reason_icon(stop_reason=reason_text)
+    return f"{icon} {reason_text}" if icon else reason_text
+
+
 def render_verification_stop_heatmap(*, leaves: list[LeafView]) -> str:
     """Render verify-vs-stop count heatmap HTML."""
 
@@ -254,7 +295,8 @@ def render_verification_stop_heatmap(*, leaves: list[LeafView]) -> str:
         counts[(label, leaf.stop_reason)] += 1
     max_count = max(counts.values()) if counts else 0
     header_cells = "".join(
-        f"<th>{escape(stop_reason)}</th>" for stop_reason in stop_reasons
+        f"<th>{escape(stop_reason_display_label(stop_reason=stop_reason))}</th>"
+        for stop_reason in stop_reasons
     )
     body_rows = []
     for label, verify_value in rows_by_verify:
@@ -303,6 +345,21 @@ def status_badge_class(*, status: str) -> str:
     return "bad"
 
 
+def verification_counts_text(*, state: AttemptState) -> str:
+    """Return `correct/incorrect` counts for scored leaves in an attempt.
+
+    Args:
+        state: Attempt replay state containing scored leaf verification values.
+
+    Returns:
+        Text formatted as `{correct}/{incorrect}`.
+    """
+
+    correct_count = sum(1 for leaf in state.leaves.values() if leaf.verification == 1)
+    incorrect_count = sum(1 for leaf in state.leaves.values() if leaf.verification == 0)
+    return f"{correct_count}/{incorrect_count}"
+
+
 def render_index_page(
     *,
     run_dir: Path,
@@ -319,7 +376,7 @@ def render_index_page(
     )
     if not selected_rows:
         selected_rows = (
-            "<tr><td colspan='8'>No completed or partial doc attempts found.</td></tr>"
+            "<tr><td colspan='9'>No completed or partial doc attempts found.</td></tr>"
         )
     all_rows = "".join(
         index_all_attempt_row_html(state=state)
@@ -329,7 +386,7 @@ def render_index_page(
         )
     )
     if not all_rows:
-        all_rows = "<tr><td colspan='8'>No attempt events found.</td></tr>"
+        all_rows = "<tr><td colspan='9'>No attempt events found.</td></tr>"
     body_html = f"""
 <section class="panel">
   <h1>Run Replay: {escape(run_dir.name)}</h1>
@@ -347,7 +404,7 @@ def render_index_page(
   <h2>Default Doc View (Latest Completed Attempt)</h2>
   <table>
     <thead>
-      <tr><th>doc</th><th>attempt</th><th>status</th><th>selector</th><th>nodes</th><th>leaves</th><th>vllm</th><th>view</th></tr>
+      <tr><th>doc</th><th>attempt</th><th>status</th><th>selector</th><th>nodes</th><th>leaves</th><th>correct/incorrect</th><th>vllm</th><th>view</th></tr>
     </thead>
     <tbody>{selected_rows}</tbody>
   </table>
@@ -356,7 +413,7 @@ def render_index_page(
   <h2>All Attempts</h2>
   <table>
     <thead>
-      <tr><th>doc</th><th>attempt</th><th>status</th><th>task</th><th>model</th><th>selector</th><th>last_event</th><th>view</th></tr>
+      <tr><th>doc</th><th>attempt</th><th>status</th><th>task</th><th>model</th><th>selector</th><th>correct/incorrect</th><th>last_event</th><th>view</th></tr>
     </thead>
     <tbody>{all_rows}</tbody>
   </table>
@@ -376,6 +433,7 @@ def index_selected_row_html(*, state: AttemptState) -> str:
 
     rel_link = f"docs/{state.key.slug()}.html"
     status = state.status()
+    verification_counts = verification_counts_text(state=state)
     return (
         "<tr>"
         f"<td>{state.key.doc_id}</td>"
@@ -384,6 +442,7 @@ def index_selected_row_html(*, state: AttemptState) -> str:
         f"<td><code>{escape(state.key.selector_mode)}</code></td>"
         f"<td>{len(state.nodes)}</td>"
         f"<td>{state.leaf_count()}</td>"
+        f"<td>{verification_counts}</td>"
         f"<td>{state.vllm_request_count}/{state.vllm_response_count}</td>"
         f"<td><a href='{escape(rel_link)}'>open</a></td>"
         "</tr>"
@@ -395,6 +454,7 @@ def index_all_attempt_row_html(*, state: AttemptState) -> str:
 
     rel_link = f"docs/{state.key.slug()}.html"
     status = state.status()
+    verification_counts = verification_counts_text(state=state)
     return (
         "<tr>"
         f"<td>{state.key.doc_id}</td>"
@@ -403,6 +463,7 @@ def index_all_attempt_row_html(*, state: AttemptState) -> str:
         f"<td><code>{escape(state.key.task_name)}</code></td>"
         f"<td><code>{escape(state.key.model_id)}</code></td>"
         f"<td><code>{escape(state.key.selector_mode)}</code></td>"
+        f"<td>{verification_counts}</td>"
         f"<td>{state.last_event_index}</td>"
         f"<td><a href='{escape(rel_link)}'>open</a></td>"
         "</tr>"

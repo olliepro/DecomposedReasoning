@@ -33,6 +33,7 @@ branching:
   max_clusters: 4
   candidate_span_tokens: 15
   max_steer_tokens: 15
+  steer_repetition_penalty: 1.01
   entropy_profile_name: aime24_default
 
 calibration:

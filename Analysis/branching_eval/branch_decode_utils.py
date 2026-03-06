@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 import random
 import re
 
@@ -14,10 +16,409 @@ from vllm_client import GenerationChoice, ParsedToken
 
 STEER_BOUNDARY_PATTERN = re.compile(r"<steer>$", flags=re.IGNORECASE)
 STEER_PARTIAL_PATTERN = re.compile(r"<steer$", flags=re.IGNORECASE)
+STEER_BLOCK_PATTERN = re.compile(
+    r"<steer\b[^>]*>(.*?)</steer>", flags=re.IGNORECASE | re.DOTALL
+)
+STEER_OPEN_TAG_PATTERN = re.compile(r"<steer\b[^>]*>", flags=re.IGNORECASE)
 EXEC_BLOCK_PATTERN = re.compile(
     r"<exec\b[^>]*>(.*?)</exec>", flags=re.IGNORECASE | re.DOTALL
 )
+EXEC_OPEN_TAG_PATTERN = re.compile(r"<exec\b[^>]*>", flags=re.IGNORECASE)
 ROLLOUT_STEER_STOP = ("<steer",)
+DEFAULT_EXEC_REPEAT_LOOKBACK_WINDOW = 3
+
+
+@dataclass(frozen=True)
+class ExecRepetitionState:
+    """Streaming state for repeated execution-block detection.
+
+    Args:
+        in_exec_block: Whether parser is currently inside an open `<exec>` block.
+        pending_exec_text: Text buffered for the currently open exec block.
+        previous_exec_block: Most recent normalized completed exec block.
+        recent_exec_blocks: Recent normalized blocks used for similarity lookback.
+        repeated_exec_blocks: Count of consecutive near-duplicate exec blocks.
+
+    Returns:
+        Dataclass used for incremental exec-loop detection.
+
+    Example:
+        >>> state = initialize_exec_repetition_state(text="<exec>a</exec>")
+        >>> state.repeated_exec_blocks
+        1
+    """
+
+    in_exec_block: bool
+    pending_exec_text: str
+    previous_exec_block: str | None
+    recent_exec_blocks: tuple[str, ...]
+    repeated_exec_blocks: int
+
+
+def normalize_exec_block_text(*, text: str) -> str:
+    """Normalize one execution block for fuzzy similarity checks.
+
+    Args:
+        text: Raw text inside one `<exec>...</exec>` block.
+
+    Returns:
+        Lowercased whitespace-normalized text.
+    """
+
+    return " ".join(str(text).lower().split()).strip()
+
+
+def exec_block_similarity_ratio(*, left_text: str, right_text: str) -> float:
+    """Return fuzzy similarity ratio for two normalized exec blocks.
+
+    Args:
+        left_text: Left normalized block.
+        right_text: Right normalized block.
+
+    Returns:
+        Similarity ratio in `[0.0, 1.0]`.
+    """
+
+    if not left_text or not right_text:
+        return 0.0
+    return float(SequenceMatcher(a=left_text, b=right_text, autojunk=False).ratio())
+
+
+def initialize_exec_repetition_state(
+    *,
+    text: str,
+    similarity_threshold: float = 0.85,
+    similarity_lookback_window: int = DEFAULT_EXEC_REPEAT_LOOKBACK_WINDOW,
+) -> ExecRepetitionState:
+    """Seed incremental repetition state from existing assistant prefix text.
+
+    Args:
+        text: Existing assistant prefix text.
+        similarity_threshold: Near-duplicate threshold for fuzzy matching.
+        similarity_lookback_window: Number of recent blocks to compare against.
+
+    Returns:
+        Initial repetition-tracker state for streaming updates.
+    """
+
+    return _initialize_tag_repetition_state(
+        text=text,
+        block_pattern=EXEC_BLOCK_PATTERN,
+        open_tag_pattern=EXEC_OPEN_TAG_PATTERN,
+        close_tag="</exec>",
+        similarity_threshold=similarity_threshold,
+        similarity_lookback_window=similarity_lookback_window,
+    )
+
+
+def update_exec_repetition_state(
+    *,
+    state: ExecRepetitionState,
+    chunk_text: str,
+    similarity_threshold: float = 0.85,
+    similarity_lookback_window: int = DEFAULT_EXEC_REPEAT_LOOKBACK_WINDOW,
+) -> tuple[ExecRepetitionState, float | None]:
+    """Advance repetition state with one appended text chunk.
+
+    Args:
+        state: Existing repetition state.
+        chunk_text: Newly appended assistant text chunk.
+        similarity_threshold: Near-duplicate threshold for fuzzy matching.
+        similarity_lookback_window: Number of recent blocks to compare against.
+
+    Returns:
+        Tuple of `(updated_state, last_similarity_ratio)` where
+        `last_similarity_ratio` is set only when at least one completed block
+        is compared against a previous block.
+    """
+
+    return _update_tag_repetition_state(
+        state=state,
+        chunk_text=chunk_text,
+        open_tag_pattern=EXEC_OPEN_TAG_PATTERN,
+        close_tag="</exec>",
+        similarity_threshold=similarity_threshold,
+        similarity_lookback_window=similarity_lookback_window,
+    )
+
+
+def initialize_steer_repetition_state(
+    *,
+    text: str,
+    similarity_threshold: float = 0.85,
+    similarity_lookback_window: int = DEFAULT_EXEC_REPEAT_LOOKBACK_WINDOW,
+) -> ExecRepetitionState:
+    """Seed incremental repetition state from existing steer blocks."""
+
+    return _initialize_tag_repetition_state(
+        text=text,
+        block_pattern=STEER_BLOCK_PATTERN,
+        open_tag_pattern=STEER_OPEN_TAG_PATTERN,
+        close_tag=STEER_CLOSE_TAG,
+        similarity_threshold=similarity_threshold,
+        similarity_lookback_window=similarity_lookback_window,
+    )
+
+
+def update_steer_repetition_state(
+    *,
+    state: ExecRepetitionState,
+    chunk_text: str,
+    similarity_threshold: float = 0.85,
+    similarity_lookback_window: int = DEFAULT_EXEC_REPEAT_LOOKBACK_WINDOW,
+) -> tuple[ExecRepetitionState, float | None]:
+    """Advance repetition state with one appended chunk for steer blocks."""
+
+    return _update_tag_repetition_state(
+        state=state,
+        chunk_text=chunk_text,
+        open_tag_pattern=STEER_OPEN_TAG_PATTERN,
+        close_tag=STEER_CLOSE_TAG,
+        similarity_threshold=similarity_threshold,
+        similarity_lookback_window=similarity_lookback_window,
+    )
+
+
+def _initialize_tag_repetition_state(
+    *,
+    text: str,
+    block_pattern: re.Pattern[str],
+    open_tag_pattern: re.Pattern[str],
+    close_tag: str,
+    similarity_threshold: float,
+    similarity_lookback_window: int,
+) -> ExecRepetitionState:
+    """Build initial repetition state for one tagged block family."""
+
+    assert similarity_lookback_window >= 1, "similarity_lookback_window must be >= 1"
+    normalized_blocks = tuple(
+        normalized
+        for normalized in (
+            normalize_exec_block_text(text=match)
+            for match in block_pattern.findall(text)
+        )
+        if normalized
+    )
+    trailing_repeat_count = _trailing_repeated_block_count(
+        normalized_blocks=normalized_blocks,
+        similarity_threshold=similarity_threshold,
+        similarity_lookback_window=similarity_lookback_window,
+    )
+    recent_exec_blocks = tuple(normalized_blocks[-similarity_lookback_window:])
+    in_exec_block, pending_exec_text = _infer_open_tag_suffix(
+        text=text,
+        open_tag_pattern=open_tag_pattern,
+        close_tag=close_tag,
+    )
+    return ExecRepetitionState(
+        in_exec_block=in_exec_block,
+        pending_exec_text=pending_exec_text,
+        previous_exec_block=(recent_exec_blocks[-1] if recent_exec_blocks else None),
+        recent_exec_blocks=recent_exec_blocks,
+        repeated_exec_blocks=trailing_repeat_count,
+    )
+
+
+def _update_tag_repetition_state(
+    *,
+    state: ExecRepetitionState,
+    chunk_text: str,
+    open_tag_pattern: re.Pattern[str],
+    close_tag: str,
+    similarity_threshold: float,
+    similarity_lookback_window: int,
+) -> tuple[ExecRepetitionState, float | None]:
+    """Advance one tagged repetition state with one appended chunk."""
+
+    assert similarity_lookback_window >= 1, "similarity_lookback_window must be >= 1"
+    (
+        in_exec_block,
+        pending_exec_text,
+        completed_exec_blocks,
+    ) = _consume_tag_chunk(
+        in_exec_block=state.in_exec_block,
+        pending_exec_text=state.pending_exec_text,
+        chunk_text=chunk_text,
+        open_tag_pattern=open_tag_pattern,
+        close_tag=close_tag,
+    )
+    previous_exec_block = state.previous_exec_block
+    recent_exec_blocks = tuple(state.recent_exec_blocks[-similarity_lookback_window:])
+    repeated_exec_blocks = state.repeated_exec_blocks
+    last_similarity_ratio: float | None = None
+    for exec_block in completed_exec_blocks:
+        repeated_exec_blocks, similarity_ratio = _next_repeated_exec_block_count(
+            recent_exec_blocks=recent_exec_blocks,
+            current_exec_block=exec_block,
+            repeated_exec_blocks=repeated_exec_blocks,
+            similarity_threshold=similarity_threshold,
+        )
+        last_similarity_ratio = (
+            similarity_ratio if similarity_ratio is not None else last_similarity_ratio
+        )
+        recent_exec_blocks = _append_exec_block_history(
+            recent_exec_blocks=recent_exec_blocks,
+            exec_block=exec_block,
+            similarity_lookback_window=similarity_lookback_window,
+        )
+        previous_exec_block = exec_block
+    return (
+        ExecRepetitionState(
+            in_exec_block=in_exec_block,
+            pending_exec_text=pending_exec_text,
+            previous_exec_block=previous_exec_block,
+            recent_exec_blocks=recent_exec_blocks,
+            repeated_exec_blocks=repeated_exec_blocks,
+        ),
+        last_similarity_ratio,
+    )
+
+
+def _next_repeated_exec_block_count(
+    *,
+    recent_exec_blocks: tuple[str, ...],
+    current_exec_block: str,
+    repeated_exec_blocks: int,
+    similarity_threshold: float,
+) -> tuple[int, float | None]:
+    """Return next repeated-block count from lookback comparisons."""
+
+    if len(recent_exec_blocks) == 0:
+        return (1, None)
+    similarity_ratio = max(
+        exec_block_similarity_ratio(
+            left_text=prior_exec_block,
+            right_text=current_exec_block,
+        )
+        for prior_exec_block in recent_exec_blocks
+    )
+    next_repeated_count = (
+        repeated_exec_blocks + 1 if similarity_ratio >= similarity_threshold else 1
+    )
+    return (next_repeated_count, similarity_ratio)
+
+
+def _append_exec_block_history(
+    *,
+    recent_exec_blocks: tuple[str, ...],
+    exec_block: str,
+    similarity_lookback_window: int,
+) -> tuple[str, ...]:
+    """Append one block to fixed-size similarity lookback history."""
+
+    updated_exec_blocks = (*recent_exec_blocks, exec_block)
+    if len(updated_exec_blocks) <= similarity_lookback_window:
+        return updated_exec_blocks
+    return updated_exec_blocks[-similarity_lookback_window:]
+
+
+def _consume_exec_chunk(
+    *,
+    in_exec_block: bool,
+    pending_exec_text: str,
+    chunk_text: str,
+) -> tuple[bool, str, tuple[str, ...]]:
+    """Parse one appended chunk and return completed normalized exec blocks."""
+
+    return _consume_tag_chunk(
+        in_exec_block=in_exec_block,
+        pending_exec_text=pending_exec_text,
+        chunk_text=chunk_text,
+        open_tag_pattern=EXEC_OPEN_TAG_PATTERN,
+        close_tag="</exec>",
+    )
+
+
+def _consume_tag_chunk(
+    *,
+    in_exec_block: bool,
+    pending_exec_text: str,
+    chunk_text: str,
+    open_tag_pattern: re.Pattern[str],
+    close_tag: str,
+) -> tuple[bool, str, tuple[str, ...]]:
+    """Parse one appended chunk and return completed normalized tag blocks."""
+
+    normalized_completed_exec_blocks: list[str] = []
+    cursor = 0
+    lowered_chunk_text = chunk_text.lower()
+    lowered_close_tag = close_tag.lower()
+    while cursor < len(chunk_text):
+        if in_exec_block:
+            close_index = lowered_chunk_text.find(lowered_close_tag, cursor)
+            if close_index < 0:
+                pending_exec_text += chunk_text[cursor:]
+                break
+            pending_exec_text += chunk_text[cursor:close_index]
+            normalized_block = normalize_exec_block_text(text=pending_exec_text)
+            if normalized_block:
+                normalized_completed_exec_blocks.append(normalized_block)
+            pending_exec_text = ""
+            in_exec_block = False
+            cursor = close_index + len(close_tag)
+            continue
+        open_match = open_tag_pattern.search(chunk_text, pos=cursor)
+        if open_match is None:
+            break
+        in_exec_block = True
+        cursor = open_match.end()
+    return (
+        in_exec_block,
+        pending_exec_text,
+        tuple(normalized_completed_exec_blocks),
+    )
+
+
+def _infer_open_exec_suffix(*, text: str) -> tuple[bool, str]:
+    """Infer whether text currently sits inside an unfinished `<exec>` block."""
+
+    return _infer_open_tag_suffix(
+        text=text,
+        open_tag_pattern=EXEC_OPEN_TAG_PATTERN,
+        close_tag="</exec>",
+    )
+
+
+def _infer_open_tag_suffix(
+    *, text: str, open_tag_pattern: re.Pattern[str], close_tag: str
+) -> tuple[bool, str]:
+    """Infer whether text currently sits inside an unfinished block tag."""
+
+    open_matches = list(open_tag_pattern.finditer(text))
+    if not open_matches:
+        return (False, "")
+    last_open_match = open_matches[-1]
+    last_close_index = text.lower().rfind(close_tag.lower())
+    if last_close_index >= last_open_match.start():
+        return (False, "")
+    return (True, text[last_open_match.end() :])
+
+
+def _trailing_repeated_block_count(
+    *,
+    normalized_blocks: tuple[str, ...],
+    similarity_threshold: float,
+    similarity_lookback_window: int,
+) -> int:
+    """Return trailing near-duplicate block run length from completed blocks."""
+
+    if len(normalized_blocks) == 0:
+        return 0
+    recent_exec_blocks: tuple[str, ...] = ()
+    repeated_exec_blocks = 0
+    for exec_block in normalized_blocks:
+        repeated_exec_blocks, _ = _next_repeated_exec_block_count(
+            recent_exec_blocks=recent_exec_blocks,
+            current_exec_block=exec_block,
+            repeated_exec_blocks=repeated_exec_blocks,
+            similarity_threshold=similarity_threshold,
+        )
+        recent_exec_blocks = _append_exec_block_history(
+            recent_exec_blocks=recent_exec_blocks,
+            exec_block=exec_block,
+            similarity_lookback_window=similarity_lookback_window,
+        )
+    return repeated_exec_blocks
 
 
 def consume_choice_tokens(

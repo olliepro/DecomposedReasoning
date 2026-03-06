@@ -95,6 +95,7 @@ class VllmClient:
         stop: tuple[str, ...] | None,
         top_logprobs: int,
         priority: int | None = None,
+        repetition_penalty: float | None = None,
     ) -> tuple[GenerationChoice, ...]:
         """Call `/v1/completions` and parse choices.
 
@@ -110,6 +111,7 @@ class VllmClient:
             stop: Optional stop markers.
             top_logprobs: Top alternatives count.
             priority: Optional request priority for scheduler-policy `priority`.
+            repetition_penalty: Optional repetition penalty for generated tokens.
 
         Returns:
             Parsed generation choices.
@@ -126,6 +128,7 @@ class VllmClient:
             stop=stop,
             top_logprobs=top_logprobs,
             priority=priority,
+            repetition_penalty=repetition_penalty,
         )
         response_payload = self._post(path="/completions", payload=payload)
         return parse_completions_choices(response_payload=response_payload)
@@ -144,6 +147,7 @@ class VllmClient:
         stop: tuple[str, ...] | None,
         top_logprobs: int,
         priority: int | None = None,
+        repetition_penalty: float | None = None,
     ) -> tuple[GenerationChoice, ...]:
         """Call `/v1/completions` asynchronously and parse choices.
 
@@ -159,6 +163,7 @@ class VllmClient:
             stop: Optional stop markers.
             top_logprobs: Top alternatives count.
             priority: Optional request priority for scheduler-policy `priority`.
+            repetition_penalty: Optional repetition penalty for generated tokens.
 
         Returns:
             Parsed generation choices.
@@ -176,6 +181,7 @@ class VllmClient:
             stop=stop,
             top_logprobs=top_logprobs,
             priority=priority,
+            repetition_penalty=repetition_penalty,
         )
         response_payload = await self._post_async(path="/completions", payload=payload)
         return parse_completions_choices(response_payload=response_payload)
@@ -424,6 +430,7 @@ def build_completions_payload(
     stop: tuple[str, ...] | None,
     top_logprobs: int,
     priority: int | None = None,
+    repetition_penalty: float | None = None,
 ) -> dict[str, Any]:
     """Build payload for `/v1/completions`.
 
@@ -439,6 +446,7 @@ def build_completions_payload(
         stop: Optional stop markers.
         top_logprobs: Top alternatives count.
         priority: Optional request priority for scheduler-policy `priority`.
+        repetition_penalty: Optional repetition penalty for generated tokens.
 
     Returns:
         JSON-ready request payload.
@@ -469,6 +477,8 @@ def build_completions_payload(
         payload["include_stop_str_in_output"] = True
     if priority is not None:
         payload["priority"] = int(priority)
+    if repetition_penalty is not None:
+        payload["repetition_penalty"] = float(repetition_penalty)
     return payload
 
 

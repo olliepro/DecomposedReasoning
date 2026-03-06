@@ -4,7 +4,7 @@ tasks:
 
 models:
   - model_id: sft
-    checkpoint_or_repo: /fs/scratch/PAA0201/ollieproudman/DecomposedReasoning/SFTTraining/outputs/qwen3_8b_to_think_aimek4_b1_ga12/checkpoint-102-hf
+    checkpoint_or_repo: /fs/scratch/PAA0201/ollieproudman/DecomposedReasoning/SFTTraining/outputs/qwen3_8b_to_think_aimek4_b1_ga12/checkpoint-357-hf
     trigger_steer_default: true
     trigger_entropy_default: false
 
@@ -28,13 +28,14 @@ decoding:
   decode_chunk_tokens: 512
 
 branching:
-  branch_prob: 0.02
+  branch_prob: 0.10
   max_branch_points_per_rollout: 3
   num_candidates: 100
   branch_fanout: 4
   max_clusters: 4
   candidate_span_tokens: 15
   max_steer_tokens: 15
+  steer_repetition_penalty: 1.01
   entropy_threshold: 1.469524155326639
   entropy_profile_name: aime24_default
 

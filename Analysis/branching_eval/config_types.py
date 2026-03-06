@@ -128,6 +128,8 @@ class ServeConfig:
         gpu_memory_utilization: vLLM GPU memory utilization.
         dtype: vLLM dtype value.
         scheduling_policy: vLLM scheduler policy (`fcfs` or `priority`).
+        kv_offloading_size_gb: KV cache CPU offload buffer size in GiB.
+        kv_offloading_backend: KV offload backend (`native` or `lmcache`).
         trust_remote_code: Forwarded model loading flag.
         max_logprobs: vLLM max logprobs engine cap.
         startup_timeout_seconds: Max wait for server health.
@@ -143,6 +145,8 @@ class ServeConfig:
     gpu_memory_utilization: float = 0.9
     dtype: str = "auto"
     scheduling_policy: str = "priority"
+    kv_offloading_size_gb: float = 64.0
+    kv_offloading_backend: str = "native"
     trust_remote_code: bool = True
     max_logprobs: int = 20
     startup_timeout_seconds: float = 180.0
@@ -183,6 +187,7 @@ class BranchingConfig:
         max_clusters: Max clusters for `cluster_across` selection.
         candidate_span_tokens: Span used for entropy-trigger candidate generation.
         max_steer_tokens: Max generated tokens for steer-trigger candidates.
+        steer_repetition_penalty: Repetition penalty applied to steer-token requests.
         entropy_threshold: Optional explicit entropy threshold override.
         entropy_profile_name: Calibration profile key.
 
@@ -197,6 +202,7 @@ class BranchingConfig:
     max_clusters: int = 4
     candidate_span_tokens: int = 15
     max_steer_tokens: int = 15
+    steer_repetition_penalty: float = 1.01
     entropy_threshold: float | None = None
     entropy_profile_name: str = "aime24_default"
 
@@ -314,6 +320,13 @@ class BranchingEvalConfig:
             "fcfs",
             "priority",
         }, "serve.scheduling_policy must be one of {fcfs, priority}"
+        assert (
+            self.serve.kv_offloading_size_gb >= 0.0
+        ), "serve.kv_offloading_size_gb must be >= 0"
+        assert self.serve.kv_offloading_backend in {
+            "native",
+            "lmcache",
+        }, "serve.kv_offloading_backend must be one of {native, lmcache}"
         assert 0.0 <= self.decoding.temperature, "temperature must be >= 0"
         assert 0.0 < self.decoding.top_p <= 1.0, "top_p must be in (0, 1]"
         assert self.decoding.max_gen_toks >= 1, "max_gen_toks must be >= 1"
@@ -328,6 +341,9 @@ class BranchingEvalConfig:
             self.branching.num_candidates >= self.branching.branch_fanout
         ), "num_candidates must be >= branch_fanout"
         assert 0.0 <= self.branching.branch_prob <= 1.0, "branch_prob must be in [0, 1]"
+        assert (
+            self.branching.steer_repetition_penalty >= 1.0
+        ), "steer_repetition_penalty must be >= 1.0"
         assert self.run_matrix.baseline_rollouts >= 1, "baseline_rollouts must be >= 1"
         assert self.run_matrix.seed_values, "seed_values must be non-empty"
 
@@ -454,6 +470,10 @@ def _parse_serve(*, payload: dict[str, Any]) -> ServeConfig:
         gpu_memory_utilization=float(serve_payload.get("gpu_memory_utilization", 0.9)),
         dtype=str(serve_payload.get("dtype", "auto")),
         scheduling_policy=str(serve_payload.get("scheduling_policy", "priority")),
+        kv_offloading_size_gb=float(serve_payload.get("kv_offloading_size_gb", 64.0)),
+        kv_offloading_backend=str(
+            serve_payload.get("kv_offloading_backend", "native")
+        ),
         trust_remote_code=bool(serve_payload.get("trust_remote_code", True)),
         max_logprobs=int(serve_payload.get("max_logprobs", 20)),
         startup_timeout_seconds=float(
@@ -490,6 +510,9 @@ def _parse_branching(*, payload: dict[str, Any]) -> BranchingConfig:
         max_clusters=int(branch_payload.get("max_clusters", 4)),
         candidate_span_tokens=int(branch_payload.get("candidate_span_tokens", 15)),
         max_steer_tokens=int(branch_payload.get("max_steer_tokens", 15)),
+        steer_repetition_penalty=float(
+            branch_payload.get("steer_repetition_penalty", 1.01)
+        ),
         entropy_threshold=_optional_float(
             value=branch_payload.get("entropy_threshold")
         ),

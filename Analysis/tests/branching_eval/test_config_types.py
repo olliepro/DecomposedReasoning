@@ -24,7 +24,10 @@ def test_config_defaults_parse_from_minimal_payload(tmp_path: Path) -> None:
     assert config.decoding.temperature == 0.6
     assert config.decoding.decode_chunk_tokens == 512
     assert config.branching.num_candidates == 100
+    assert config.branching.steer_repetition_penalty == 1.01
     assert config.serve.scheduling_policy == "priority"
+    assert config.serve.kv_offloading_size_gb == 64.0
+    assert config.serve.kv_offloading_backend == "native"
 
 
 def test_calibration_and_output_paths_resolve_relative_to_config(
@@ -56,7 +59,7 @@ def test_calibration_and_output_paths_resolve_relative_to_config(
 
 
 def test_scheduling_policy_parses_from_serve_block(tmp_path: Path) -> None:
-    """Serve scheduling policy should parse from YAML and validate."""
+    """Serve scheduling and KV offload settings should parse from YAML."""
 
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
@@ -65,10 +68,18 @@ def test_scheduling_policy_parses_from_serve_block(tmp_path: Path) -> None:
                 "models": [
                     {"model_id": "non_sft", "checkpoint_or_repo": "Qwen/Qwen3-8B"}
                 ],
-                "serve": {"scheduling_policy": "priority"},
+                "serve": {
+                    "scheduling_policy": "priority",
+                    "kv_offloading_size_gb": 12.0,
+                    "kv_offloading_backend": "lmcache",
+                },
+                "branching": {"steer_repetition_penalty": 1.2},
             }
         ),
         encoding="utf-8",
     )
     config = load_branching_eval_config(config_path=config_path)
     assert config.serve.scheduling_policy == "priority"
+    assert config.serve.kv_offloading_size_gb == 12.0
+    assert config.serve.kv_offloading_backend == "lmcache"
+    assert config.branching.steer_repetition_penalty == 1.2

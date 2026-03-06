@@ -72,6 +72,16 @@ def build_vllm_serve_command(
         "--max-logprobs",
         str(serve_config.max_logprobs),
     ]
+    if serve_config.kv_offloading_size_gb > 0.0:
+        command.extend(
+            [
+                "--kv-offloading-size",
+                str(serve_config.kv_offloading_size_gb),
+                "--kv-offloading-backend",
+                serve_config.kv_offloading_backend,
+            ]
+        )
+        command.append("--disable-hybrid-kv-cache-manager")
     if serve_config.trust_remote_code:
         command.append("--trust-remote-code")
     if not model_spec.has_lora:

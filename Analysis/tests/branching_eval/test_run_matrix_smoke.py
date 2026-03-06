@@ -57,6 +57,7 @@ class FakeRuntimeClient:
         stop: tuple[str, ...] | None,
         top_logprobs: int,
         priority: int | None = None,
+        repetition_penalty: float | None = None,
     ) -> tuple[GenerationChoice, ...]:
         _ = (
             model,
@@ -69,6 +70,7 @@ class FakeRuntimeClient:
             stop,
             top_logprobs,
             priority,
+            repetition_penalty,
         )
         if n > 1:
             return tuple(
@@ -90,6 +92,7 @@ class FakeRuntimeClient:
         stop: tuple[str, ...] | None,
         top_logprobs: int,
         priority: int | None = None,
+        repetition_penalty: float | None = None,
     ) -> tuple[GenerationChoice, ...]:
         """Async completions shim matching runtime client surface."""
 
@@ -105,6 +108,7 @@ class FakeRuntimeClient:
             stop=stop,
             top_logprobs=top_logprobs,
             priority=priority,
+            repetition_penalty=repetition_penalty,
         )
 
     async def tokenize_async(
