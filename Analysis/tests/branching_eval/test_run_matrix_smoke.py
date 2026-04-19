@@ -15,6 +15,7 @@ from branching_eval.config_types import (
     BranchingConfig,
     BranchingEvalConfig,
     DecodingConfig,
+    ExperimentSpec,
     ModelSpec,
     RunMatrixConfig,
     ServeConfig,
@@ -23,9 +24,12 @@ from branching_eval.config_types import (
 from branching_eval.lm_eval_adapter import DocRecord
 from branching_eval.run_matrix import (
     requested_selectors_for_spec,
+    runtime_branching_for_spec,
+    selector_modes_for_executor,
     run_experiment_matrix,
     seed_for_doc,
 )
+from branching_eval.selector_types import SelectionOutcome
 from branching_eval.tree_types import LeafRollout
 from vllm_client import GenerationChoice, ParsedToken
 
@@ -228,9 +232,7 @@ def test_run_matrix_smoke_writes_expected_artifacts(
             entropy_threshold=-1.0,
             entropy_profile_name="aime24_default",
         ),
-        artifacts=ArtifactConfig(
-            output_root=tmp_path / "runs", reuse_candidate_pools=True
-        ),
+        artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
         run_matrix=RunMatrixConfig(
             include_baselines=True,
             baseline_rollouts=2,
@@ -259,6 +261,7 @@ def test_run_matrix_smoke_writes_expected_artifacts(
     assert len(run_dirs) == 2
     for run_dir in run_dirs:
         assert (run_dir / "run_manifest.json").exists()
+        assert (run_dir / "doc_diagnostics.jsonl").exists()
         assert (run_dir / "lm_eval_aggregates.json").exists()
         assert (run_dir / "variance_diagnostics.json").exists()
         assert (run_dir / "length_diagnostics.json").exists()
@@ -269,6 +272,182 @@ def test_run_matrix_smoke_writes_expected_artifacts(
         assert payload["model_id"] == "non_sft"
 
 
+def test_run_matrix_smoke_writes_structured_baseline_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Structured baselines should write distinct manifests and diagnostics."""
+
+    config = BranchingEvalConfig(
+        tasks=TaskConfig(task_names=("aime24",)),
+        models=(
+            ModelSpec(
+                model_id="non_sft",
+                checkpoint_or_repo="fake/checkpoint",
+                trigger_steer_default=True,
+                trigger_entropy_default=False,
+            ),
+        ),
+        serve=ServeConfig(),
+        decoding=DecodingConfig(
+            temperature=0.6, top_p=0.95, max_gen_toks=4, top_logprobs=5
+        ),
+        branching=BranchingConfig(
+            branch_prob=0.0,
+            max_branch_points_per_rollout=2,
+            num_candidates=4,
+            branch_fanout=2,
+            max_clusters=2,
+            candidate_span_tokens=2,
+            max_steer_tokens=2,
+            entropy_threshold=-1.0,
+            entropy_profile_name="aime24_default",
+        ),
+        artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
+        run_matrix=RunMatrixConfig(
+            include_baselines=False,
+            include_structured_baselines=True,
+            baseline_rollouts=2,
+            include_branching=False,
+            selectors=("random",),
+            seed_values=(77,),
+            default_limit=1,
+        ),
+    )
+    config.validate()
+    monkeypatch.setattr("branching_eval.run_matrix.LmEvalAdapter", FakeLmEvalAdapter)
+    monkeypatch.setattr("branching_eval.run_matrix.VllmClient", FakeRuntimeClient)
+    monkeypatch.setattr(
+        "branching_eval.run_matrix.managed_vllm_server",
+        fake_managed_vllm_server,
+    )
+
+    run_dirs = run_experiment_matrix(
+        config=config,
+        limit=1,
+        seed_override=None,
+        selector_override=None,
+        model_override=None,
+    )
+    assert len(run_dirs) == 1
+    run_dir = run_dirs[0]
+    manifest = json.loads((run_dir / "run_manifest.json").read_text())
+    assert manifest["selector_mode"] == "structured_baseline"
+    assert (run_dir / "doc_diagnostics.jsonl").exists()
+    events = [
+        json.loads(line)
+        for line in (run_dir / "tree_events.jsonl").read_text().splitlines()
+    ]
+    assert any(
+        row["event_type"] == "run_started"
+        and row["payload"]["mode"] == "structured_baseline"
+        for row in events
+    )
+    assert sum(1 for row in events if row["event_type"] == "leaf_scored") == 2
+
+
+def test_run_matrix_smoke_writes_epsilon_greedy_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Epsilon-greedy runs should write distinct mode and selector artifacts."""
+
+    config = BranchingEvalConfig(
+        tasks=TaskConfig(task_names=("aime24",)),
+        models=(
+            ModelSpec(
+                model_id="non_sft",
+                checkpoint_or_repo="fake/checkpoint",
+                trigger_steer_default=False,
+                trigger_entropy_default=True,
+            ),
+        ),
+        serve=ServeConfig(),
+        decoding=DecodingConfig(
+            temperature=0.6, top_p=0.95, max_gen_toks=4, top_logprobs=5
+        ),
+        branching=BranchingConfig(
+            branch_prob=0.0,
+            epsilon_greedy_prob=1.0,
+            max_branch_points_per_rollout=2,
+            num_candidates=4,
+            branch_fanout=4,
+            max_clusters=2,
+            candidate_span_tokens=2,
+            max_steer_tokens=2,
+            entropy_threshold=-1.0,
+            entropy_profile_name="aime24_default",
+        ),
+        artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
+        run_matrix=RunMatrixConfig(
+            include_baselines=False,
+            baseline_rollouts=2,
+            include_branching=False,
+            include_epsilon_greedy=True,
+            selectors=("random",),
+            seed_values=(77,),
+            default_limit=1,
+        ),
+    )
+    config.validate()
+
+    def fake_select_all_modes(**_: object) -> tuple[SelectionOutcome, ...]:
+        return (
+            SelectionOutcome(
+                selector_mode="embed_diverse_topk_random",
+                selected_candidate_ids=(0,),
+            ),
+        )
+
+    async def fake_select_all_modes_async(
+        **_: object,
+    ) -> tuple[SelectionOutcome, ...]:
+        return fake_select_all_modes()
+
+    monkeypatch.setattr("branching_eval.run_matrix.LmEvalAdapter", FakeLmEvalAdapter)
+    monkeypatch.setattr("branching_eval.run_matrix.VllmClient", FakeRuntimeClient)
+    monkeypatch.setattr(
+        "branching_eval.run_matrix.managed_vllm_server",
+        fake_managed_vllm_server,
+    )
+    monkeypatch.setattr(
+        "branching_eval.branch_executor.select_candidates_all_modes",
+        fake_select_all_modes,
+    )
+    monkeypatch.setattr(
+        "branching_eval.branch_executor.select_candidates_all_modes_async",
+        fake_select_all_modes_async,
+    )
+
+    run_dirs = run_experiment_matrix(
+        config=config,
+        limit=1,
+        seed_override=None,
+        selector_override=None,
+        model_override=None,
+    )
+
+    assert len(run_dirs) == 1
+    run_dir = run_dirs[0]
+    assert "epsilon_greedy" in run_dir.name
+    manifest = json.loads((run_dir / "run_manifest.json").read_text())
+    assert manifest["selector_mode"] == "embed_diverse_topk_random"
+    events = [
+        json.loads(line)
+        for line in (run_dir / "tree_events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(
+        row["event_type"] == "run_started"
+        and row["payload"]["mode"] == "epsilon_greedy"
+        for row in events
+    )
+    assert any(
+        row["event_type"] == "selector_applied"
+        and row["payload"]["active_selector_mode"] == "embed_diverse_topk_random"
+        for row in events
+    )
+    assert sum(1 for row in events if row["event_type"] == "leaf_scored") == 2
+
+
 def test_requested_selectors_for_spec_includes_active_selector() -> None:
     """Requested selectors should include active selector for one-off overrides."""
 
@@ -277,6 +456,53 @@ def test_requested_selectors_for_spec_includes_active_selector() -> None:
         active_selector="cluster_across",
     )
     assert selectors == ("random", "cluster_across")
+
+
+def test_selector_modes_for_executor_uses_active_only_for_epsilon_mode() -> None:
+    """Epsilon-greedy runs should request only the active selector."""
+
+    spec = ExperimentSpec(
+        task_name="aime24",
+        model_id="non_sft",
+        mode="epsilon_greedy",
+        selector="embed_diverse_topk_random",
+        seed=77,
+        baseline_rollouts=2,
+        trigger_steer=False,
+        trigger_entropy=True,
+    )
+
+    selectors = selector_modes_for_executor(
+        spec=spec,
+        configured_selectors=("cluster_across", "random"),
+        active_selector="embed_diverse_topk_random",
+    )
+
+    assert selectors == ("embed_diverse_topk_random",)
+
+
+def test_runtime_branching_for_spec_sets_single_path_epsilon_behavior() -> None:
+    """Epsilon-greedy runtime config should keep one-child trigger behavior."""
+
+    spec = ExperimentSpec(
+        task_name="aime24",
+        model_id="non_sft",
+        mode="epsilon_greedy",
+        selector="embed_diverse_topk_random",
+        seed=77,
+        baseline_rollouts=2,
+        trigger_steer=False,
+        trigger_entropy=True,
+    )
+    branching = BranchingConfig(
+        branch_prob=0.0, branch_fanout=4, epsilon_greedy_prob=0.2
+    )
+
+    runtime_branching = runtime_branching_for_spec(spec=spec, branching=branching)
+
+    assert runtime_branching.branch_prob == 0.2
+    assert runtime_branching.branch_fanout == 1
+    assert runtime_branching.max_branch_points_per_rollout > 4
 
 
 def test_branching_scores_leaves_before_rollout_finished(
@@ -309,9 +535,7 @@ def test_branching_scores_leaves_before_rollout_finished(
             entropy_threshold=-1.0,
             entropy_profile_name="aime24_default",
         ),
-        artifacts=ArtifactConfig(
-            output_root=tmp_path / "runs", reuse_candidate_pools=True
-        ),
+        artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
         run_matrix=RunMatrixConfig(
             include_baselines=False,
             baseline_rollouts=2,
@@ -408,9 +632,7 @@ def test_run_matrix_caps_doc_async_concurrency_to_five(
             entropy_threshold=-1.0,
             entropy_profile_name="aime24_default",
         ),
-        artifacts=ArtifactConfig(
-            output_root=tmp_path / "runs", reuse_candidate_pools=True
-        ),
+        artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
         run_matrix=RunMatrixConfig(
             include_baselines=False,
             baseline_rollouts=2,
@@ -418,6 +640,7 @@ def test_run_matrix_caps_doc_async_concurrency_to_five(
             selectors=("random",),
             seed_values=(77,),
             default_limit=12,
+            max_concurrent_docs=5,
         ),
     )
     config.validate()

@@ -56,10 +56,12 @@ def render_attempt_page(
     run_dir: Path,
     state: AttemptState,
     output_path: Path,
+    graph_path: Path,
 ) -> None:
     """Render one per-attempt HTML page."""
 
     tree_payload = tree_payload_for_attempt(state=state)
+    write_json_atomic(path=graph_path, payload=tree_payload)
     title = (
         f"{state.key.label()} · {state.key.task_name} · "
         f"{state.key.model_id} · {state.key.selector_mode}"
@@ -68,7 +70,7 @@ def render_attempt_page(
     status_class = status_badge_class(status=state.status())
     metrics_html = render_metrics_panel(state=state)
     leaves_html = render_leaves_panel(state=state)
-    tree_html = render_tree_workspace(payload=tree_payload)
+    tree_html = render_tree_workspace(graph_path=f"data/{graph_path.name}")
     body_html = f"""
 <section class="panel">
   <h1>{escape(title)}</h1>
@@ -399,6 +401,7 @@ def render_index_page(
     <span class="pill">attempts={len(states)}</span>
     <span class="pill">selected_docs={len(selected_states)}</span>
   </div>
+  <p style="margin:0.75rem 0 0 0"><a href="gallery.html">Open all selected docs in one page</a></p>
 </section>
 <section class="panel">
   <h2>Default Doc View (Latest Completed Attempt)</h2>
@@ -426,6 +429,86 @@ def render_index_page(
         footer_text="Regenerated from tree_events.jsonl without tree snapshots.",
     )
     write_text_atomic(path=output_dir / "index.html", text=page)
+
+
+def gallery_card_html(*, state: AttemptState) -> str:
+    """Build one gallery card embedding a selected attempt page.
+
+    Args:
+        state: Replayed selected-doc attempt state.
+
+    Returns:
+        HTML card string with iframe embed and summary pills.
+    """
+
+    rel_link = f"docs/{state.key.slug()}.html"
+    status = state.status()
+    verification_counts = verification_counts_text(state=state)
+    return f"""
+<section class="panel gallery-card">
+  <div class="pill-row" style="margin-bottom:0.65rem">
+    <span class="pill {status_badge_class(status=status)}">{escape(state.key.label())}</span>
+    <span class="pill">selector={escape(state.key.selector_mode)}</span>
+    <span class="pill">nodes={len(state.nodes)}</span>
+    <span class="pill">leaves={state.leaf_count()}</span>
+    <span class="pill">correct/incorrect={verification_counts}</span>
+    <span class="pill">vllm={state.vllm_request_count}/{state.vllm_response_count}</span>
+    <a href="{escape(rel_link)}">open full page</a>
+  </div>
+  <iframe class="gallery-frame" src="{escape(rel_link)}" loading="lazy" title="{escape(state.key.label())}"></iframe>
+</section>
+"""
+
+
+def render_gallery_page(
+    *,
+    run_dir: Path,
+    output_dir: Path,
+    selected_states: list[AttemptState],
+) -> None:
+    """Render one page containing all selected-doc attempt iframes.
+
+    Args:
+        run_dir: Source run directory for subtitle text.
+        output_dir: Visualization output directory.
+        selected_states: Latest completed attempt per doc.
+
+    Returns:
+        None.
+    """
+
+    gallery_cards = "".join(
+        gallery_card_html(state=state)
+        for state in sorted(selected_states, key=lambda item: (item.key.doc_id, item.key.doc_attempt))
+    )
+    if not gallery_cards:
+        gallery_cards = (
+            "<section class='panel'>No selected-doc attempts available.</section>"
+        )
+    body_html = f"""
+<style>
+.gallery-grid {{ display:grid; gap:1rem; }}
+.gallery-card {{ padding:0.8rem; }}
+.gallery-frame {{ width:100%; height:900px; border:1px solid var(--line); border-radius:0.8rem; background:rgba(8, 12, 22, 0.84); }}
+@media (max-width: 960px) {{ .gallery-frame {{ height:640px; }} }}
+</style>
+<section class="panel">
+  <h1>All Selected Docs: {escape(run_dir.name)}</h1>
+  <p class="muted" style="margin:0.45rem 0 0.9rem 0">Latest completed attempt per doc, embedded in one page.</p>
+  <div class="pill-row">
+    <span class="pill">selected_docs={len(selected_states)}</span>
+  </div>
+  <p style="margin:0.75rem 0 0 0"><a href="index.html">Back to run index</a></p>
+</section>
+<div class="gallery-grid">{gallery_cards}</div>
+"""
+    page = wrap_page(
+        title=f"Branching Replay Gallery · {run_dir.name}",
+        subtitle="all selected docs",
+        body_html=body_html,
+        footer_text="Embedded attempt pages generated from tree_events.jsonl.",
+    )
+    write_text_atomic(path=output_dir / "gallery.html", text=page)
 
 
 def index_selected_row_html(*, state: AttemptState) -> str:
@@ -518,6 +601,15 @@ def write_text_atomic(*, path: Path, text: str) -> None:
     temp_path.replace(path)
 
 
+def write_json_atomic(*, path: Path, payload: dict[str, object]) -> None:
+    """Atomically write one JSON payload file."""
+
+    write_text_atomic(
+        path=path,
+        text=json.dumps(payload, indent=2) + "\n",
+    )
+
+
 def render_snapshot(*, run_dir: Path, output_dir: Path) -> RenderSummary:
     """Render one snapshot from current `tree_events.jsonl` content."""
 
@@ -526,18 +618,26 @@ def render_snapshot(*, run_dir: Path, output_dir: Path) -> RenderSummary:
     states = replay_attempts(events=events)
     selected_states = selected_attempts_by_doc(states=states)
     docs_dir = output_dir / "docs"
+    graph_dir = docs_dir / "data"
     docs_dir.mkdir(parents=True, exist_ok=True)
+    graph_dir.mkdir(parents=True, exist_ok=True)
     for state in states.values():
         render_attempt_page(
             run_dir=run_dir,
             state=state,
             output_path=docs_dir / f"{state.key.slug()}.html",
+            graph_path=graph_dir / f"{state.key.slug()}.json",
         )
     render_index_page(
         run_dir=run_dir,
         output_dir=output_dir,
         events=events,
         states=states,
+        selected_states=selected_states,
+    )
+    render_gallery_page(
+        run_dir=run_dir,
+        output_dir=output_dir,
         selected_states=selected_states,
     )
     write_summary_json(

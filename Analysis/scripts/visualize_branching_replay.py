@@ -59,6 +59,7 @@ class NodeView:
     node_id: str
     parent_node_id: str | None
     branch_points_used: int
+    assistant_prefix: str = ""
 
 
 @dataclass(frozen=True)
@@ -289,6 +290,9 @@ def apply_event_to_attempt(*, state: AttemptState, event: EventEnvelope) -> None
     if event_type == "doc_started":
         state.started = True
         return
+    if event_type == "rollout_started":
+        _apply_rollout_started_event(state=state)
+        return
     if event_type == "doc_resumed":
         state.started = True
         state.resumed_reason = str(payload.get("reason", ""))
@@ -296,6 +300,9 @@ def apply_event_to_attempt(*, state: AttemptState, event: EventEnvelope) -> None
     if event_type == "doc_finished":
         state.finished = True
         state.finished_payload = payload
+        return
+    if event_type == "rollout_finished":
+        _apply_rollout_finished_event(state=state, payload=payload)
         return
     if event_type == "node_created":
         _apply_node_created_event(state=state, event=event)
@@ -309,8 +316,15 @@ def apply_event_to_attempt(*, state: AttemptState, event: EventEnvelope) -> None
     if event_type in {"trigger_fired", "trigger_skipped_max_branch_points"}:
         _apply_trigger_event(state=state, event=event)
         return
-    if event_type in {"candidate_pool_resolved", "selector_applied", "leaf_completed"}:
+    if event_type in {
+        "candidate_pool_resolved",
+        "selector_applied",
+        "selector_continued_inline",
+    }:
         _apply_node_marker_event(state=state, event=event)
+        return
+    if event_type == "leaf_completed":
+        _apply_leaf_completed_event(state=state, event=event)
         return
     if event_type == "leaf_scored":
         _apply_leaf_scored_event(state=state, event=event)
@@ -320,6 +334,37 @@ def apply_event_to_attempt(*, state: AttemptState, event: EventEnvelope) -> None
         return
     if event_type == "vllm_response":
         _apply_vllm_response_event(state=state, event=event)
+
+
+def _apply_rollout_started_event(*, state: AttemptState) -> None:
+    """Mark replay state as started for rollout-style event streams.
+
+    Args:
+        state: Mutable replay state for one attempt.
+
+    Returns:
+        None.
+    """
+
+    state.started = True
+
+
+def _apply_rollout_finished_event(
+    *, state: AttemptState, payload: dict[str, object]
+) -> None:
+    """Mark replay state as finished for rollout-style event streams.
+
+    Args:
+        state: Mutable replay state for one attempt.
+        payload: Terminal rollout payload summary.
+
+    Returns:
+        None.
+    """
+
+    state.started = True
+    state.finished = True
+    state.finished_payload = payload
 
 
 def _apply_node_created_event(*, state: AttemptState, event: EventEnvelope) -> None:
@@ -332,6 +377,9 @@ def _apply_node_created_event(*, state: AttemptState, event: EventEnvelope) -> N
         node_id=node_id,
         parent_node_id=str(parent_node_id) if parent_node_id is not None else None,
         branch_points_used=int(payload.get("branch_points_used", 0)),
+        assistant_prefix=(
+            state.nodes[node_id].assistant_prefix if node_id in state.nodes else ""
+        ),
     )
     mark_node_event_touch(state=state, node_id=node_id, event=event)
 
@@ -360,6 +408,18 @@ def _apply_edge_selected_event(*, state: AttemptState, event: EventEnvelope) -> 
             candidate_token_ids=candidate_token_ids,
         )
     )
+    parent_prefix = state.nodes.get(
+        parent_node_id, NodeView(parent_node_id, None, 0)
+    ).assistant_prefix
+    child_node = state.nodes.get(child_node_id)
+    child_branch_points = child_node.branch_points_used if child_node else 0
+    state.nodes[child_node_id] = NodeView(
+        node_id=child_node_id,
+        parent_node_id=parent_node_id,
+        branch_points_used=child_branch_points,
+        assistant_prefix=parent_prefix
+        + str(payload.get("candidate_text_normalized", "")),
+    )
     mark_node_event_touch(state=state, node_id=child_node_id, event=event)
 
 
@@ -385,6 +445,15 @@ def _apply_decode_chunk_event(*, state: AttemptState, event: EventEnvelope) -> N
             ),
         )
     )
+    existing_node = state.nodes.get(node_id)
+    if existing_node is not None:
+        state.nodes[node_id] = NodeView(
+            node_id=existing_node.node_id,
+            parent_node_id=existing_node.parent_node_id,
+            branch_points_used=existing_node.branch_points_used,
+            assistant_prefix=existing_node.assistant_prefix
+            + str(payload.get("chunk_text", "")),
+        )
     mark_node_event_touch(state=state, node_id=node_id, event=event)
 
 
@@ -424,6 +493,48 @@ def _apply_node_marker_event(*, state: AttemptState, event: EventEnvelope) -> No
     mark_node_event_touch(state=state, node_id=node_id, event=event)
 
 
+def _apply_leaf_completed_event(*, state: AttemptState, event: EventEnvelope) -> None:
+    """Replay one ungraded leaf event into the leaves table.
+
+    Args:
+        state: Mutable replay state for one attempt.
+        event: Canonical `leaf_completed` event envelope.
+
+    Returns:
+        None.
+    """
+
+    payload = event.payload
+    leaf_id = str(payload.get("leaf_id", ""))
+    if not leaf_id:
+        return
+    leaf = LeafView(
+        leaf_id=leaf_id,
+        node_id=str(payload.get("node_id", "")),
+        text=_leaf_text_from_state(
+            state=state,
+            leaf_id=leaf_id,
+            node_id=str(payload.get("node_id", "")),
+            fallback_text=str(payload.get("text", "")),
+        ),
+        verification=(
+            int(payload["verification"])
+            if payload.get("verification") is not None
+            else None
+        ),
+        length_tokens_total=(
+            int(payload["length_tokens_total"])
+            if payload.get("length_tokens_total") is not None
+            else None
+        ),
+        stop_reason=str(payload.get("stop_reason", "")),
+        task_metrics={},
+    )
+    state.leaves[leaf_id] = leaf
+    if leaf.node_id:
+        mark_node_event_touch(state=state, node_id=leaf.node_id, event=event)
+
+
 def _apply_leaf_scored_event(*, state: AttemptState, event: EventEnvelope) -> None:
     payload = event.payload
     leaf_id = str(payload.get("leaf_id", ""))
@@ -434,7 +545,12 @@ def _apply_leaf_scored_event(*, state: AttemptState, event: EventEnvelope) -> No
     leaf = LeafView(
         leaf_id=leaf_id,
         node_id=str(payload.get("node_id", "")),
-        text=str(payload.get("text", "")),
+        text=_leaf_text_from_state(
+            state=state,
+            leaf_id=leaf_id,
+            node_id=str(payload.get("node_id", "")),
+            fallback_text=str(payload.get("text_preview", "")),
+        ),
         verification=(
             int(payload["verification"])
             if payload.get("verification") is not None
@@ -516,6 +632,54 @@ def decode_node_id_from_stream_id(*, request_stream_id: str) -> str | None:
         return None
     node_id = request_stream_id.split(":", maxsplit=1)[1]
     return node_id if node_id else None
+
+
+def _leaf_text_from_state(
+    *,
+    state: AttemptState,
+    leaf_id: str,
+    node_id: str,
+    fallback_text: str,
+) -> str:
+    """Return reconstructed leaf text from node state or baseline responses."""
+
+    existing = state.leaves.get(leaf_id)
+    if existing is not None and existing.text:
+        return existing.text
+    node = state.nodes.get(node_id)
+    if node is not None and node.assistant_prefix:
+        return node.assistant_prefix
+    baseline_text = _baseline_leaf_text_from_state(state=state, leaf_id=leaf_id)
+    if baseline_text:
+        return baseline_text
+    return fallback_text
+
+
+def _baseline_leaf_text_from_state(*, state: AttemptState, leaf_id: str) -> str:
+    """Return reconstructed baseline-leaf text from compact response choices."""
+
+    prefix = "leaf_baseline_"
+    if not leaf_id.startswith(prefix):
+        return ""
+    choice_index = int(leaf_id[len(prefix) :])
+    for response in state.vllm_responses.values():
+        if response.request_kind != "baseline_rollout_pool" or response.status != "ok":
+            continue
+        choices = response.payload.get("choices", [])
+        if not isinstance(choices, list) or choice_index >= len(choices):
+            continue
+        choice = choices[choice_index]
+        if not isinstance(choice, dict):
+            continue
+        token_rows = choice.get("tokens", [])
+        if not isinstance(token_rows, list):
+            continue
+        return "".join(
+            str(row.get("token_text", ""))
+            for row in token_rows
+            if isinstance(row, dict)
+        )
+    return ""
 
 
 def mark_node_event_touch(

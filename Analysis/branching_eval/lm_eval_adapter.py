@@ -1,11 +1,14 @@
-"""lm_eval task adapter for doc iteration, scoring, and aggregation."""
+"""lm_eval task adapter for doc iteration, scoring, aggregation, and answers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
-from branching_eval.aime_bridge import verify_aime_response
+from branching_eval.aime_bridge import (
+    extract_aime_candidate_answer,
+    verify_aime_response,
+)
 
 
 @dataclass(frozen=True)
@@ -157,6 +160,20 @@ class LmEvalAdapter:
             return direct
         return _mean_numeric_metrics(per_doc_metrics=per_doc_metrics)
 
+    def extract_answer(self, *, response_text: str) -> str:
+        """Extract a canonical answer key from one response string.
+
+        Args:
+            response_text: Model-generated response text.
+
+        Returns:
+            Normalized answer key used for unique-answer counting.
+        """
+
+        if self.task_name in {"aime24", "aime25"}:
+            return extract_aime_candidate_answer(response_text=response_text)
+        return _normalize_response_answer(response_text=response_text)
+
     def _load_task(self, *, task_name: str) -> Any:
         from lm_eval import tasks
 
@@ -245,3 +262,17 @@ def _mean_numeric_metrics(*, per_doc_metrics: list[dict[str, Any]]) -> dict[str,
         if present_values:
             reduced[key] = present_values[0]
     return reduced
+
+
+def _normalize_response_answer(*, response_text: str) -> str:
+    """Normalize fallback answer text for tasks without a custom extractor.
+
+    Args:
+        response_text: Raw model response text.
+
+    Returns:
+        Deterministic normalized response string for uniqueness tracking.
+    """
+
+    collapsed = " ".join(str(response_text).split())
+    return collapsed.casefold()

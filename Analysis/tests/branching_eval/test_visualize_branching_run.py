@@ -180,7 +180,7 @@ def test_event_replay_index_selects_latest_completed_else_partial(
 
     run_dir = tmp_path / "run"
     output_dir = run_dir / "viz"
-    store = ArtifactStore(run_dir=run_dir, reuse_candidate_pools=False)
+    store = ArtifactStore(run_dir=run_dir)
     append_attempt_events(store=store, doc_id=0, doc_attempt=0, finished=True)
     append_attempt_events(store=store, doc_id=1, doc_attempt=0, finished=False)
     append_attempt_events(store=store, doc_id=2, doc_attempt=0, finished=True)
@@ -205,12 +205,12 @@ def test_event_replay_index_selects_latest_completed_else_partial(
     assert ">1/0<" in index_html
 
 
-def test_render_snapshot_tree_payload_is_valid_json_script(tmp_path: Path) -> None:
-    """Tree payload script should contain raw JSON that `JSON.parse` can read."""
+def test_render_snapshot_tree_payload_is_external_json(tmp_path: Path) -> None:
+    """Tree payload should be written to a sidecar JSON file and fetched by the page."""
 
     run_dir = tmp_path / "run"
     output_dir = run_dir / "viz"
-    store = ArtifactStore(run_dir=run_dir, reuse_candidate_pools=False)
+    store = ArtifactStore(run_dir=run_dir)
     append_attempt_events(store=store, doc_id=0, doc_attempt=0, finished=True)
 
     render_snapshot(run_dir=run_dir, output_dir=output_dir)
@@ -246,13 +246,13 @@ def test_render_snapshot_tree_payload_is_valid_json_script(tmp_path: Path) -> No
     assert "🏁" in html
     assert "🔁" in html
 
-    match = re.search(
-        r'<script type="application/json" id="tree-data">(.*?)</script>',
-        html,
-        flags=re.DOTALL,
-    )
-    assert match is not None, "Expected tree-data script payload."
-    payload = json.loads(match.group(1))
+    assert 'id="tree-data"' not in html
+    graph_match = re.search(r'data-graph-path="([^"]+)"', html)
+    assert graph_match is not None, "Expected tree graph data path."
+    graph_rel_path = graph_match.group(1)
+    graph_path = doc_paths[0].parent / graph_rel_path
+    assert graph_path.exists()
+    payload = json.loads(graph_path.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
     assert "nodes" in payload
     assert "branches" in payload
@@ -267,7 +267,7 @@ def test_render_snapshot_scored_leaf_table_sorts_and_renders_heatmap(
 
     run_dir = tmp_path / "run"
     output_dir = run_dir / "viz"
-    store = ArtifactStore(run_dir=run_dir, reuse_candidate_pools=False)
+    store = ArtifactStore(run_dir=run_dir)
     append_finished_attempt_with_custom_leaves(
         store=store,
         doc_id=0,
@@ -305,7 +305,7 @@ def test_follow_mode_rerenders_after_append(tmp_path: Path) -> None:
 
     run_dir = tmp_path / "run"
     output_dir = run_dir / "viz_follow"
-    store = ArtifactStore(run_dir=run_dir, reuse_candidate_pools=False)
+    store = ArtifactStore(run_dir=run_dir)
     append_attempt_events(store=store, doc_id=0, doc_attempt=0, finished=False)
     analysis_root = Path(__file__).resolve().parents[2]
     script_path = analysis_root / "scripts" / "visualize_branching_run.py"

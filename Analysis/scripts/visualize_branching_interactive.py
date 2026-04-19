@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-from typing import Any
-
 
 def workspace_css() -> str:
     """Return page-local CSS for interactive tree workspace widgets."""
@@ -341,6 +338,11 @@ def workspace_css() -> str:
   border-color: rgba(244, 180, 193, 0.95);
   box-shadow: 0 0 0 1px rgba(244, 180, 193, 0.35) inset;
 }
+.candidate-card.shortlisted:not(.selected),
+.candidate-panel.shortlisted:not(.selected) {
+  border-color: rgba(255, 209, 102, 0.9);
+  box-shadow: 0 0 0 1px rgba(255, 209, 102, 0.24) inset;
+}
 .candidate-head {
   display: flex;
   align-items: baseline;
@@ -487,20 +489,19 @@ def workspace_css() -> str:
 """
 
 
-def render_tree_workspace(*, payload: dict[str, Any]) -> str:
-    """Render interactive tree panel with embedded JSON payload.
+def render_tree_workspace(*, graph_path: str) -> str:
+    """Render interactive tree panel that fetches its graph payload.
 
     Args:
-        payload: JSON-ready attempt visualization payload.
+        graph_path: Relative path to the JSON graph payload.
 
     Returns:
         HTML panel string.
     """
 
-    payload_json = json.dumps(payload).replace("</", "<\\/")
     return f"""
 <style>{workspace_css()}</style>
-<section class="panel branch-workspace">
+<section class="panel branch-workspace" data-graph-path="{graph_path}">
   <div class="workspace-toolbar">
     <h2>Tree</h2>
     <div class="mode-toggle" role="group" aria-label="x-axis mode">
@@ -525,7 +526,6 @@ def render_tree_workspace(*, payload: dict[str, Any]) -> str:
       <div id="inspector-content" class="detail-kv"></div>
     </aside>
   </div>
-  <script type="application/json" id="tree-data">{payload_json}</script>
 </section>
 """
 
@@ -535,21 +535,25 @@ def tree_workspace_script() -> str:
 
     return """
 (() => {
-  const payloadNode = document.getElementById("tree-data");
-  if (!payloadNode) return;
-  let payload = {};
-  try {
-    payload = JSON.parse(payloadNode.textContent || "{}");
-  } catch {
-    return;
-  }
+  const workspaceRoot = document.querySelector(".branch-workspace[data-graph-path]");
+  const graphPath = workspaceRoot ? workspaceRoot.getAttribute("data-graph-path") : "";
+  if (!workspaceRoot || !graphPath) return;
   const treeSvg = document.getElementById("tree-svg");
   const inspectorHost = document.getElementById("inspector-content");
   const workspaceLayout = document.querySelector(".workspace-layout");
   const workspaceDivider = document.getElementById("workspace-divider");
   const inspectorPane = document.getElementById("viz-inspector");
   if (!treeSvg || !inspectorHost || !workspaceLayout) return;
+  inspectorHost.innerHTML = "<p class='muted'>Loading tree data...</p>";
 
+  fetch(graphPath)
+    .then((response) => {
+      if (!response.ok) {
+        throw new Error(`Failed to load graph payload: ${response.status}`);
+      }
+      return response.json();
+    })
+    .then((payload) => {
   const nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
   const edges = Array.isArray(payload.edges) ? payload.edges : [];
   const nodeEvents = payload.node_events && typeof payload.node_events === "object"
@@ -1088,6 +1092,7 @@ def tree_workspace_script() -> str:
     if (type === "trigger_skipped_max_branch_points") return "#ff9f7f";
     if (type === "candidate_pool_resolved") return "#ffd166";
     if (type === "selector_applied") return "#f6a6ff";
+    if (type === "selector_continued_inline") return "#c9a3ff";
     if (type === "leaf_completed") return "#9fe2ff";
     if (type === "leaf_scored") return "#b8f28d";
     return "#9fb4db";
@@ -1608,15 +1613,20 @@ def tree_workspace_script() -> str:
     return byId;
   }
 
-  function renderClusterCandidateCard({ candidateId, selected, candidate }) {
-    const selectedClass = selected ? " selected" : "";
-    const selectedTag = selected ? "selected" : "not selected";
+  function renderClusterCandidateCard({ candidateId, shortlisted, selected, candidate }) {
+    const classNames = [
+      shortlisted ? "shortlisted" : "",
+      selected ? "selected" : "",
+    ].filter(Boolean).join(" ");
+    const stateLabel = selected
+      ? "selected"
+      : (shortlisted ? "shortlisted" : "not selected");
     if (!candidate) {
       return `
-        <section class="candidate-panel${selectedClass}">
+        <section class="candidate-panel${classNames ? ` ${classNames}` : ""}">
           <div class="candidate-head">
             <span>candidate ${esc(String(candidateId))}</span>
-            <span>${esc(selectedTag)}</span>
+            <span>${esc(stateLabel)}</span>
           </div>
           <div class="hidden-note">Candidate details unavailable in this event window.</div>
         </section>
@@ -1631,10 +1641,10 @@ def tree_workspace_script() -> str:
       { showHint: false },
     );
     return `
-      <section class="candidate-panel${selectedClass}">
+      <section class="candidate-panel${classNames ? ` ${classNames}` : ""}">
         <div class="candidate-head">
           <span>candidate ${esc(String(candidateId))}</span>
-          <span>${esc(selectedTag)}</span>
+          <span>${esc(stateLabel)}</span>
         </div>
         <div class="detail-kv">
           ${detailRow("tokens", tokenCount)}
@@ -1647,11 +1657,12 @@ def tree_workspace_script() -> str:
     `;
   }
 
-  function renderClusterModeDetails({ modeName, groups, selectedIds, candidateById }) {
+  function renderClusterModeDetails({ modeName, groups, shortlistIds, selectedIds, candidateById }) {
     if (!groups.length) {
       return `<p class="muted">No clusters logged for ${esc(String(modeName))}.</p>`;
     }
     const selectedSet = new Set(selectedIds.map((value) => String(value)));
+    const shortlistSet = new Set(shortlistIds.map((value) => String(value)));
     const totalCount = groups.reduce((sum, group) => {
       const groupCount = Number(group.candidate_count);
       if (Number.isFinite(groupCount) && groupCount > 0) return sum + groupCount;
@@ -1675,6 +1686,7 @@ def tree_workspace_script() -> str:
       const clusterName = clusterNameRaw || `Cluster ${groupIndex + 1}`;
       const candidateCards = candidateIds.map((candidateId) => renderClusterCandidateCard({
         candidateId,
+        shortlisted: shortlistSet.has(String(candidateId)),
         selected: selectedSet.has(String(candidateId)),
         candidate: candidateById.get(String(candidateId)),
       })).join("");
@@ -1716,10 +1728,27 @@ def tree_workspace_script() -> str:
     const selectedByMode = details.selected_by_mode && typeof details.selected_by_mode === "object"
       ? details.selected_by_mode
       : {};
+    const shortlistByMode = details.shortlist_by_mode && typeof details.shortlist_by_mode === "object"
+      ? details.shortlist_by_mode
+      : {};
+    const shortlistCandidatesByMode = details.shortlist_candidates_by_mode && typeof details.shortlist_candidates_by_mode === "object"
+      ? details.shortlist_candidates_by_mode
+      : {};
     const clusterGroupsByMode = details.cluster_groups_by_mode && typeof details.cluster_groups_by_mode === "object"
       ? details.cluster_groups_by_mode
       : {};
     const clusterModes = Object.keys(clusterGroupsByMode).sort();
+    const activeSelectorMode = String(details.active_selector_mode || "");
+    if (activeSelectorMode && Array.isArray(shortlistCandidatesByMode[activeSelectorMode])) {
+      const shortlistCards = shortlistCandidatesByMode[activeSelectorMode].map((candidate) => renderClusterCandidateCard({
+        candidateId: candidate.candidate_id,
+        shortlisted: true,
+        selected: selectedIds.includes(candidate.candidate_id),
+        candidate: candidate,
+      })).join("");
+      rows.push(`<h4 style="margin:0.38rem 0 0.12rem">Shortlist · ${esc(activeSelectorMode)}</h4>`);
+      rows.push(`<div class="candidate-list">${shortlistCards}</div>`);
+    }
     if (!clusterModes.length) {
       rows.push("<p class='muted'>No cluster summaries found in this selector event.</p>");
       return rows.join("");
@@ -1732,10 +1761,14 @@ def tree_workspace_script() -> str:
       const modeSelected = Array.isArray(selectedByMode[modeName])
         ? selectedByMode[modeName]
         : [];
+      const modeShortlist = Array.isArray(shortlistByMode[modeName])
+        ? shortlistByMode[modeName]
+        : [];
       rows.push(`<h4 style="margin:0.38rem 0 0.12rem">Clusters · ${esc(String(modeName))}</h4>`);
       rows.push(renderClusterModeDetails({
         modeName,
         groups,
+        shortlistIds: modeShortlist,
         selectedIds: modeSelected,
         candidateById,
       }));
@@ -1750,11 +1783,14 @@ def tree_workspace_script() -> str:
     rows.push(detailRow("branch_point_id", String(details.branch_point_id || "")));
     rows.push(detailRow("candidate_pool_id", String(details.candidate_pool_id || "")));
     rows.push(detailRow("trigger_type", String(details.trigger_type || "")));
-    rows.push(detailRow("loaded_from_cache", String(Boolean(details.loaded_from_cache))));
     const selectedIds = Array.isArray(details.selected_candidate_ids)
       ? details.selected_candidate_ids
       : [];
+    const shortlistIds = Array.isArray(details.shortlist_candidate_ids)
+      ? details.shortlist_candidate_ids
+      : [];
     rows.push(detailRow("selected_candidate_ids", selectedIds.join(", ")));
+    rows.push(detailRow("shortlist_candidate_ids", shortlistIds.join(", ")));
     const candidates = Array.isArray(details.candidates) ? details.candidates : [];
     if (!candidates.length) {
       rows.push("<p class='muted'>No candidate rows logged.</p>");
@@ -1762,15 +1798,20 @@ def tree_workspace_script() -> str:
     }
     const cards = candidates.map((candidate) => {
       const candidateId = String(candidate.candidate_id ?? "");
-      const selectedClass = candidate.selected ? " selected" : "";
-      const selectedTag = candidate.selected ? "chosen" : "not chosen";
+      const classNames = [
+        candidate.shortlisted ? "shortlisted" : "",
+        candidate.selected ? "selected" : "",
+      ].filter(Boolean).join(" ");
+      const selectedTag = candidate.selected
+        ? "selected"
+        : (candidate.shortlisted ? "shortlisted" : "not selected");
       const candidateText = String(candidate.text || "");
       const tokenCount = String(candidate.output_token_count || 0);
       const finish = String(candidate.finish_reason || "");
       const stop = String(candidate.stop_reason || "");
       const strip = renderChoiceTokenStrip({ tokens: candidate.tokens || [] });
       return `
-        <section class="candidate-card${selectedClass}">
+        <section class="candidate-card${classNames ? ` ${classNames}` : ""}">
           <div class="candidate-head">
             <span>candidate ${esc(candidateId)}</span>
             <span>${esc(selectedTag)}</span>
@@ -1812,6 +1853,8 @@ def tree_workspace_script() -> str:
       rows.push(renderCandidatePoolDetails(details));
     } else if (event.event_type === "selector_applied") {
       rows.push(renderSelectorAppliedDetails(details));
+    } else if (event.event_type === "selector_continued_inline") {
+      rows.push(renderSelectorAppliedDetails(details));
     } else {
       rows.push(`<pre>${esc(JSON.stringify(withoutRawTokenIds(details), null, 2))}</pre>`);
     }
@@ -1821,6 +1864,7 @@ def tree_workspace_script() -> str:
       event.event_type === "vllm_step"
       || event.event_type === "candidate_pool_resolved"
       || event.event_type === "selector_applied"
+      || event.event_type === "selector_continued_inline"
     ) {
       bindTokenHoverTooltips();
     } else {
@@ -1964,5 +2008,13 @@ def tree_workspace_script() -> str:
 
   initWorkspaceSplitter();
   renderAll();
+    })
+    .catch((error) => {
+      const message = String(error && error.message ? error.message : error)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+      inspectorHost.innerHTML = `<p class="muted">Failed to load tree data: ${message}</p>`;
+    });
 })();
 """

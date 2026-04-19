@@ -18,8 +18,10 @@ from branching_eval.config_types import (
     BranchingConfig,
     ExperimentSpec,
     ModelSpec,
+    ServeConfig,
 )
-from branching_eval.event_types import EventContext
+from branching_eval.doc_progress import DocProgressTracker
+from branching_eval.event_types import EventContext, utc_now_iso
 from branching_eval.lm_eval_adapter import DocRecord, LmEvalAdapter
 from branching_eval.metrics_types import (
     AggregateDiagnostics,
@@ -35,10 +37,43 @@ from branching_eval.resume_state import BranchResumeState, replay_branching_resu
 from branching_eval.selector_types import SelectorMode
 from branching_eval.tree_types import BranchTree, LeafRollout, TreeNode
 from branching_eval.vllm_runtime import managed_vllm_server
+from branching_eval.vllm_runtime import wait_for_existing_server
 from vllm_client import VllmClient
 
-MAX_CONCURRENT_DOC_ROLLOUTS = 5
+EPSILON_GREEDY_SELECTOR: SelectorMode = "embed_diverse_topk_random"
+EPSILON_GREEDY_MAX_BRANCH_POINTS = 1_000_000
 LeafCompletionHook = Callable[[LeafRollout], LeafRollout]
+
+
+def build_clustering_runtime_client(
+    *,
+    model_spec: ModelSpec,
+    serve_config: ServeConfig,
+) -> tuple[VllmClient | None, str | None]:
+    """Build optional clustering client/model metadata for one model spec.
+
+    Args:
+        model_spec: Model serving specification.
+        serve_config: Serving config used for readiness polling.
+
+    Returns:
+        Tuple of optional clustering client and request-time clustering model name.
+    """
+
+    if model_spec.clustering_base_url is None:
+        return None, None
+    wait_for_existing_server(
+        base_url=model_spec.clustering_base_url,
+        timeout_seconds=serve_config.startup_timeout_seconds,
+        poll_interval_seconds=serve_config.poll_interval_seconds,
+    )
+    assert (
+        model_spec.clustering_served_model_name is not None
+    ), "clustering_served_model_name required when clustering_base_url is set"
+    return (
+        VllmClient(base_url=model_spec.clustering_base_url),
+        model_spec.clustering_served_model_name,
+    )
 
 
 @dataclass(frozen=True)
@@ -129,6 +164,99 @@ def requested_selectors_for_spec(
     return tuple(ordered)
 
 
+def selector_mode_for_spec(*, spec: ExperimentSpec) -> str:
+    """Return the selector label written into manifests and event rows.
+
+    Args:
+        spec: Concrete experiment specification.
+
+    Returns:
+        Stable selector-mode label for this experiment.
+
+    Example:
+        >>> selector_mode_for_spec(
+        ...     spec=ExperimentSpec(
+        ...         task_name="aime25",
+        ...         model_id="sft",
+        ...         mode="structured_baseline",
+        ...         selector=None,
+        ...         seed=1234,
+        ...         baseline_rollouts=32,
+        ...         trigger_steer=True,
+        ...         trigger_entropy=False,
+        ...     )
+        ... )
+        'structured_baseline'
+    """
+
+    if spec.selector is not None:
+        return spec.selector
+    if spec.mode == "structured_baseline":
+        return "structured_baseline"
+    return "baseline"
+
+
+def selector_modes_for_executor(
+    *,
+    spec: ExperimentSpec,
+    configured_selectors: tuple[SelectorMode, ...],
+    active_selector: SelectorMode,
+) -> tuple[SelectorMode, ...]:
+    """Return selector modes executed for one concrete experiment.
+
+    Args:
+        spec: Concrete experiment specification.
+        configured_selectors: Selector modes configured for shared-pool logging.
+        active_selector: Selector used to expand the current tree.
+
+    Returns:
+        Ordered selector modes requested from selector runtime.
+    """
+
+    if spec.mode == "epsilon_greedy":
+        return (active_selector,)
+    return requested_selectors_for_spec(
+        configured_selectors=configured_selectors,
+        active_selector=active_selector,
+    )
+
+
+def runtime_branching_for_spec(
+    *, spec: ExperimentSpec, branching: BranchingConfig
+) -> BranchingConfig:
+    """Return effective branching settings for one experiment mode.
+
+    Args:
+        spec: Concrete experiment specification.
+        branching: Resolved branching configuration.
+
+    Returns:
+        Effective branching config for runtime execution.
+    """
+
+    if spec.mode != "epsilon_greedy":
+        return branching
+    return replace(
+        branching,
+        branch_prob=branching.epsilon_greedy_prob,
+        branch_fanout=1,
+        max_branch_points_per_rollout=EPSILON_GREEDY_MAX_BRANCH_POINTS,
+    )
+
+
+def uses_branch_tree_mode(*, spec: ExperimentSpec) -> bool:
+    """Return whether one experiment mode uses tree-based trigger execution.
+
+    Args:
+        spec: Concrete experiment specification.
+
+    Returns:
+        `True` for branching-like modes.
+    """
+
+    return spec.mode in {"branching", "epsilon_greedy"}
+
+
 def run_experiment_matrix(
     *,
     config: BranchingEvalConfig,
@@ -182,13 +310,19 @@ def run_experiment_matrix(
             log_dir=serve_log_dir,
         ) as running_server:
             client = VllmClient(base_url=running_server.base_url)
+            cluster_client, cluster_model_name = build_clustering_runtime_client(
+                model_spec=model_spec,
+                serve_config=config.serve,
+            )
             for spec in model_experiments:
                 run_dir = run_one_experiment(
                     config=config,
                     model_spec=model_spec,
                     spec=spec,
                     client=client,
+                    cluster_client=cluster_client,
                     model_name_for_generation=running_server.model_name_for_generation,
+                    cluster_model_name_for_generation=cluster_model_name,
                     limit=limit,
                     doc_ids=doc_ids,
                     resume_run_dir=resume_target,
@@ -245,9 +379,24 @@ def expand_experiments(
                             trigger_entropy=False,
                         )
                     )
+                if config.run_matrix.include_structured_baselines:
+                    experiments.append(
+                        ExperimentSpec(
+                            task_name=task_name,
+                            model_id=model_spec.model_id,
+                            mode="structured_baseline",
+                            selector=None,
+                            seed=seed,
+                            baseline_rollouts=config.run_matrix.baseline_rollouts,
+                            trigger_steer=model_spec.trigger_steer_default,
+                            trigger_entropy=False,
+                        )
+                    )
                 if not config.run_matrix.include_branching:
-                    continue
-                for selector in selectors:
+                    branching_selectors: tuple[SelectorMode, ...] = ()
+                else:
+                    branching_selectors = selectors
+                for selector in branching_selectors:
                     experiments.append(
                         ExperimentSpec(
                             task_name=task_name,
@@ -260,6 +409,20 @@ def expand_experiments(
                             trigger_entropy=model_spec.trigger_entropy_default,
                         )
                     )
+                if not config.run_matrix.include_epsilon_greedy:
+                    continue
+                experiments.append(
+                    ExperimentSpec(
+                        task_name=task_name,
+                        model_id=model_spec.model_id,
+                        mode="epsilon_greedy",
+                        selector=EPSILON_GREEDY_SELECTOR,
+                        seed=seed,
+                        baseline_rollouts=config.run_matrix.baseline_rollouts,
+                        trigger_steer=model_spec.trigger_steer_default,
+                        trigger_entropy=model_spec.trigger_entropy_default,
+                    )
+                )
     return experiments
 
 
@@ -303,7 +466,9 @@ def run_one_experiment(
     model_spec: ModelSpec,
     spec: ExperimentSpec,
     client: VllmClient,
+    cluster_client: VllmClient | None,
     model_name_for_generation: str,
+    cluster_model_name_for_generation: str | None,
     limit: int | None,
     doc_ids: tuple[int, ...] | None,
     resume_run_dir: Path | None,
@@ -315,7 +480,9 @@ def run_one_experiment(
         model_spec: Model specification.
         spec: Concrete experiment spec.
         client: Connected vLLM client.
+        cluster_client: Optional dedicated vLLM client for clustering.
         model_name_for_generation: Request-time model name.
+        cluster_model_name_for_generation: Optional request-time clustering model.
         limit: Optional doc cap.
         doc_ids: Optional explicit doc ids to execute.
         resume_run_dir: Existing run directory for resume.
@@ -334,7 +501,6 @@ def run_one_experiment(
     )
     store = ArtifactStore(
         run_dir=run_dir,
-        reuse_candidate_pools=config.artifacts.reuse_candidate_pools,
         run_id=run_dir.name,
     )
     config_snapshot = build_config_snapshot(
@@ -382,11 +548,13 @@ def run_one_experiment(
     asyncio.run(
         run_docs_with_limit_async(
             plans=plans,
-            max_concurrent_docs=MAX_CONCURRENT_DOC_ROLLOUTS,
+            max_concurrent_docs=config.run_matrix.max_concurrent_docs,
             config=config,
             spec=spec,
             client=client,
+            cluster_client=cluster_client,
             model_name_for_generation=model_name_for_generation,
+            cluster_model_name_for_generation=cluster_model_name_for_generation,
             task_name=spec.task_name,
             model_id=spec.model_id,
             resolved_branching=resolved_branching,
@@ -398,7 +566,7 @@ def run_one_experiment(
     summary = recompute_outputs_from_events(
         store=store,
         adapter=adapter,
-        selector_mode=spec.selector or "baseline",
+        selector_mode=selector_mode_for_spec(spec=spec),
     )
     store.append_event(
         context=run_context,
@@ -428,7 +596,7 @@ def _initialize_or_validate_run_metadata(
                 run_id=store.run_id,
                 task_name=spec.task_name,
                 model_id=spec.model_id,
-                selector_mode=spec.selector or "baseline",
+                selector_mode=selector_mode_for_spec(spec=spec),
                 config_snapshot=config_snapshot,
                 git_commit=read_git_commit_hash(),
             )
@@ -444,7 +612,7 @@ def _initialize_or_validate_run_metadata(
     assert (
         str(existing_manifest.get("model_id", "")) == spec.model_id
     ), "resume mismatch: model_id differs from existing run manifest"
-    expected_selector = spec.selector or "baseline"
+    expected_selector = selector_mode_for_spec(spec=spec)
     assert (
         str(existing_manifest.get("selector_mode", "")) == expected_selector
     ), "resume mismatch: selector_mode differs from existing run manifest"
@@ -542,7 +710,9 @@ def run_doc_rollouts(
     config: BranchingEvalConfig,
     spec: ExperimentSpec,
     client: VllmClient,
+    cluster_client: VllmClient | None,
     model_name_for_generation: str,
+    cluster_model_name_for_generation: str | None,
     prompt_text: str,
     doc_id: int,
     doc_attempt: int,
@@ -559,7 +729,9 @@ def run_doc_rollouts(
         config: Root config.
         spec: Experiment spec.
         client: vLLM client.
+        cluster_client: Optional vLLM client used for clustering prompts.
         model_name_for_generation: Request-time model name.
+        cluster_model_name_for_generation: Optional clustering request-time model.
         prompt_text: Prompt string.
         doc_id: Document id.
         doc_attempt: Attempt index.
@@ -575,16 +747,23 @@ def run_doc_rollouts(
     """
 
     env_paths = default_env_paths()
-    selector_mode = spec.selector or "baseline"
+    selector_mode = selector_mode_for_spec(spec=spec)
     active_selector: SelectorMode = spec.selector or "random"
+    runtime_branching = runtime_branching_for_spec(
+        spec=spec,
+        branching=resolved_branching,
+    )
     executor = BranchExecutor(
         client=client,
+        cluster_client=cluster_client,
         prompt_text=prompt_text,
         model_name=model_name_for_generation,
+        cluster_model_name=cluster_model_name_for_generation,
         decoding=config.decoding,
-        branching=resolved_branching,
+        branching=runtime_branching,
         artifact_store=store,
-        requested_selectors=requested_selectors_for_spec(
+        requested_selectors=selector_modes_for_executor(
+            spec=spec,
             configured_selectors=config.run_matrix.selectors,
             active_selector=active_selector,
         ),
@@ -594,8 +773,6 @@ def run_doc_rollouts(
         trigger_steer_enabled=spec.trigger_steer,
         trigger_entropy_enabled=spec.trigger_entropy,
         env_paths=env_paths,
-        cluster_cache_path=store.cache_dir / "cluster_prompt_cache.json",
-        embedding_cache_path=store.cache_dir / "embedding_cache.json",
         enable_request_priorities=config.serve.scheduling_policy == "priority",
     )
     executor.set_event_context(
@@ -613,6 +790,16 @@ def run_doc_rollouts(
         assert resume_state is None, "baseline resume replay is not implemented"
         leaves = executor.run_standard_rollouts(rollout_count=spec.baseline_rollouts)
         return leaves, None
+    if spec.mode == "structured_baseline":
+        assert resume_state is None, "structured baseline resume is not implemented"
+        tree = executor.run_structured_rollouts(rollout_count=spec.baseline_rollouts)
+        return list(tree.leaves), tree
+    if spec.mode == "epsilon_greedy":
+        assert resume_state is None, "epsilon-greedy resume is not implemented"
+        tree = executor.run_epsilon_greedy_rollouts(
+            rollout_count=spec.baseline_rollouts
+        )
+        return list(tree.leaves), tree
     if (
         resume_state is not None
         and resume_state.rollout_finished_seen
@@ -643,7 +830,9 @@ async def run_doc_rollouts_async(
     config: BranchingEvalConfig,
     spec: ExperimentSpec,
     client: VllmClient,
+    cluster_client: VllmClient | None,
     model_name_for_generation: str,
+    cluster_model_name_for_generation: str | None,
     prompt_text: str,
     doc_id: int,
     doc_attempt: int,
@@ -651,6 +840,7 @@ async def run_doc_rollouts_async(
     model_id: str,
     resolved_branching: BranchingConfig,
     store: ArtifactStore,
+    branch_task_semaphore: asyncio.Semaphore | None = None,
     resume_state: BranchResumeState | None = None,
     on_leaf_completed: LeafCompletionHook | None = None,
 ) -> tuple[list[LeafRollout], BranchTree | None]:
@@ -660,7 +850,9 @@ async def run_doc_rollouts_async(
         config: Root config.
         spec: Experiment spec.
         client: vLLM client.
+        cluster_client: Optional vLLM client used for clustering prompts.
         model_name_for_generation: Request-time model name.
+        cluster_model_name_for_generation: Optional clustering request-time model.
         prompt_text: Prompt string.
         doc_id: Document id.
         doc_attempt: Attempt index.
@@ -668,6 +860,7 @@ async def run_doc_rollouts_async(
         model_id: Model label.
         resolved_branching: Branching config with threshold resolved.
         store: Artifact store.
+        branch_task_semaphore: Optional shared branch-task concurrency limiter.
         resume_state: Optional partial-attempt replay state from event logs.
         on_leaf_completed: Optional callback invoked when one leaf completes.
 
@@ -676,16 +869,23 @@ async def run_doc_rollouts_async(
     """
 
     env_paths = default_env_paths()
-    selector_mode = spec.selector or "baseline"
+    selector_mode = selector_mode_for_spec(spec=spec)
     active_selector: SelectorMode = spec.selector or "random"
+    runtime_branching = runtime_branching_for_spec(
+        spec=spec,
+        branching=resolved_branching,
+    )
     executor = BranchExecutor(
         client=client,
+        cluster_client=cluster_client,
         prompt_text=prompt_text,
         model_name=model_name_for_generation,
+        cluster_model_name=cluster_model_name_for_generation,
         decoding=config.decoding,
-        branching=resolved_branching,
+        branching=runtime_branching,
         artifact_store=store,
-        requested_selectors=requested_selectors_for_spec(
+        requested_selectors=selector_modes_for_executor(
+            spec=spec,
             configured_selectors=config.run_matrix.selectors,
             active_selector=active_selector,
         ),
@@ -695,9 +895,9 @@ async def run_doc_rollouts_async(
         trigger_steer_enabled=spec.trigger_steer,
         trigger_entropy_enabled=spec.trigger_entropy,
         env_paths=env_paths,
-        cluster_cache_path=store.cache_dir / "cluster_prompt_cache.json",
-        embedding_cache_path=store.cache_dir / "embedding_cache.json",
         enable_request_priorities=config.serve.scheduling_policy == "priority",
+        branch_task_semaphore=branch_task_semaphore,
+        allow_true_branching=spec.mode != "epsilon_greedy",
     )
     executor.set_event_context(
         doc_id=doc_id,
@@ -716,6 +916,18 @@ async def run_doc_rollouts_async(
             rollout_count=spec.baseline_rollouts
         )
         return leaves, None
+    if spec.mode == "structured_baseline":
+        assert resume_state is None, "structured baseline resume is not implemented"
+        tree = await executor.run_structured_rollouts_async(
+            rollout_count=spec.baseline_rollouts
+        )
+        return list(tree.leaves), tree
+    if spec.mode == "epsilon_greedy":
+        assert resume_state is None, "epsilon-greedy resume is not implemented"
+        tree = await executor.run_epsilon_greedy_rollouts_async(
+            rollout_count=spec.baseline_rollouts
+        )
+        return list(tree.leaves), tree
     if (
         resume_state is not None
         and resume_state.rollout_finished_seen
@@ -745,10 +957,13 @@ async def run_scored_doc_with_limit_async(
     *,
     plan: DocExecutionPlan,
     semaphore: asyncio.Semaphore,
+    branch_task_semaphore: asyncio.Semaphore | None,
     config: BranchingEvalConfig,
     spec: ExperimentSpec,
     client: VllmClient,
+    cluster_client: VllmClient | None,
     model_name_for_generation: str,
+    cluster_model_name_for_generation: str | None,
     task_name: str,
     model_id: str,
     resolved_branching: BranchingConfig,
@@ -761,10 +976,13 @@ async def run_scored_doc_with_limit_async(
     Args:
         plan: Doc attempt execution plan.
         semaphore: Shared concurrency limiter.
+        branch_task_semaphore: Shared branch-task concurrency limiter.
         config: Root config.
         spec: Experiment spec.
         client: vLLM client.
+        cluster_client: Optional vLLM client used for clustering prompts.
         model_name_for_generation: Request-time model name.
+        cluster_model_name_for_generation: Optional clustering request-time model.
         task_name: Task name.
         model_id: Model label.
         resolved_branching: Branching config.
@@ -784,7 +1002,7 @@ async def run_scored_doc_with_limit_async(
         doc_attempt=plan.doc_attempt,
     )
     resume_state: BranchResumeState | None = None
-    if spec.mode == "branching" and plan.resume_in_place:
+    if uses_branch_tree_mode(spec=spec) and plan.resume_in_place:
         resume_state = replay_branching_resume_state(
             events=events_snapshot,
             prompt_text=doc_record.prompt_text,
@@ -793,22 +1011,47 @@ async def run_scored_doc_with_limit_async(
             doc_attempt=plan.doc_attempt,
             task_name=task_name,
             model_id=model_id,
-            selector_mode=spec.selector or "baseline",
+            selector_mode=selector_mode_for_spec(spec=spec),
         )
     if plan.resumed_reason is not None:
-        store.append_event(
+        resumed_event = store.append_event(
             context=context,
             event_type="doc_resumed",
             payload={"reason": plan.resumed_reason},
         )
+    else:
+        resumed_event = None
     if not plan.has_started_event:
-        store.append_event(
+        started_event = store.append_event(
             context=context,
             event_type="doc_started",
             payload={"prompt_char_count": len(doc_record.prompt_text)},
         )
+    else:
+        started_event = None
     pre_scored = resume_state.pre_scored_leaves if resume_state is not None else {}
     scored_during_rollout: dict[str, LeafRollout] = {}
+    progress_tracker = DocProgressTracker.create(
+        run_id=store.run_id,
+        doc_id=doc_record.doc_id,
+        doc_attempt=plan.doc_attempt,
+        task_name=task_name,
+        model_id=model_id,
+        selector_mode=selector_mode_for_spec(spec=spec),
+        rollout_mode=spec.mode,
+        answer_extractor=resolve_answer_extractor(adapter=adapter),
+        existing_leaves=tuple(pre_scored.values()),
+    )
+    progress_timestamp_source = started_event or resumed_event
+    write_doc_progress_snapshot(
+        store=store,
+        tracker=progress_tracker,
+        timestamp_utc=(
+            progress_timestamp_source.timestamp_utc
+            if progress_timestamp_source is not None
+            else utc_now_iso()
+        ),
+    )
 
     def score_and_log_leaf(leaf: LeafRollout) -> LeafRollout:
         """Score one completed leaf immediately and emit `leaf_scored` event."""
@@ -816,6 +1059,7 @@ async def run_scored_doc_with_limit_async(
         existing = pre_scored.get(leaf.leaf_id)
         if existing is not None:
             scored_during_rollout[leaf.leaf_id] = existing
+            progress_tracker.record_leaf(leaf=existing)
             return existing
         scored = score_leaf_and_log_event(
             adapter=adapter,
@@ -825,6 +1069,12 @@ async def run_scored_doc_with_limit_async(
             context=context,
         )
         scored_during_rollout[leaf.leaf_id] = scored
+        progress_tracker.record_leaf(leaf=scored)
+        write_doc_progress_snapshot(
+            store=store,
+            tracker=progress_tracker,
+            timestamp_utc=utc_now_iso(),
+        )
         return scored
 
     async with semaphore:
@@ -834,7 +1084,29 @@ async def run_scored_doc_with_limit_async(
                 config=config,
                 spec=spec,
                 client=client,
+                cluster_client=cluster_client,
                 model_name_for_generation=model_name_for_generation,
+                cluster_model_name_for_generation=cluster_model_name_for_generation,
+                prompt_text=doc_record.prompt_text,
+                doc_id=doc_record.doc_id,
+                doc_attempt=plan.doc_attempt,
+                task_name=task_name,
+                model_id=model_id,
+                resolved_branching=resolved_branching,
+                store=store,
+                branch_task_semaphore=branch_task_semaphore,
+                resume_state=resume_state,
+                on_leaf_completed=score_and_log_leaf,
+            )
+        else:
+            leaves, tree = await asyncio.to_thread(
+                run_doc_rollouts,
+                config=config,
+                spec=spec,
+                client=client,
+                cluster_client=cluster_client,
+                model_name_for_generation=model_name_for_generation,
+                cluster_model_name_for_generation=cluster_model_name_for_generation,
                 prompt_text=doc_record.prompt_text,
                 doc_id=doc_record.doc_id,
                 doc_attempt=plan.doc_attempt,
@@ -845,31 +1117,11 @@ async def run_scored_doc_with_limit_async(
                 resume_state=resume_state,
                 on_leaf_completed=score_and_log_leaf,
             )
-        else:
-            leaves, tree = await asyncio.to_thread(
-                run_doc_rollouts,
-                config=config,
-                spec=spec,
-                client=client,
-                model_name_for_generation=model_name_for_generation,
-                prompt_text=doc_record.prompt_text,
-                doc_id=doc_record.doc_id,
-                doc_attempt=plan.doc_attempt,
-                task_name=task_name,
-                model_id=model_id,
-                resolved_branching=resolved_branching,
-                store=store,
-                resume_state=resume_state,
-                on_leaf_completed=None,
-            )
     scored_leaves = finalize_scored_leaves(
         leaves=leaves,
         pre_scored=pre_scored,
         scored_during_rollout=scored_during_rollout,
-        adapter=adapter,
-        doc_payload=doc_record.doc_payload,
-        store=store,
-        context=context,
+        score_leaf_now=score_and_log_leaf,
     )
     rollout_metrics = [leaf.task_metrics for leaf in scored_leaves]
     doc_metrics = adapter.aggregate_doc_metrics(rollout_metrics=rollout_metrics)
@@ -881,6 +1133,13 @@ async def run_scored_doc_with_limit_async(
             doc_id=doc_record.doc_id,
             leaves=scored_leaves,
         )
+    store.append_doc_diagnostics(diagnostics=diagnostics)
+    progress_tracker.mark_complete()
+    write_doc_progress_snapshot(
+        store=store,
+        tracker=progress_tracker,
+        timestamp_utc=utc_now_iso(),
+    )
     store.append_event(
         context=context,
         event_type="doc_finished",
@@ -909,7 +1168,9 @@ async def run_docs_with_limit_async(
     config: BranchingEvalConfig,
     spec: ExperimentSpec,
     client: VllmClient,
+    cluster_client: VllmClient | None,
     model_name_for_generation: str,
+    cluster_model_name_for_generation: str | None,
     task_name: str,
     model_id: str,
     resolved_branching: BranchingConfig,
@@ -925,7 +1186,9 @@ async def run_docs_with_limit_async(
         config: Root config.
         spec: Experiment spec.
         client: vLLM client.
+        cluster_client: Optional vLLM client used for clustering prompts.
         model_name_for_generation: Request-time model name.
+        cluster_model_name_for_generation: Optional clustering request-time model.
         task_name: Task name.
         model_id: Model label.
         resolved_branching: Branching config.
@@ -938,15 +1201,21 @@ async def run_docs_with_limit_async(
     """
 
     semaphore = asyncio.Semaphore(max_concurrent_docs)
+    branch_task_semaphore = asyncio.Semaphore(
+        resolved_branching.max_concurrent_branches
+    )
     tasks = [
         asyncio.create_task(
             run_scored_doc_with_limit_async(
                 plan=plan,
                 semaphore=semaphore,
+                branch_task_semaphore=branch_task_semaphore,
                 config=config,
                 spec=spec,
                 client=client,
+                cluster_client=cluster_client,
                 model_name_for_generation=model_name_for_generation,
+                cluster_model_name_for_generation=cluster_model_name_for_generation,
                 task_name=task_name,
                 model_id=model_id,
                 resolved_branching=resolved_branching,
@@ -1077,10 +1346,7 @@ def finalize_scored_leaves(
     leaves: list[LeafRollout],
     pre_scored: dict[str, LeafRollout],
     scored_during_rollout: dict[str, LeafRollout],
-    adapter: LmEvalAdapter,
-    doc_payload: dict[str, Any],
-    store: ArtifactStore,
-    context: EventContext,
+    score_leaf_now: LeafCompletionHook,
 ) -> list[LeafRollout]:
     """Return fully-scored leaves with duplicate-score suppression.
 
@@ -1088,10 +1354,7 @@ def finalize_scored_leaves(
         leaves: Leaves returned by runtime rollout execution.
         pre_scored: Resume-replayed leaves already scored in prior events.
         scored_during_rollout: Leaves scored live on completion in this attempt.
-        adapter: lm_eval adapter used for fallback scoring.
-        doc_payload: Task document payload for fallback scoring.
-        store: Artifact store for fallback event logging.
-        context: Doc-scoped event attribution context.
+        score_leaf_now: Live scoring callback used for fallback scoring.
 
     Returns:
         Ordered scored leaves for diagnostics and doc aggregation.
@@ -1107,15 +1370,7 @@ def finalize_scored_leaves(
         if live_scored is not None:
             scored_rows.append(live_scored)
             continue
-        scored_rows.append(
-            score_leaf_and_log_event(
-                adapter=adapter,
-                doc_payload=doc_payload,
-                leaf=leaf,
-                store=store,
-                context=context,
-            )
-        )
+        scored_rows.append(score_leaf_now(leaf))
     return scored_rows
 
 
@@ -1154,15 +1409,70 @@ def leaf_scored_event_payload(*, leaf: LeafRollout) -> dict[str, Any]:
     return {
         "leaf_id": leaf.leaf_id,
         "node_id": leaf.node_id,
-        "text": leaf.text,
-        "token_ids": list(leaf.token_ids),
-        "tokens": [asdict(token) for token in leaf.tokens],
         "verification": leaf.verification,
         "length_tokens_total": leaf.length_tokens_total,
         "length_tokens_exec": leaf.length_tokens_exec,
         "stop_reason": leaf.stop_reason,
         "task_metrics": leaf.task_metrics,
+        "text_preview": compact_text_preview(text=leaf.text, max_chars=200),
     }
+
+
+def compact_text_preview(*, text: str, max_chars: int) -> str:
+    """Return one compact single-line preview for event-log summaries.
+
+    Args:
+        text: Full text to summarize.
+        max_chars: Maximum preview width.
+
+    Returns:
+        Collapsed preview string.
+    """
+
+    collapsed = " ".join(str(text).split())
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return f"{collapsed[: max_chars - 3]}..."
+
+
+def resolve_answer_extractor(*, adapter: LmEvalAdapter) -> Callable[[str], str]:
+    """Return a stable answer extractor for progress logging.
+
+    Args:
+        adapter: lm_eval adapter that may expose `extract_answer`.
+
+    Returns:
+        Callable mapping response text to a normalized answer key.
+    """
+
+    extracted = getattr(adapter, "extract_answer", None)
+    if callable(extracted):
+        return lambda response_text: str(
+            extracted(response_text=response_text)
+        )
+    return lambda response_text: " ".join(str(response_text).split()).casefold()
+
+
+def write_doc_progress_snapshot(
+    *,
+    store: ArtifactStore,
+    tracker: DocProgressTracker,
+    timestamp_utc: str,
+) -> None:
+    """Persist the latest compact per-doc progress snapshot.
+
+    Args:
+        store: Artifact store for this run.
+        tracker: Mutable progress tracker for one doc attempt.
+        timestamp_utc: ISO timestamp recorded for this snapshot.
+
+    Returns:
+        None.
+    """
+
+    store.write_doc_progress(
+        snapshot=tracker.snapshot(last_update_timestamp=timestamp_utc)
+    )
 
 
 def diagnostics_from_payload(
@@ -1243,7 +1553,7 @@ def run_event_context(*, spec: ExperimentSpec, run_id: str) -> EventContext:
         doc_attempt=None,
         task_name=spec.task_name,
         model_id=spec.model_id,
-        selector_mode=spec.selector or "baseline",
+        selector_mode=selector_mode_for_spec(spec=spec),
     )
 
 
@@ -1272,7 +1582,7 @@ def doc_event_context(
         doc_attempt=doc_attempt,
         task_name=spec.task_name,
         model_id=spec.model_id,
-        selector_mode=spec.selector or "baseline",
+        selector_mode=selector_mode_for_spec(spec=spec),
     )
 
 
@@ -1377,7 +1687,7 @@ def build_run_dir(*, config: BranchingEvalConfig, spec: ExperimentSpec) -> Path:
     """
 
     timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    selector_label = spec.selector if spec.selector is not None else "baseline"
+    selector_label = selector_mode_for_spec(spec=spec)
     run_name = (
         f"{spec.task_name}_{spec.model_id}_{spec.mode}_{selector_label}"
         f"_seed{spec.seed}_{timestamp}"

@@ -3,22 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 import time
 from typing import cast
 
 import pytest
 
+import branching_eval.branch_executor as branch_executor_module
 from branching_eval.artifact_store import ArtifactStore
 from branching_eval.branch_executor import BranchExecutor, DecodeOutcome, PathState
 from branching_eval.config_types import BranchingConfig, DecodingConfig
+from branching_eval.selector_types import SelectionOutcome
 from branching_eval.selector_runtime import (
     _cluster_across_ids,
-    _diverse_embedding_ids,
     _random_ids,
     _within_cluster_ids,
 )
-from branching_eval.steer_decode_flow import continue_with_single_steer_candidate
+from branching_eval.steer_decode_flow import (
+    continue_with_single_steer_candidate,
+    continue_with_single_steer_candidate_async,
+)
 from branching_eval.tree_types import (
     BranchTree,
     CandidatePoolRecord,
@@ -270,22 +275,32 @@ def build_executor(
     tmp_path: Path,
     *,
     branch_prob: float = 1.0,
+    max_concurrent_branches: int = 20,
+    branch_task_semaphore: asyncio.Semaphore | None = None,
     trigger_steer_enabled: bool = False,
     trigger_entropy_enabled: bool = True,
+    debug_assert_text_token_alignment: bool = False,
 ) -> BranchExecutor:
     """Build branch executor with fake client and random-only selector."""
 
-    store = ArtifactStore(run_dir=tmp_path / "run", reuse_candidate_pools=True)
+    store = ArtifactStore(run_dir=tmp_path / "run")
     return BranchExecutor(
         client=cast(VllmClient, FakeClient()),
+        cluster_client=None,
         prompt_text="Solve this.",
         model_name="fake",
+        cluster_model_name=None,
         decoding=DecodingConfig(
-            temperature=0.6, top_p=0.95, max_gen_toks=8, top_logprobs=5
+            temperature=0.6,
+            top_p=0.95,
+            max_gen_toks=8,
+            top_logprobs=5,
+            debug_assert_text_token_alignment=debug_assert_text_token_alignment,
         ),
         branching=BranchingConfig(
             branch_prob=branch_prob,
             max_branch_points_per_rollout=2,
+            max_concurrent_branches=max_concurrent_branches,
             num_candidates=100,
             branch_fanout=2,
             max_clusters=4,
@@ -300,8 +315,7 @@ def build_executor(
         trigger_steer_enabled=trigger_steer_enabled,
         trigger_entropy_enabled=trigger_entropy_enabled,
         env_paths=(),
-        cluster_cache_path=tmp_path / "cluster_cache.json",
-        embedding_cache_path=tmp_path / "embedding_cache.json",
+        branch_task_semaphore=branch_task_semaphore,
     )
 
 
@@ -313,7 +327,7 @@ def test_shared_pool_records_all_requested_selectors(
     executor = build_executor(tmp_path=tmp_path)
     executor.requested_selectors = (
         "cluster_across",
-        "embed_diverse",
+        "embed_diverse_topk_random",
         "within_cluster",
         "random",
     )
@@ -326,7 +340,8 @@ def test_shared_pool_records_all_requested_selectors(
                 selector_mode="cluster_across", selected_candidate_ids=(0, 1)
             ),
             SelectionOutcome(
-                selector_mode="embed_diverse", selected_candidate_ids=(2, 3)
+                selector_mode="embed_diverse_topk_random",
+                selected_candidate_ids=(2, 3),
             ),
             SelectionOutcome(
                 selector_mode="within_cluster", selected_candidate_ids=(4, 5)
@@ -334,9 +349,16 @@ def test_shared_pool_records_all_requested_selectors(
             SelectionOutcome(selector_mode="random", selected_candidate_ids=(6, 7)),
         )
 
+    async def fake_select_all_modes_async(**_: object):
+        return fake_select_all_modes()
+
     monkeypatch.setattr(
         "branching_eval.branch_executor.select_candidates_all_modes",
         fake_select_all_modes,
+    )
+    monkeypatch.setattr(
+        "branching_eval.branch_executor.select_candidates_all_modes_async",
+        fake_select_all_modes_async,
     )
     tree = executor.run_branching_rollouts(doc_id=9, task_name="aime24", model_id="m")
     assert tree.branch_points
@@ -364,9 +386,16 @@ def test_selector_event_logs_cluster_details(tmp_path: Path, monkeypatch) -> Non
             SelectionOutcome(selector_mode="random", selected_candidate_ids=(6, 7)),
         )
 
+    async def fake_select_all_modes_async(**_: object):
+        return fake_select_all_modes()
+
     monkeypatch.setattr(
         "branching_eval.branch_executor.select_candidates_all_modes",
         fake_select_all_modes,
+    )
+    monkeypatch.setattr(
+        "branching_eval.branch_executor.select_candidates_all_modes_async",
+        fake_select_all_modes_async,
     )
     _ = executor.run_branching_rollouts(doc_id=10, task_name="aime24", model_id="m")
     rows = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
@@ -395,6 +424,75 @@ def test_branching_leaf_bound_is_k_squared(tmp_path: Path) -> None:
     tree = executor.run_branching_rollouts(doc_id=0, task_name="aime24", model_id="m")
     assert len(tree.leaves) <= 4
     assert all(node.branch_points_used <= 2 for node in tree.nodes.values())
+
+
+def test_leaf_budget_caps_realized_leaf_count(tmp_path: Path) -> None:
+    """Runtime leaf budgets should cap realized leaves below the full tree capacity."""
+
+    executor = build_executor(tmp_path=tmp_path)
+    tree = executor.run_branching_rollouts(
+        doc_id=1,
+        task_name="aime24",
+        model_id="m",
+        leaf_budget=2,
+    )
+
+    rows = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    rollout_started = next(
+        row for row in rows if row.get("event_type") == "rollout_started"
+    )
+    assert rollout_started["payload"]["leaf_limit"] == 2
+    assert len(tree.leaves) == 2
+
+
+def test_leaf_budget_keeps_underproduced_no_trigger_rollouts_ragged(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No-trigger runs should keep their single realized leaf instead of padding to budget."""
+
+    executor = build_executor(
+        tmp_path=tmp_path,
+        trigger_steer_enabled=False,
+        trigger_entropy_enabled=False,
+    )
+
+    async def fake_decode_until_event_async(
+        *,
+        tree: BranchTree,
+        state: PathState,
+        branching_enabled: bool = True,
+        steer_normalization_enabled: bool | None = None,
+    ) -> DecodeOutcome:
+        _ = tree, state, branching_enabled, steer_normalization_enabled
+        return _decode_outcome(
+            event_type="terminated",
+            assistant_prefix="done",
+            token_ids=(11, 12),
+            generated_tokens=2,
+            stop_reason="model_finished",
+        )
+
+    monkeypatch.setattr(
+        executor, "_decode_until_event_async", fake_decode_until_event_async
+    )
+    tree = executor.run_branching_rollouts(
+        doc_id=2,
+        task_name="aime24",
+        model_id="m",
+        leaf_budget=2,
+    )
+
+    rows = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    rollout_started = next(
+        row for row in rows if row.get("event_type") == "rollout_started"
+    )
+    rollout_finished = next(
+        row for row in rows if row.get("event_type") == "rollout_finished"
+    )
+    assert rollout_started["payload"]["leaf_limit"] == 2
+    assert len(tree.branch_points) == 0
+    assert len(tree.leaves) == 1
+    assert rollout_finished["payload"]["leaf_count"] == 1
 
 
 def test_async_frontier_decode_runs_states_concurrently(tmp_path: Path) -> None:
@@ -731,6 +829,86 @@ def test_streaming_scheduler_does_not_block_maxed_resume_on_slow_expansion(
     assert len(tree.leaves) == 1
 
 
+def test_streaming_scheduler_caps_shared_inflight_branch_tasks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Shared branch semaphore should cap decode work across executors."""
+
+    active_task_count = 0
+    max_active_task_count = 0
+
+    async def fake_decode_until_event(
+        *,
+        tree: BranchTree,
+        state: PathState,
+        branching_enabled: bool = True,
+        steer_normalization_enabled: bool | None = None,
+    ) -> DecodeOutcome:
+        nonlocal active_task_count, max_active_task_count
+        _ = tree, state, branching_enabled, steer_normalization_enabled
+        active_task_count += 1
+        max_active_task_count = max(max_active_task_count, active_task_count)
+        await asyncio.sleep(0.02)
+        active_task_count -= 1
+        return _decode_outcome(
+            event_type="terminated",
+            assistant_prefix="done",
+            token_ids=(1,),
+            generated_tokens=1,
+            stop_reason="model_finished",
+        )
+
+    async def run_both_executors() -> None:
+        branch_task_semaphore = asyncio.Semaphore(2)
+        executor_a = build_executor(
+            tmp_path=tmp_path / "run_a",
+            branch_task_semaphore=branch_task_semaphore,
+            trigger_steer_enabled=False,
+            trigger_entropy_enabled=False,
+        )
+        executor_b = build_executor(
+            tmp_path=tmp_path / "run_b",
+            branch_task_semaphore=branch_task_semaphore,
+            trigger_steer_enabled=False,
+            trigger_entropy_enabled=False,
+        )
+        tree_a = _minimal_tree()
+        tree_b = _minimal_tree()
+        frontier_a = [
+            _path_state(node_id=f"node_a_{index}", branch_points_used=0)
+            for index in range(3)
+        ]
+        frontier_b = [
+            _path_state(node_id=f"node_b_{index}", branch_points_used=0)
+            for index in range(3)
+        ]
+        monkeypatch.setattr(
+            executor_a, "_decode_until_event_async", fake_decode_until_event
+        )
+        monkeypatch.setattr(
+            executor_b, "_decode_until_event_async", fake_decode_until_event
+        )
+        await asyncio.gather(
+            executor_a._decode_frontier_streaming_async(
+                tree=tree_a,
+                frontier=frontier_a,
+                doc_id=0,
+                leaf_limit=16,
+            ),
+            executor_b._decode_frontier_streaming_async(
+                tree=tree_b,
+                frontier=frontier_b,
+                doc_id=1,
+                leaf_limit=16,
+            ),
+        )
+        assert len(tree_a.leaves) == 3
+        assert len(tree_b.leaves) == 3
+
+    asyncio.run(run_both_executors())
+    assert max_active_task_count == 2
+
+
 def test_baseline_rollout_count_is_n(tmp_path: Path) -> None:
     """Baseline mode should return exactly N rollouts."""
 
@@ -739,15 +917,15 @@ def test_baseline_rollout_count_is_n(tmp_path: Path) -> None:
     assert len(leaves) == 16
 
 
-def test_branching_pool_reuse_avoids_regeneration(tmp_path: Path) -> None:
-    """Candidate pool should be reused from cache on repeated resolution."""
+def test_branching_pool_regenerates_without_cache(tmp_path: Path) -> None:
+    """Candidate pool should be regenerated on each rollout."""
 
     executor = build_executor(tmp_path=tmp_path)
     assert isinstance(executor.client, FakeClient)
     _ = executor.run_branching_rollouts(doc_id=1, task_name="aime24", model_id="m")
     first_calls = executor.client.candidate_calls
     _ = executor.run_branching_rollouts(doc_id=1, task_name="aime24", model_id="m")
-    assert executor.client.candidate_calls == first_calls
+    assert executor.client.candidate_calls > first_calls
 
 
 def test_branching_writes_incremental_tree_events_jsonl(tmp_path: Path) -> None:
@@ -787,7 +965,8 @@ def test_branching_writes_incremental_tree_events_jsonl(tmp_path: Path) -> None:
     assert candidates_payload
     first_candidate = candidates_payload[0]
     assert isinstance(first_candidate, dict)
-    assert "text" in first_candidate
+    assert "text" not in first_candidate
+    assert "text_preview" in first_candidate
 
 
 def test_max_branch_points_does_not_force_leaf_termination(tmp_path: Path) -> None:
@@ -865,22 +1044,68 @@ def test_selector_cluster_across_respects_cluster_cap() -> None:
     assert len(selected) == 3
 
 
-def test_selector_diverse_embedding_returns_k_ids() -> None:
-    """Embedding-diverse mode should return `K` ids when enough points exist."""
+def test_selected_ids_for_diverse_topk_random_does_not_backfill(tmp_path: Path) -> None:
+    """OpenAI diverse-top-k selector should not backfill beyond chosen ids."""
 
-    embeddings = {
-        0: (1.0, 0.0),
-        1: (0.0, 1.0),
-        2: (-1.0, 0.0),
-        3: (0.0, -1.0),
-    }
-    selected = _diverse_embedding_ids(
-        embedding_by_candidate=embeddings,
-        max_count=3,
-        rng=__import__("random").Random(2),
+    executor = build_executor(tmp_path=tmp_path)
+    executor.active_selector = "embed_diverse_topk_random"
+    pool = sample_pool(candidate_count=4)
+
+    selected = executor._selected_ids_for_branch(pool=pool, selected_ids=(1,))
+
+    assert selected == (1,)
+
+
+def test_candidate_pool_generation_defers_alignment_until_selection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Candidate pools should skip detokenization until a selected child is normalized."""
+
+    executor = build_executor(tmp_path=tmp_path)
+    detokenize_calls: list[tuple[int, ...]] = []
+
+    async def fake_generate_many_async(**_: object) -> tuple[GenerationChoice, ...]:
+        return (
+            make_choice(index=0, text="raw_0", entropy_logprob=-0.4),
+            make_choice(index=1, text="raw_1", entropy_logprob=-0.4),
+        )
+
+    async def fake_detokenize_async(*, model: str, token_ids: tuple[int, ...]) -> str:
+        _ = model
+        detokenize_calls.append(token_ids)
+        return f"decoded_{token_ids[0]}"
+
+    monkeypatch.setattr(executor, "_generate_many_async", fake_generate_many_async)
+    monkeypatch.setattr(
+        executor.client,
+        "detokenize_async",
+        fake_detokenize_async,
+        raising=False,
     )
-    assert len(selected) == 3
-    assert all(candidate_id in embeddings for candidate_id in selected)
+
+    pool = asyncio.run(
+        executor._generate_candidate_pool_async(
+            candidate_pool_id="pool",
+            state=_path_state(node_id="root"),
+            trigger_type="high_entropy",
+            entropy_value=0.3,
+            assistant_prefix="seed",
+            prompt_token_ids=(1, 2, 3),
+            candidate_token_budget=4,
+        )
+    )
+
+    assert detokenize_calls == []
+    selected_text, selected_token_ids = asyncio.run(
+        executor._normalized_child_candidate_async(
+            trigger_type="high_entropy",
+            candidate=pool.candidates[1],
+        )
+    )
+
+    assert detokenize_calls == [(11,)]
+    assert selected_text == "decoded_11"
+    assert selected_token_ids == (11,)
 
 
 def test_selector_within_cluster_prefers_non_other() -> None:
@@ -937,6 +1162,15 @@ def test_entropy_span_pool_generation_uses_no_stop(tmp_path: Path, monkeypatch) 
         called["n"] = n
         called["stop"] = stop
         called["temperature"] = temperature
+        request_stream_id = str(kwargs.get("request_stream_id", ""))
+        if request_stream_id:
+            executor._request_stream_state[request_stream_id] = (
+                branch_executor_module._RequestStreamState(
+                    request_id="test-request",
+                    input_token_ids=prompt_token_ids or (),
+                    output_token_ids=(10,),
+                )
+            )
         return tuple(
             make_choice(index=index, text=f"c{index}", entropy_logprob=-0.4)
             for index in range(n)
@@ -976,7 +1210,7 @@ def test_entropy_span_generation_preserves_partial_steer_prefix(
 
     monkeypatch.setattr(executor, "_generate_many_async", fake_generate_many)
     _ = executor._generate_candidate_pool(
-        cache_key="cache_key",
+        candidate_pool_id="pool_00000001",
         state=PathState(
             node_id="node_x",
             assistant_prefix="abc<steer",
@@ -989,6 +1223,7 @@ def test_entropy_span_generation_preserves_partial_steer_prefix(
         entropy_value=1.2,
         assistant_prefix="abc<steer",
         prompt_token_ids=(1, 2, 3),
+        candidate_token_budget=3,
     )
     assert captured_prefix["assistant_prefix"] == "abc<steer"
     assert captured_prefix["temperature"] == 1.0
@@ -1026,7 +1261,7 @@ def test_steer_pool_generation_applies_full_boundary_normalization(
 
     monkeypatch.setattr(executor, "_generate_many_async", fake_generate_many)
     _ = executor._generate_candidate_pool(
-        cache_key="cache_key",
+        candidate_pool_id="pool_00000001",
         state=PathState(
             node_id="node_s",
             assistant_prefix="<exec>abc<steer",
@@ -1039,6 +1274,7 @@ def test_steer_pool_generation_applies_full_boundary_normalization(
         entropy_value=None,
         assistant_prefix="<exec>abc<steer",
         prompt_token_ids=(1, 2, 3),
+        candidate_token_budget=3,
     )
     assert captured_prefix["stop"] == "</steer"
     assert isinstance(captured_prefix["assistant_prefix"], str)
@@ -1055,7 +1291,10 @@ def test_steer_prefix_normalization_asserts_detokenized_alignment(
 ) -> None:
     """Prefix normalization should assert when suffix detokenization mismatches."""
 
-    executor = build_executor(tmp_path=tmp_path)
+    executor = build_executor(
+        tmp_path=tmp_path,
+        debug_assert_text_token_alignment=True,
+    )
 
     def fake_detokenize(*, model: str, token_ids: tuple[int, ...]) -> str:
         _ = model, token_ids
@@ -1109,7 +1348,7 @@ def test_steer_pool_candidates_preserve_vllm_output(
 
     monkeypatch.setattr(executor, "_generate_many_async", fake_generate_many)
     pool = executor._generate_candidate_pool(
-        cache_key="cache_key",
+        candidate_pool_id="pool_00000002",
         state=PathState(
             node_id="node_s",
             assistant_prefix="<think><steer>",
@@ -1122,6 +1361,7 @@ def test_steer_pool_candidates_preserve_vllm_output(
         entropy_value=None,
         assistant_prefix="<think><steer>",
         prompt_token_ids=(1, 2, 3),
+        candidate_token_budget=3,
     )
     assert pool.candidates[0].text == "abc</steer>"
     assert pool.candidates[0].token_ids == (10, 11, 12)
@@ -1167,7 +1407,7 @@ def test_steer_pool_candidates_fail_when_text_after_close(
     monkeypatch.setattr(executor, "_generate_many_async", fake_generate_many)
     with pytest.raises(AssertionError, match="unexpected text after first </steer>"):
         _ = executor._generate_candidate_pool(
-            cache_key="cache_key",
+            candidate_pool_id="pool_00000003",
             state=PathState(
                 node_id="node_s",
                 assistant_prefix="<think><steer>",
@@ -1180,6 +1420,7 @@ def test_steer_pool_candidates_fail_when_text_after_close(
             entropy_value=None,
             assistant_prefix="<think><steer>",
             prompt_token_ids=(1, 2, 3),
+            candidate_token_budget=3,
         )
 
 
@@ -1258,8 +1499,9 @@ def test_steer_stop_reason_triggers_branch_event(tmp_path: Path, monkeypatch) ->
         )
 
     monkeypatch.setattr(executor, "_generate_choice_async", fake_generate_choice)
+    tree = _minimal_tree()
     outcome = executor._decode_until_event(
-        tree=_minimal_tree(),
+        tree=tree,
         state=PathState(
             node_id="node_root",
             assistant_prefix="",
@@ -1311,8 +1553,9 @@ def test_steer_think_close_natural_finish_terminates(
         )
 
     monkeypatch.setattr(executor, "_generate_choice_async", fake_generate_choice)
+    tree = _minimal_tree()
     outcome = executor._decode_until_event(
-        tree=_minimal_tree(),
+        tree=tree,
         state=PathState(
             node_id="node_root",
             assistant_prefix="",
@@ -1384,8 +1627,9 @@ def test_steer_think_partial_continues_without_stop(
         )
 
     monkeypatch.setattr(executor, "_generate_choice_async", fake_generate_choice)
+    tree = _minimal_tree()
     outcome = executor._decode_until_event(
-        tree=_minimal_tree(),
+        tree=tree,
         state=PathState(
             node_id="node_root",
             assistant_prefix="",
@@ -1439,8 +1683,9 @@ def test_steer_length_boundary_forces_branch_trigger(
         )
 
     monkeypatch.setattr(executor, "_generate_choice_async", fake_generate_choice)
+    tree = _minimal_tree()
     outcome = executor._decode_until_event(
-        tree=_minimal_tree(),
+        tree=tree,
         state=PathState(
             node_id="node_root",
             assistant_prefix="",
@@ -1692,6 +1937,146 @@ def test_maxed_path_keeps_steer_normalization_without_branching(
         for row in events
         if row.get("event_type") == "decode_chunk"
     )
+
+
+def test_inline_epsilon_selection_stays_on_same_node(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Inline epsilon steer selection should emit diagnostics without new edges."""
+
+    executor = build_executor(
+        tmp_path=tmp_path,
+        branch_prob=1.0,
+        trigger_steer_enabled=True,
+        trigger_entropy_enabled=False,
+    )
+    executor.allow_true_branching = False
+    executor.decoding = replace(executor.decoding, max_gen_toks=64)
+    executor.branching = replace(executor.branching, epsilon_greedy_prob=1.0)
+    pool = CandidatePoolRecord(
+        candidate_pool_id="pool_inline",
+        branch_point_id="bp_inline",
+        node_id="node_root",
+        trigger_type="steer_boundary",
+        entropy_value=None,
+        candidates=(
+            CandidateRecord(
+                candidate_id=0,
+                text="reject",
+                token_ids=(10,),
+                tokens=(),
+                finish_reason="stop",
+                stop_reason="</steer",
+            ),
+            CandidateRecord(
+                candidate_id=1,
+                text="keep",
+                token_ids=(11,),
+                tokens=(),
+                finish_reason="stop",
+                stop_reason="</steer",
+            ),
+        ),
+    )
+    call_count = {"decode": 0}
+
+    async def fake_generate_choice(
+        *,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+        max_tokens: int,
+        stop: tuple[str, ...] | None,
+        n: int,
+        **kwargs: object,
+    ) -> GenerationChoice:
+        _ = assistant_prefix, prompt_token_ids, max_tokens, stop, n, kwargs
+        call_count["decode"] += 1
+        if call_count["decode"] == 1:
+            return GenerationChoice(
+                index=0,
+                text="trigger",
+                finish_reason="stop",
+                stop_reason="<steer",
+                tokens=(
+                    ParsedToken(
+                        token="trigger",
+                        logprob=-0.1,
+                        top_entries=(("a", -0.2),),
+                    ),
+                ),
+                prompt_token_ids=(1, 2, 3),
+                token_ids=(42,),
+            )
+        return GenerationChoice(
+            index=0,
+            text="done",
+            finish_reason="stop",
+            stop_reason=None,
+            tokens=(
+                ParsedToken(
+                    token="done",
+                    logprob=-0.1,
+                    top_entries=(("a", -0.2),),
+                ),
+            ),
+            prompt_token_ids=(1, 2, 3, 42, 11),
+            token_ids=(43,),
+        )
+
+    async def fake_resolve_pool_async(**kwargs: object) -> CandidatePoolRecord:
+        _ = kwargs
+        return pool
+
+    async def fake_resolve_selection_outcomes_async(
+        *,
+        pool: CandidatePoolRecord,
+        selector_params: object = None,
+        selector_modes: tuple[str, ...] | None = None,
+    ) -> tuple[SelectionOutcome, ...]:
+        _ = pool, selector_params
+        assert selector_modes == ("embed_diverse_topk_random",)
+        return (
+            SelectionOutcome(
+                selector_mode="embed_diverse_topk_random",
+                selected_candidate_ids=(1,),
+                shortlist_candidate_ids=(0, 1),
+            ),
+        )
+
+    monkeypatch.setattr(executor, "_generate_choice_async", fake_generate_choice)
+    monkeypatch.setattr(
+        executor,
+        "_resolve_candidate_pool_async",
+        fake_resolve_pool_async,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_resolve_selection_outcomes_async",
+        fake_resolve_selection_outcomes_async,
+    )
+    tree = _minimal_tree()
+    outcome = executor._decode_until_event(
+        tree=tree,
+        state=PathState(
+            node_id="node_root",
+            assistant_prefix="",
+            prompt_token_ids=None,
+            token_ids=(),
+            token_traces=(),
+            branch_points_used=0,
+        ),
+    )
+    assert outcome.event_type == "terminated"
+    assert outcome.stop_reason == "model_finished"
+    assert outcome.branch_points_used == 0
+    events = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    event_types = [str(row.get("event_type")) for row in events]
+    assert "candidate_pool_resolved" in event_types
+    assert "selector_applied" in event_types
+    assert "selector_continued_inline" in event_types
+    assert "edge_selected" not in event_types
+    assert "node_created" not in event_types
+    assert len(tree.branch_points) == 0
 
 
 def test_steer_exec_repeat_loop_terminates_branch(tmp_path: Path, monkeypatch) -> None:
@@ -2051,6 +2436,13 @@ def test_single_steer_continuation_keeps_vllm_tokens_and_appends_suffix(
         trigger_steer_enabled=True,
         trigger_entropy_enabled=False,
     )
+    executor.decoding = DecodingConfig(
+        temperature=executor.decoding.temperature,
+        top_p=executor.decoding.top_p,
+        max_gen_toks=32,
+        top_logprobs=executor.decoding.top_logprobs,
+        decode_chunk_tokens=executor.decoding.decode_chunk_tokens,
+    )
 
     def fake_generate_choice(
         *,
@@ -2079,6 +2471,11 @@ def test_single_steer_continuation_keeps_vllm_tokens_and_appends_suffix(
         )
 
     monkeypatch.setattr(executor, "_generate_choice", fake_generate_choice)
+    monkeypatch.setattr(
+        executor,
+        "_update_request_stream_state_output_ids",
+        lambda **_: None,
+    )
     outcome = continue_with_single_steer_candidate(
         executor=executor,
         assistant_prefix="seed</exec>\n\n<steer>",
@@ -2090,12 +2487,78 @@ def test_single_steer_continuation_keeps_vllm_tokens_and_appends_suffix(
     )
     assert outcome.event_type == "continued"
     assert outcome.assistant_prefix.endswith("abc</steer>\n<exec>\n")
-    assert outcome.generated_tokens == 3
+    assert outcome.generated_tokens == len(outcome.token_ids)
     assert outcome.token_ids[:3] == (10, 11, 12)
     assert outcome.token_ids[3:] == tuple(range(1000, 1008))
     assert outcome.prompt_token_ids is not None
     assert outcome.prompt_token_ids[:6] == (1, 2, 3, 10, 11, 12)
     assert outcome.prompt_token_ids[6:] == tuple(range(1000, 1008))
+
+
+def test_single_steer_continuation_async_counts_normalized_suffix_tokens(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Async steer continuation should count injected suffix tokens against the budget."""
+
+    executor = build_executor(
+        tmp_path=tmp_path,
+        trigger_steer_enabled=True,
+        trigger_entropy_enabled=False,
+    )
+    executor.decoding = DecodingConfig(
+        temperature=executor.decoding.temperature,
+        top_p=executor.decoding.top_p,
+        max_gen_toks=32,
+        top_logprobs=executor.decoding.top_logprobs,
+        decode_chunk_tokens=executor.decoding.decode_chunk_tokens,
+    )
+
+    async def fake_generate_choice_async(
+        *,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+        max_tokens: int,
+        stop: tuple[str, ...] | None,
+        n: int,
+        **kwargs: object,
+    ) -> GenerationChoice:
+        _ = assistant_prefix, prompt_token_ids, max_tokens, stop, n, kwargs
+        return GenerationChoice(
+            index=0,
+            text="abc</steer>",
+            finish_reason="stop",
+            stop_reason="</steer>",
+            tokens=(
+                ParsedToken(
+                    token="abc</steer>",
+                    logprob=-0.1,
+                    top_entries=(("a", -0.2),),
+                ),
+            ),
+            prompt_token_ids=(1, 2, 3),
+            token_ids=(10, 11, 12),
+        )
+
+    monkeypatch.setattr(executor, "_generate_choice_async", fake_generate_choice_async)
+    monkeypatch.setattr(
+        executor,
+        "_update_request_stream_state_output_ids",
+        lambda **_: None,
+    )
+    outcome = asyncio.run(
+        continue_with_single_steer_candidate_async(
+            executor=executor,
+            assistant_prefix="seed</exec>\n\n<steer>",
+            prompt_token_ids=(1, 2, 3),
+            token_ids=(),
+            token_traces=(),
+            generated_tokens=0,
+            request_stream_id="decode:node_root",
+        )
+    )
+    assert outcome.event_type == "continued"
+    assert outcome.generated_tokens == len(outcome.token_ids)
+    assert outcome.assistant_prefix.endswith("abc</steer>\n<exec>\n")
 
 
 def test_decode_respects_path_level_max_gen_toks(tmp_path: Path, monkeypatch) -> None:
@@ -2139,6 +2602,49 @@ def test_decode_respects_path_level_max_gen_toks(tmp_path: Path, monkeypatch) ->
     assert outcome.token_ids == tuple(range(max_budget))
 
 
+def test_inline_epsilon_terminates_when_candidate_budget_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    """Inline epsilon should terminate cleanly when no candidate budget remains."""
+
+    executor = build_executor(
+        tmp_path=tmp_path,
+        trigger_steer_enabled=True,
+        trigger_entropy_enabled=False,
+    )
+    executor.allow_true_branching = False
+    executor.branching = replace(executor.branching, epsilon_greedy_prob=1.0)
+    executor.decoding = replace(executor.decoding, max_gen_toks=4)
+    outcome = asyncio.run(
+        executor._resolve_nonbranch_steer_trigger_async(
+            tree=_minimal_tree(),
+            state=PathState(
+                node_id="node_root",
+                assistant_prefix="prefix",
+                prompt_token_ids=(1, 2, 3, 4),
+                token_ids=(10, 11, 12, 13),
+                token_traces=(),
+                branch_points_used=2,
+            ),
+            trigger_outcome=DecodeOutcome(
+                event_type="trigger",
+                trigger_type="steer_boundary",
+                entropy_value=None,
+                assistant_prefix="prefix<steer>",
+                prompt_token_ids=(1, 2, 3, 4),
+                token_ids=(10, 11, 12, 13),
+                token_traces=(),
+                generated_tokens=4,
+                stop_reason="",
+            ),
+            branching_enabled=True,
+        )
+    )
+    assert outcome.event_type == "terminated"
+    assert outcome.stop_reason == "max_gen_toks_reached"
+    assert outcome.branch_points_used == 2
+
+
 def test_single_steer_continuation_fails_when_text_after_close(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -2148,6 +2654,13 @@ def test_single_steer_continuation_fails_when_text_after_close(
         tmp_path=tmp_path,
         trigger_steer_enabled=True,
         trigger_entropy_enabled=False,
+    )
+    executor.decoding = DecodingConfig(
+        temperature=executor.decoding.temperature,
+        top_p=executor.decoding.top_p,
+        max_gen_toks=32,
+        top_logprobs=executor.decoding.top_logprobs,
+        decode_chunk_tokens=executor.decoding.decode_chunk_tokens,
     )
 
     def fake_generate_choice(
@@ -2177,6 +2690,11 @@ def test_single_steer_continuation_fails_when_text_after_close(
         )
 
     monkeypatch.setattr(executor, "_generate_choice", fake_generate_choice)
+    monkeypatch.setattr(
+        executor,
+        "_update_request_stream_state_output_ids",
+        lambda **_: None,
+    )
     with pytest.raises(AssertionError, match="unexpected text after first </steer>"):
         _ = continue_with_single_steer_candidate(
             executor=executor,
@@ -2200,7 +2718,6 @@ def test_steer_selected_child_is_closed_before_continuation(tmp_path: Path) -> N
     tree = _minimal_tree()
     pool = CandidatePoolRecord(
         candidate_pool_id="pool_s",
-        cache_key="key_s",
         branch_point_id="bp_s",
         node_id="node_root",
         trigger_type="steer_boundary",
@@ -2257,6 +2774,114 @@ def test_steer_selected_child_is_closed_before_continuation(tmp_path: Path) -> N
     )
 
 
+def test_steer_candidate_pool_refreshes_when_cache_disabled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Disabling pool cache should regenerate candidates for the same trigger."""
+
+    executor = build_executor(tmp_path=tmp_path)
+    calls: dict[str, int] = {"generate": 0}
+
+    async def fake_candidate_budget_async(
+        *,
+        trigger_type: str,
+        generated_tokens: int,
+    ) -> int:
+        _ = trigger_type, generated_tokens
+        return 3
+
+    async def fake_generate_candidate_pool_async(
+        *,
+        candidate_pool_id: str,
+        state: PathState,
+        trigger_type: str,
+        entropy_value: float | None,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+        candidate_token_budget: int,
+    ) -> CandidatePoolRecord:
+        _ = (
+            candidate_pool_id,
+            state,
+            trigger_type,
+            entropy_value,
+            assistant_prefix,
+            prompt_token_ids,
+            candidate_token_budget,
+        )
+        calls["generate"] += 1
+        return CandidatePoolRecord(
+            candidate_pool_id=f"pool_{calls['generate']}",
+            branch_point_id="bp",
+            node_id="node_root",
+            trigger_type="steer_boundary",
+            entropy_value=None,
+            candidates=(
+                CandidateRecord(
+                    candidate_id=0,
+                    text=f"c{calls['generate']}",
+                    token_ids=(11,),
+                    tokens=(),
+                    finish_reason="stop",
+                    stop_reason="</steer",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        executor,
+        "_candidate_token_budget_async",
+        fake_candidate_budget_async,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_generate_candidate_pool_async",
+        fake_generate_candidate_pool_async,
+    )
+
+    async def run_twice() -> tuple[
+        CandidatePoolRecord,
+        CandidatePoolRecord,
+    ]:
+        first = await executor._resolve_candidate_pool_async(
+            doc_id=1,
+            state=PathState(
+                node_id="node_root",
+                assistant_prefix="seed",
+                prompt_token_ids=(1, 2),
+                token_ids=(),
+                token_traces=(),
+                branch_points_used=0,
+            ),
+            trigger_type="steer_boundary",
+            entropy_value=None,
+            assistant_prefix="seed",
+            prompt_token_ids=(1, 2),
+            generated_tokens=2,
+        )
+        second = await executor._resolve_candidate_pool_async(
+            doc_id=1,
+            state=PathState(
+                node_id="node_root",
+                assistant_prefix="seed",
+                prompt_token_ids=(1, 2),
+                token_ids=(),
+                token_traces=(),
+                branch_points_used=0,
+            ),
+            trigger_type="steer_boundary",
+            entropy_value=None,
+            assistant_prefix="seed",
+            prompt_token_ids=(1, 2),
+            generated_tokens=2,
+        )
+        return (first, second)
+
+    first_pool, second_pool = asyncio.run(run_twice())
+    assert calls["generate"] == 2
+    assert first_pool.candidate_pool_id != second_pool.candidate_pool_id
+
+
 def test_selected_child_normalization_asserts_detokenized_alignment(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -2266,6 +2891,7 @@ def test_selected_child_normalization_asserts_detokenized_alignment(
         tmp_path=tmp_path,
         trigger_steer_enabled=True,
         trigger_entropy_enabled=False,
+        debug_assert_text_token_alignment=True,
     )
 
     def fake_detokenize(*, model: str, token_ids: tuple[int, ...]) -> str:
@@ -2287,6 +2913,37 @@ def test_selected_child_normalization_asserts_detokenized_alignment(
                 stop_reason=None,
             ),
         )
+
+
+def test_selected_child_normalization_skips_alignment_asserts_by_default(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Alignment asserts should be disabled unless debug mode enables them."""
+
+    executor = build_executor(
+        tmp_path=tmp_path,
+        trigger_steer_enabled=True,
+        trigger_entropy_enabled=False,
+    )
+
+    def fake_detokenize(*, model: str, token_ids: tuple[int, ...]) -> str:
+        _ = model, token_ids
+        return "bad"
+
+    monkeypatch.setattr(executor.client, "detokenize", fake_detokenize, raising=False)
+    normalized_text, normalized_token_ids = executor._normalized_child_candidate(
+        trigger_type="steer_boundary",
+        candidate=CandidateRecord(
+            candidate_id=0,
+            text="unfinished",
+            token_ids=(11, 12),
+            tokens=(),
+            finish_reason="length",
+            stop_reason=None,
+        ),
+    )
+    assert normalized_text.startswith("bad")
+    assert normalized_token_ids[:2] == (11, 12)
 
 
 def sample_pool(*, candidate_count: int) -> CandidatePoolRecord:
@@ -2314,7 +2971,6 @@ def sample_pool(*, candidate_count: int) -> CandidatePoolRecord:
     )
     return CandidatePoolRecord(
         candidate_pool_id="pool",
-        cache_key="key",
         branch_point_id="bp",
         node_id="node",
         trigger_type="high_entropy",

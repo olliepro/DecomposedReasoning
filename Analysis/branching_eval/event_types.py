@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-EVENT_SCHEMA_VERSION = 2
+EVENT_SCHEMA_VERSION = 3
 FLOAT_QUANTIZATION_DIGITS = 4
 
 
@@ -57,7 +57,7 @@ class EventEnvelope:
     Example:
         >>> row = EventEnvelope(
         ...     event_index=0,
-        ...     event_version=2,
+        ...     event_version=3,
         ...     timestamp_utc="2026-01-01T00:00:00+00:00",
         ...     run_id="run_abc",
         ...     doc_id=3,

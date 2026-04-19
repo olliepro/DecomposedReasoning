@@ -29,6 +29,21 @@ def verify_aime_response(*, doc: dict[str, Any], response_text: str) -> int:
     return int(module.is_correct_answer(candidate=candidate, target=target))
 
 
+def extract_aime_candidate_answer(*, response_text: str) -> str:
+    """Extract the canonical AIME candidate answer from one response.
+
+    Args:
+        response_text: Model response text.
+
+    Returns:
+        Normalized answer key used for uniqueness accounting.
+    """
+
+    module = _load_aime_module()
+    extracted = module.extract_candidate_answer(response_text)
+    return module.normalize_answer_text(extracted)
+
+
 def _load_aime_module() -> Any:
     """Load `Eval/eval_runner/aime_avgk.py` as importable module.
 

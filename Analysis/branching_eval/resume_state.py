@@ -572,13 +572,20 @@ def _apply_leaf_scored(
         return
     task_metrics = payload.get("task_metrics", {})
     metrics_mapping = task_metrics if isinstance(task_metrics, dict) else {}
-    token_ids = tuple(_ints(payload.get("token_ids")))
-    token_rows = payload.get("tokens", [])
-    token_traces = _token_traces_from_payload(token_rows=token_rows)
+    existing = leaves_by_id.get(leaf_id)
+    state = _ensure_node_state(
+        node_id=node_id,
+        parent_node_id=None,
+        branch_points_used=0,
+        node_state=node_state,
+    )
+    text = state.assistant_prefix if existing is None else existing.text
+    token_ids = tuple(state.token_ids) if existing is None else existing.token_ids
+    token_traces = tuple(state.token_traces) if existing is None else existing.tokens
     scored = LeafRollout(
         leaf_id=leaf_id,
         node_id=node_id,
-        text=str(payload.get("text", "")),
+        text=text,
         token_ids=token_ids,
         tokens=token_traces,
         verification=int(payload.get("verification", 0)),
@@ -586,19 +593,13 @@ def _apply_leaf_scored(
         length_tokens_exec=(
             int(payload["length_tokens_exec"])
             if payload.get("length_tokens_exec") is not None
-            else length_tokens_exec(text=str(payload.get("text", "")))
+            else length_tokens_exec(text=text)
         ),
         stop_reason=str(payload.get("stop_reason", "")),
         task_metrics=metrics_mapping,
     )
     leaves_by_id[leaf_id] = scored
     pre_scored_leaves[leaf_id] = scored
-    state = _ensure_node_state(
-        node_id=node_id,
-        parent_node_id=None,
-        branch_points_used=0,
-        node_state=node_state,
-    )
     state.terminal = True
 
 

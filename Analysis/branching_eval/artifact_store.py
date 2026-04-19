@@ -1,14 +1,15 @@
-"""Artifact logging and cache persistence for branching lm_eval runs."""
+"""Artifact logging for branching lm_eval runs."""
 
 from __future__ import annotations
 
 import fcntl
 import json
 import threading
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+from dataclasses import asdict
 
+from branching_eval.doc_progress import DocProgressSnapshot
 from branching_eval.event_types import (
     EVENT_SCHEMA_VERSION,
     EventContext,
@@ -18,24 +19,22 @@ from branching_eval.event_types import (
     utc_now_iso,
 )
 from branching_eval.metrics_types import AggregateDiagnostics, DocDiagnostics
-from branching_eval.selector_types import SelectionOutcome
-from branching_eval.tree_types import BranchTree, CandidatePoolRecord
+from branching_eval.tree_types import BranchTree
 from io_utils import append_jsonl, read_jsonl, write_json
 
 
 class ArtifactStore:
-    """Persist run artifacts, event logs, and candidate-pool caches.
+    """Persist run artifacts and event logs.
 
     Args:
         run_dir: Root run directory.
-        reuse_candidate_pools: Enables candidate-pool cache reuse.
         run_id: Optional explicit run id. Defaults to `run_dir.name`.
 
     Returns:
         Stateful artifact persistence helper.
 
     Example:
-        >>> store = ArtifactStore(run_dir=Path("output/example"), reuse_candidate_pools=True)
+        >>> store = ArtifactStore(run_dir=Path("output/example"))
         >>> store.tree_events_path.name
         'tree_events.jsonl'
     """
@@ -44,26 +43,15 @@ class ArtifactStore:
         self,
         *,
         run_dir: Path,
-        reuse_candidate_pools: bool,
         run_id: str | None = None,
     ) -> None:
         self.run_dir = run_dir.resolve()
         self.run_id = run_id or self.run_dir.name
-        self.reuse_candidate_pools = reuse_candidate_pools
-        self.cache_dir = self.run_dir / "cache"
         self.tree_events_path = self.run_dir / "tree_events.jsonl"
+        self.doc_progress_dir = self.run_dir / "doc_progress"
         self._event_lock_path = self.run_dir / ".tree_events.lock"
         self._append_lock = threading.Lock()
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.pool_index_path = self.cache_dir / "candidate_pool_index.json"
-        self.pool_payload_path = self.cache_dir / "candidate_pools.jsonl"
-        self.selection_cache_path = self.cache_dir / "selection_cache.json"
-        self._pool_index = self._load_json(path=self.pool_index_path, fallback={})
-        self._selection_cache = self._load_json(
-            path=self.selection_cache_path,
-            fallback={},
-        )
         self._next_event_index = self._read_last_event_index() + 1
 
     def write_config_snapshot(self, *, payload: dict[str, Any]) -> None:
@@ -279,102 +267,38 @@ class ArtifactStore:
 
         write_json(path=self.run_dir / "lm_eval_aggregates.json", payload=payload)
 
-    def load_candidate_pool_id(self, *, cache_key: str) -> str | None:
-        """Load cached candidate pool id for one key.
+    def write_doc_progress(self, *, snapshot: DocProgressSnapshot) -> None:
+        """Write the latest compact progress snapshot for one doc attempt.
 
         Args:
-            cache_key: Candidate pool cache key.
-
-        Returns:
-            Cached pool id or `None`.
-        """
-
-        if not self.reuse_candidate_pools:
-            return None
-        value = self._pool_index.get(cache_key)
-        return str(value) if isinstance(value, str) else None
-
-    def persist_candidate_pool(
-        self,
-        *,
-        cache_key: str,
-        pool: CandidatePoolRecord,
-    ) -> None:
-        """Persist one candidate pool and update key index.
-
-        Args:
-            cache_key: Candidate pool cache key.
-            pool: Candidate pool payload.
+            snapshot: Immutable doc-progress snapshot to persist.
 
         Returns:
             None.
         """
 
-        append_jsonl(path=self.pool_payload_path, payload=asdict(pool))
-        self._pool_index[cache_key] = pool.candidate_pool_id
-        write_json(path=self.pool_index_path, payload=self._pool_index)
+        write_json(
+            path=self.doc_progress_dir / snapshot.filename(),
+            payload=snapshot.to_payload(),
+        )
 
-    def load_selection_cache(self, *, candidate_pool_id: str) -> dict[str, Any] | None:
-        """Load cached selection outputs for one candidate pool.
-
-        Args:
-            candidate_pool_id: Candidate pool id.
-
-        Returns:
-            Selection cache payload or `None`.
-        """
-
-        value = self._selection_cache.get(candidate_pool_id)
-        return value if isinstance(value, dict) else None
-
-    def persist_selection_cache(
-        self,
-        *,
-        candidate_pool_id: str,
-        selections: tuple[SelectionOutcome, ...],
-    ) -> None:
-        """Persist selector outputs for one candidate pool.
+    def read_doc_progress_snapshots(self) -> list[dict[str, Any]]:
+        """Read all latest per-attempt progress snapshots from disk.
 
         Args:
-            candidate_pool_id: Candidate pool id.
-            selections: Selector outcomes for all modes.
-
-        Returns:
             None.
-        """
-
-        self._selection_cache[candidate_pool_id] = {
-            outcome.selector_mode: _serialize_selection(outcome=outcome)
-            for outcome in selections
-        }
-        write_json(path=self.selection_cache_path, payload=self._selection_cache)
-
-    def load_candidate_pool(
-        self,
-        *,
-        candidate_pool_id: str,
-    ) -> CandidatePoolRecord | None:
-        """Load one candidate pool by id from JSONL cache.
-
-        Args:
-            candidate_pool_id: Candidate pool id.
 
         Returns:
-            Parsed candidate pool record or `None`.
+            Sorted list of snapshot payload mappings.
         """
 
-        if not self.pool_payload_path.exists():
-            return None
-        with self.pool_payload_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                payload = json.loads(line)
-                if payload.get("candidate_pool_id") != candidate_pool_id:
-                    continue
-                assert isinstance(payload, dict), "candidate row must be a mapping"
-                return _parse_candidate_pool(payload=payload)
-        return None
+        if not self.doc_progress_dir.exists():
+            return []
+        rows = [
+            self._load_json(path=path, fallback={})
+            for path in sorted(self.doc_progress_dir.glob("doc_*_attempt_*.json"))
+        ]
+        return [row for row in rows if row]
 
     def _allocate_event_index_locked(self) -> int:
         """Allocate next event index from in-memory counter.
@@ -386,7 +310,7 @@ class ArtifactStore:
             Next monotonic event index for this process.
 
         Example:
-            >>> store = ArtifactStore(run_dir=Path('/tmp/run_x'), reuse_candidate_pools=False)
+            >>> store = ArtifactStore(run_dir=Path('/tmp/run_x'))
             >>> first = store._allocate_event_index_locked()
             >>> second = store._allocate_event_index_locked()
             >>> second == first + 1
@@ -466,72 +390,3 @@ def build_run_manifest_payload(
 def _as_mapping(*, value: Any, context: str) -> dict[str, Any]:
     assert isinstance(value, dict), f"{context} must be a mapping"
     return value
-
-
-def _serialize_selection(*, outcome: SelectionOutcome) -> dict[str, Any]:
-    return {
-        "selector_mode": outcome.selector_mode,
-        "selected_candidate_ids": list(outcome.selected_candidate_ids),
-        "cluster_by_candidate_id": outcome.cluster_by_candidate_id,
-        "embedding_by_candidate_id": outcome.embedding_by_candidate_id,
-    }
-
-
-def _parse_candidate_pool(*, payload: dict[str, Any]) -> CandidatePoolRecord:
-    from branching_eval.tree_types import CandidateRecord, TokenTrace
-
-    raw_candidates = payload.get("candidates", [])
-    assert isinstance(raw_candidates, list), "candidates must be a list"
-    candidates = tuple(
-        _parse_candidate(candidate=row)
-        for row in raw_candidates
-        if isinstance(row, dict)
-    )
-    return CandidatePoolRecord(
-        candidate_pool_id=str(payload.get("candidate_pool_id", "")),
-        cache_key=str(payload.get("cache_key", "")),
-        branch_point_id=str(payload.get("branch_point_id", "")),
-        node_id=str(payload.get("node_id", "")),
-        trigger_type=str(payload.get("trigger_type", "")),
-        entropy_value=(
-            float(payload["entropy_value"])
-            if payload.get("entropy_value") is not None
-            else None
-        ),
-        candidates=tuple(candidates),
-    )
-
-
-def _parse_candidate(*, candidate: dict[str, Any]) -> Any:
-    from branching_eval.tree_types import CandidateRecord
-
-    token_rows = candidate.get("tokens", [])
-    assert isinstance(token_rows, list), "token rows must be a list"
-    tokens = tuple(
-        _parse_token_trace(token_row=token_row)
-        for token_row in token_rows
-        if isinstance(token_row, dict)
-    )
-    token_ids = tuple(int(item) for item in candidate.get("token_ids", []))
-    return CandidateRecord(
-        candidate_id=int(candidate.get("candidate_id", 0)),
-        text=str(candidate.get("text", "")),
-        token_ids=token_ids,
-        tokens=tokens,
-        finish_reason=str(candidate.get("finish_reason", "unknown")),
-        stop_reason=candidate.get("stop_reason"),
-    )
-
-
-def _parse_token_trace(*, token_row: dict[str, Any]) -> Any:
-    from branching_eval.tree_types import TokenTrace
-
-    token_id = token_row.get("token_id")
-    return TokenTrace(
-        token_index=int(token_row.get("token_index", 0)),
-        token_id=int(token_id) if token_id is not None else None,
-        token_text=str(token_row.get("token_text", "")),
-        logprob=float(token_row.get("logprob", 0.0)),
-        probability=float(token_row.get("probability", 0.0)),
-        entropy=float(token_row.get("entropy", 0.0)),
-    )

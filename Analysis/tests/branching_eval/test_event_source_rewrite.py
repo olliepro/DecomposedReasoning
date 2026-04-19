@@ -101,11 +101,13 @@ def build_executor(
 ) -> BranchExecutor:
     """Build executor with lightweight async client for prefix tests."""
 
-    store = ArtifactStore(run_dir=tmp_path / "run", reuse_candidate_pools=True)
+    store = ArtifactStore(run_dir=tmp_path / "run")
     executor = BranchExecutor(
         client=cast(VllmClient, PrefixClient()),
+        cluster_client=None,
         prompt_text="Solve this.",
         model_name="fake-model",
+        cluster_model_name=None,
         decoding=DecodingConfig(
             temperature=0.6,
             top_p=0.95,
@@ -129,8 +131,6 @@ def build_executor(
         trigger_steer_enabled=False,
         trigger_entropy_enabled=False,
         env_paths=(),
-        cluster_cache_path=tmp_path / "cluster_cache.json",
-        embedding_cache_path=tmp_path / "embedding_cache.json",
         enable_request_priorities=enable_request_priorities,
     )
     executor.set_event_context(
@@ -190,8 +190,8 @@ def test_vllm_request_prefix_invariant_and_delta_extraction(tmp_path: Path) -> N
     assert request_rows[1]["payload"]["delta_token_count"] == 0
 
 
-def test_vllm_response_alternatives_truncated_to_four(tmp_path: Path) -> None:
-    """Serialized response token alternatives should keep top four alternates only."""
+def test_vllm_response_serialization_is_compact(tmp_path: Path) -> None:
+    """Serialized response token rows should omit heavy alternative payloads."""
 
     executor = build_executor(tmp_path=tmp_path)
     choice = GenerationChoice(
@@ -221,13 +221,8 @@ def test_vllm_response_alternatives_truncated_to_four(tmp_path: Path) -> None:
     token_rows = payload["tokens"]
     assert isinstance(token_rows, list)
     assert len(token_rows) == 1
-    alternatives = token_rows[0]["top_logprob_alternatives"]
-    assert [row["token_text"] for row in alternatives] == [
-        "alt_a",
-        "alt_b",
-        "alt_c",
-        "alt_d",
-    ]
+    assert "top_logprob_alternatives" not in token_rows[0]
+    assert payload["text_preview"] == "answer"
 
 
 def test_vllm_request_includes_branch_priority_fields(tmp_path: Path) -> None:
@@ -279,7 +274,7 @@ def test_vllm_request_includes_branch_priority_fields(tmp_path: Path) -> None:
 def test_event_writer_monotonic_indices_and_float_quantization(tmp_path: Path) -> None:
     """Concurrent appends should remain monotonic and quantize floats to 4 decimals."""
 
-    store = ArtifactStore(run_dir=tmp_path / "run", reuse_candidate_pools=False)
+    store = ArtifactStore(run_dir=tmp_path / "run")
     context = EventContext(
         run_id=store.run_id,
         doc_id=0,
@@ -309,7 +304,7 @@ def test_event_writer_monotonic_indices_and_float_quantization(tmp_path: Path) -
 def test_resume_planning_skips_finished_and_restarts_incomplete(tmp_path: Path) -> None:
     """Resume plans should skip completed docs and continue incomplete attempts in place."""
 
-    store = ArtifactStore(run_dir=tmp_path / "run", reuse_candidate_pools=False)
+    store = ArtifactStore(run_dir=tmp_path / "run")
     context_doc0 = EventContext(
         run_id=store.run_id,
         doc_id=0,
@@ -355,7 +350,7 @@ def test_resume_planning_skips_finished_and_restarts_incomplete(tmp_path: Path) 
 def test_recompute_outputs_uses_latest_completed_attempt_only(tmp_path: Path) -> None:
     """Aggregate recompute should ignore stale older attempts for same doc."""
 
-    store = ArtifactStore(run_dir=tmp_path / "run", reuse_candidate_pools=False)
+    store = ArtifactStore(run_dir=tmp_path / "run")
     contexts = {
         (0, 0): EventContext(
             run_id=store.run_id,
