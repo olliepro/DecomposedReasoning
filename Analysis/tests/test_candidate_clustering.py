@@ -45,7 +45,7 @@ def test_build_cluster_prompt_previous_context_behavior() -> None:
         items=items,
     )
     assert "Current step index" not in with_context
-    assert "## Rules" in with_context
+    assert "Rules for the JSON:" in with_context
     assert "## Context on the current process" in with_context
     assert "## Options to group:" in with_context
     assert "Previous 2 selected steps:" in with_context
@@ -121,11 +121,18 @@ def test_cluster_candidates_by_step_reuses_prompt_cache(
     call_count = 0
 
     def fake_call(
-        *, api_key: str, prompt: str, model_id: str, temperature: float
+        *, api_key: str, prompt: str, model_id: str, temperature: float, items
     ) -> list[dict[str, object]]:
         nonlocal call_count
+        _ = items
         call_count += 1
-        return [{"name": "solver_plan", "member_ids": [1, 2]}]
+        return [
+            {
+                "name": "solver_plan",
+                "key": "solver_plan",
+                "member_ids": [1, 2],
+            }
+        ]
 
     monkeypatch.setenv("VERTEX_KEY", "test-key")
     monkeypatch.setattr(candidate_clustering, "call_gemini_clusters", fake_call)

@@ -27,6 +27,7 @@
     "overlap_comm": false,
     "reduce_bucket_size": "auto",
     "stage3_prefetch_bucket_size": "auto",
-    "stage3_param_persistence_threshold": "auto"
+    "stage3_param_persistence_threshold": "auto",
+    "gather_16bit_weights_on_model_save": true
   }
 }

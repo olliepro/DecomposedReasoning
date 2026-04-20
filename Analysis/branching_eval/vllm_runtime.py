@@ -23,9 +23,9 @@ class RunningVllmServer:
         model_spec: Source model specification.
         model_name_for_generation: Model name used in completions requests.
         base_url: OpenAI-compatible base URL.
-        port: Bound TCP port.
-        command: Launch command.
-        process: Process handle.
+        port: Bound TCP port when locally managed, else `None`.
+        command: Launch command when locally managed, else empty.
+        process: Process handle when locally managed, else `None`.
 
     Returns:
         Dataclass representing one server runtime.
@@ -34,9 +34,9 @@ class RunningVllmServer:
     model_spec: ModelSpec
     model_name_for_generation: str
     base_url: str
-    port: int
+    port: int | None
     command: tuple[str, ...]
-    process: subprocess.Popen[str]
+    process: subprocess.Popen[str] | None
 
 
 def build_vllm_serve_command(
@@ -102,6 +102,11 @@ def resolve_generation_model_name(*, model_spec: ModelSpec) -> str:
         Generation-time model id.
     """
 
+    if model_spec.uses_external_server:
+        assert (
+            model_spec.served_model_name is not None
+        ), "served_model_name required for external server"
+        return model_spec.served_model_name
     if model_spec.has_lora:
         assert model_spec.lora_name is not None, "lora_name required for LoRA"
         return model_spec.lora_name
@@ -191,6 +196,31 @@ def wait_for_server(
     raise TimeoutError(f"Timed out waiting for vLLM server: {base_url}")
 
 
+def wait_for_existing_server(
+    *,
+    base_url: str,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+) -> None:
+    """Wait for a pre-existing vLLM server to become reachable.
+
+    Args:
+        base_url: OpenAI-compatible server base URL (`.../v1`).
+        timeout_seconds: Max wait duration.
+        poll_interval_seconds: Poll sleep interval.
+
+    Returns:
+        None.
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if is_server_ready(base_url=base_url):
+            return
+        time.sleep(max(0.1, poll_interval_seconds))
+    raise TimeoutError(f"Timed out waiting for external vLLM server: {base_url}")
+
+
 def is_server_ready(*, base_url: str) -> bool:
     """Check whether vLLM `/models` endpoint is reachable.
 
@@ -226,6 +256,8 @@ def stop_vllm_server(*, server: RunningVllmServer) -> None:
         None.
     """
 
+    if server.process is None:
+        return
     _terminate_process(process=server.process)
 
 
@@ -249,12 +281,28 @@ def managed_vllm_server(
         Iterator yielding one running server descriptor.
     """
 
-    server = start_vllm_server(
-        model_spec=model_spec,
-        serve_config=serve_config,
-        port=port,
-        log_dir=log_dir,
-    )
+    if model_spec.uses_external_server:
+        assert model_spec.base_url is not None, "base_url required for external server"
+        wait_for_existing_server(
+            base_url=model_spec.base_url,
+            timeout_seconds=serve_config.startup_timeout_seconds,
+            poll_interval_seconds=serve_config.poll_interval_seconds,
+        )
+        server = RunningVllmServer(
+            model_spec=model_spec,
+            model_name_for_generation=resolve_generation_model_name(model_spec=model_spec),
+            base_url=model_spec.base_url,
+            port=None,
+            command=(),
+            process=None,
+        )
+    else:
+        server = start_vllm_server(
+            model_spec=model_spec,
+            serve_config=serve_config,
+            port=port,
+            log_dir=log_dir,
+        )
     try:
         yield server
     finally:

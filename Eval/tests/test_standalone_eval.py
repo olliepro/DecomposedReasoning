@@ -1,5 +1,7 @@
 """Unit tests for standalone eval logging helpers."""
 
+# pyright: reportMissingImports=false
+
 from __future__ import annotations
 
 import argparse
@@ -27,6 +29,7 @@ from eval_runner.standalone import (
     maybe_init_wandb_eval_run,
     maybe_log_eval_metrics_to_wandb,
     parse_args,
+    resolve_output_json_path,
 )
 
 
@@ -50,6 +53,20 @@ def test_infer_eval_step_for_final_model_uses_latest_checkpoint(tmp_path: Path) 
     final_model_path = tmp_path / "final_model"
     final_model_path.mkdir()
     assert infer_eval_step(checkpoint=final_model_path) == 10
+
+
+def test_infer_eval_step_ignores_hf_repo_id() -> None:
+    """HF repo ids should not be treated as local final_model directories."""
+    assert infer_eval_step(checkpoint="allenai/Olmo-3-7B-Think-SFT") is None
+
+
+def test_resolve_output_json_path_for_repo_id_uses_base_dir() -> None:
+    """Remote baseline refs should default to benchmark_evals_base outputs."""
+    output_path = resolve_output_json_path(
+        checkpoint="allenai/Olmo-3-7B-Think-SFT",
+        output=None,
+    )
+    assert output_path == Path("benchmark_evals_base/allenai--Olmo-3-7B-Think-SFT.json")
 
 
 def test_build_eval_log_payload_adds_step_metrics(

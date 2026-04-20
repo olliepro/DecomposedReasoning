@@ -15,6 +15,12 @@ from typing import Any
 import wandb
 
 from eval_runner.config_types import EvalRunMetadata, LmEvalConfig, parse_eval_config
+from eval_runner.model_reference import (
+    ModelReference,
+    model_reference_name,
+    resolve_local_model_path,
+    resolve_pretrained_arg,
+)
 from eval_runner.run_lm_eval import (
     find_sample_log_files,
     load_and_flatten_metrics,
@@ -64,11 +70,11 @@ def checkpoint_step_from_name(checkpoint_name: str) -> int | None:
     return int(numeric_prefix)
 
 
-def infer_eval_step(checkpoint: Path) -> int | None:
+def infer_eval_step(checkpoint: ModelReference) -> int | None:
     """Infer a train global step for eval logging from checkpoint path.
 
     Args:
-        checkpoint: Evaluated checkpoint directory path.
+        checkpoint: Evaluated checkpoint directory path or remote model id.
 
     Returns:
         Train global step when inferable, otherwise `None`.
@@ -77,14 +83,16 @@ def infer_eval_step(checkpoint: Path) -> int | None:
         >>> infer_eval_step(checkpoint=Path("checkpoint-200"))
         200
     """
-    direct_step = checkpoint_step_from_name(checkpoint_name=checkpoint.name)
+    checkpoint_name = model_reference_name(model_reference=checkpoint)
+    direct_step = checkpoint_step_from_name(checkpoint_name=checkpoint_name)
     if direct_step is not None:
         return direct_step
-    if checkpoint.name != "final_model" or not checkpoint.parent.exists():
+    local_checkpoint_path = resolve_local_model_path(model_reference=checkpoint)
+    if checkpoint_name != "final_model" or local_checkpoint_path is None:
         return None
     discovered_steps = [
         parsed_step
-        for checkpoint_dir in checkpoint.parent.glob("checkpoint-*")
+        for checkpoint_dir in local_checkpoint_path.parent.glob("checkpoint-*")
         for parsed_step in [
             checkpoint_step_from_name(checkpoint_name=checkpoint_dir.name)
         ]
@@ -97,13 +105,13 @@ def infer_eval_step(checkpoint: Path) -> int | None:
 
 def build_eval_log_payload(
     result_path: Path,
-    checkpoint: Path,
+    checkpoint: ModelReference,
 ) -> tuple[dict[str, float], int | None]:
     """Build eval metrics payload and optional W&B step value.
 
     Args:
         result_path: Aggregated `lm-eval` output JSON path.
-        checkpoint: Evaluated checkpoint directory path.
+        checkpoint: Evaluated checkpoint directory path or remote model id.
 
     Returns:
         Tuple `(payload, eval_step)` for `wandb.log`.
@@ -123,9 +131,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run standalone benchmark evaluation.")
     parser.add_argument(
         "--checkpoint",
-        type=Path,
+        type=str,
         required=True,
-        help="Path to the model checkpoint directory.",
+        help="Path to the local model checkpoint directory or HF repo id.",
     )
     parser.add_argument(
         "--config",
@@ -213,7 +221,7 @@ def load_eval_config(config_path: Path) -> tuple[LmEvalConfig, EvalRunMetadata |
     return parse_eval_config(config_path=config_path)
 
 
-def resolve_output_json_path(checkpoint: Path, output: Path | None) -> Path:
+def resolve_output_json_path(checkpoint: ModelReference, output: Path | None) -> Path:
     """Resolve default output JSON path for standalone eval.
 
     Args:
@@ -225,15 +233,16 @@ def resolve_output_json_path(checkpoint: Path, output: Path | None) -> Path:
     """
     if output is not None:
         return output
-    if not checkpoint.exists():
-        model_slug = str(checkpoint).replace("/", "--")
+    local_checkpoint_path = resolve_local_model_path(model_reference=checkpoint)
+    if local_checkpoint_path is None:
+        model_slug = resolve_pretrained_arg(model_reference=checkpoint).replace("/", "--")
         return Path("benchmark_evals_base") / f"{model_slug}.json"
-    return checkpoint / "benchmark_evals" / "standalone.json"
+    return local_checkpoint_path / "benchmark_evals" / "standalone.json"
 
 
 def maybe_init_wandb_eval_run(
     run_config: EvalRunMetadata | None,
-    checkpoint: Path,
+    checkpoint: ModelReference,
     config_path: Path,
     task_names: tuple[str, ...] | None = None,
 ) -> None:
@@ -241,7 +250,7 @@ def maybe_init_wandb_eval_run(
 
     Args:
         run_config: Optional full run configuration.
-        checkpoint: Evaluated checkpoint path.
+        checkpoint: Evaluated checkpoint path or remote model id.
         config_path: Source config path used for eval.
         task_names: Optional explicit task list used for this eval invocation.
 
@@ -259,7 +268,9 @@ def maybe_init_wandb_eval_run(
     run_name = run_context.run_name
     if not shared_run_id:
         checkpoint_token = (
-            f"checkpoint-{eval_step}" if eval_step is not None else checkpoint.name
+            f"checkpoint-{eval_step}"
+            if eval_step is not None
+            else model_reference_name(model_reference=checkpoint)
         ).replace("/", "--")
         run_name = f"{run_context.run_name}_{checkpoint_token}"
         if task_names:
@@ -270,7 +281,7 @@ def maybe_init_wandb_eval_run(
             run_name = f"{run_name}_{task_token.replace('/', '--')}"
     init_config: dict[str, Any] = {
         "eval_config_path": str(config_path),
-        "eval_checkpoint_path": str(checkpoint),
+        "eval_checkpoint_path": resolve_pretrained_arg(model_reference=checkpoint),
     }
     if eval_step is not None:
         init_config["eval_checkpoint_step"] = int(eval_step)
@@ -292,12 +303,12 @@ def maybe_init_wandb_eval_run(
     wandb.define_metric(name="bench/*", step_metric="train/global_step")
 
 
-def maybe_log_eval_metrics_to_wandb(result_path: Path, checkpoint: Path) -> None:
+def maybe_log_eval_metrics_to_wandb(result_path: Path, checkpoint: ModelReference) -> None:
     """Log flattened benchmark metrics to active W&B eval run.
 
     Args:
         result_path: Aggregated eval result JSON path.
-        checkpoint: Evaluated checkpoint path.
+        checkpoint: Evaluated checkpoint path or remote model id.
 
     Returns:
         None.

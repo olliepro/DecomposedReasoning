@@ -29,11 +29,13 @@ class MinimalClient:
 def build_executor(tmp_path: Path, *, branch_fanout: int = 2) -> BranchExecutor:
     """Build an executor instance for steer-selection unit tests."""
 
-    store = ArtifactStore(run_dir=tmp_path / "run", reuse_candidate_pools=True)
+    store = ArtifactStore(run_dir=tmp_path / "run")
     return BranchExecutor(
         client=cast(VllmClient, MinimalClient()),
+        cluster_client=None,
         prompt_text="prompt",
         model_name="fake",
+        cluster_model_name=None,
         decoding=DecodingConfig(
             temperature=0.6,
             top_p=0.95,
@@ -57,8 +59,6 @@ def build_executor(tmp_path: Path, *, branch_fanout: int = 2) -> BranchExecutor:
         trigger_steer_enabled=True,
         trigger_entropy_enabled=False,
         env_paths=(),
-        cluster_cache_path=tmp_path / "cluster_cache.json",
-        embedding_cache_path=tmp_path / "embedding_cache.json",
     )
 
 
@@ -67,7 +67,6 @@ def steer_pool(*, trigger_type: str) -> CandidatePoolRecord:
 
     return CandidatePoolRecord(
         candidate_pool_id="pool",
-        cache_key="key",
         branch_point_id="bp",
         node_id="node",
         trigger_type=trigger_type,
@@ -112,7 +111,9 @@ def test_steer_selection_deduplicates_and_backfills(tmp_path: Path) -> None:
     assert selected == (0, 2)
 
 
-def test_steer_selection_ignores_repeated_ids_without_replacement(tmp_path: Path) -> None:
+def test_steer_selection_ignores_repeated_ids_without_replacement(
+    tmp_path: Path,
+) -> None:
     """Steer selection should never include repeated candidate IDs."""
 
     executor = build_executor(tmp_path=tmp_path, branch_fanout=2)
@@ -121,14 +122,3 @@ def test_steer_selection_ignores_repeated_ids_without_replacement(tmp_path: Path
         selected_ids=(1, 1, 1),
     )
     assert selected == (1, 2)
-
-
-def test_non_steer_selection_preserves_selector_output(tmp_path: Path) -> None:
-    """Non-steer trigger should preserve selector ids unchanged."""
-
-    executor = build_executor(tmp_path=tmp_path, branch_fanout=2)
-    selected = executor._selected_ids_for_branch(
-        pool=steer_pool(trigger_type="high_entropy"),
-        selected_ids=(0, 0, 1),
-    )
-    assert selected == (0, 0, 1)

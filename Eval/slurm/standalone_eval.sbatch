@@ -29,12 +29,28 @@ if [[ -z "${PROJECT_DIR}" ]]; then
     PROJECT_DIR="${DEFAULT_PROJECT_DIR}"
   fi
 fi
-CHECKPOINT_PATH="$1"
+CHECKPOINT_REFERENCE="$1"
 CONFIG_PATH="$2"
 shift 2
 
-CHECKPOINT_PATH="$(realpath -m "${CHECKPOINT_PATH}")"
 CONFIG_PATH="$(realpath -m "${CONFIG_PATH}")"
+
+normalize_model_reference() {
+  local raw_reference="$1"
+  if [[ -e "${raw_reference}" ]]; then
+    realpath -m "${raw_reference}"
+    return
+  fi
+  case "${raw_reference}" in
+    /*|./*|../*|~*)
+      realpath -m "${raw_reference}"
+      return
+      ;;
+  esac
+  printf '%s\n' "${raw_reference}"
+}
+
+CHECKPOINT_REFERENCE="$(normalize_model_reference "${CHECKPOINT_REFERENCE}")"
 
 if [[ ! -f "${CONFIG_PATH}" ]]; then
   echo "Config not found: ${CONFIG_PATH}"
@@ -79,10 +95,10 @@ if [[ ! -x "${EVAL_STANDALONE_SCRIPT}" ]]; then
 fi
 
 echo "Running standalone eval"
-echo "Checkpoint: ${CHECKPOINT_PATH}"
+echo "Checkpoint: ${CHECKPOINT_REFERENCE}"
 echo "Config: ${CONFIG_PATH}"
 
 EVAL_PYTHON_BIN="${EVAL_PYTHON_BIN}" "${EVAL_STANDALONE_SCRIPT}" \
-  --checkpoint "${CHECKPOINT_PATH}" \
+  --checkpoint "${CHECKPOINT_REFERENCE}" \
   --config "${CONFIG_PATH}" \
   "$@"

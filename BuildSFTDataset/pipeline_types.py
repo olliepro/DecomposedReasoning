@@ -16,9 +16,9 @@ DEFAULT_ENV_PATH = Path(".env")
 DEFAULT_ROWS_PER_SHARD = 3000
 DEFAULT_NUM_SHARDS = 20
 DEFAULT_SEED = 42
-DEFAULT_SHUFFLE_BUFFER = 10000
+DEFAULT_SHUFFLE_BUFFER = 20000
 DEFAULT_MIN_TOKENS = 500
-DEFAULT_MAX_TOKENS = 3000
+DEFAULT_MAX_TOKENS = 16384
 DEFAULT_ENCODING = "cl100k_base"
 DEFAULT_TARGET_ROWS = 2000
 
@@ -28,7 +28,8 @@ DEFAULT_MAX_OUTPUT_TOKENS = 20000
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_THINKING_LEVEL = "low"
 DEFAULT_BATCH = True
-DEFAULT_MAX_ROWS = 2000
+DEFAULT_MAX_CONCURRENT_REQUESTS = 500
+DEFAULT_MAX_ROWS = 5000
 DEFAULT_CONFIRM_THRESHOLD = 100
 DEFAULT_RETRY_LIMIT = 3
 DEFAULT_RETRY_SLEEP = 2.0
@@ -104,6 +105,7 @@ class TransformConfig:
         temperature: Sampling temperature.
         thinking_level: Gemini reasoning level.
         batch: Whether to use batch API.
+        max_concurrent_requests: Max concurrent async non-batch requests.
         retry_limit: Retry count for non-batch calls.
         retry_sleep_seconds: Backoff base.
         batch_poll_seconds: Batch polling interval.
@@ -120,6 +122,7 @@ class TransformConfig:
     temperature: float
     thinking_level: str | None
     batch: bool
+    max_concurrent_requests: int
     retry_limit: int
     retry_sleep_seconds: float
     batch_poll_seconds: float
@@ -212,3 +215,18 @@ class ThinkTask:
     row_index: int
     message_index: int
     block_index: int
+
+
+@dataclass(frozen=True)
+class AsyncTransformResult:
+    """Outputs and failures from async non-batch transform.
+
+    Args:
+        outputs: Output text aligned with think-block order.
+        failed_indexes: Failed think-block indexes using original text fallback.
+        failed_errors: Short error strings keyed by failed index.
+    """
+
+    outputs: list[str]
+    failed_indexes: list[int]
+    failed_errors: dict[int, str]

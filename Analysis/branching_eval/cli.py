@@ -43,7 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--selector",
         type=str,
-        choices=("cluster_across", "embed_diverse", "within_cluster", "random"),
+        choices=(
+            "cluster_across",
+            "embed_diverse_topk_random",
+            "within_cluster",
+            "random",
+        ),
         default=None,
     )
     return parser.parse_args()
@@ -67,9 +72,9 @@ def parse_doc_ids(*, raw_doc_ids: list[int] | None) -> tuple[int, ...] | None:
         return None
     deduped_doc_ids = tuple(dict.fromkeys(raw_doc_ids))
     assert deduped_doc_ids, "--doc-id requires at least one value"
-    assert all(doc_id >= 0 for doc_id in deduped_doc_ids), (
-        "--doc-id values must be >= 0"
-    )
+    assert all(
+        doc_id >= 0 for doc_id in deduped_doc_ids
+    ), "--doc-id values must be >= 0"
     return deduped_doc_ids
 
 

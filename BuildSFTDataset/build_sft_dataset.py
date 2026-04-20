@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -31,9 +32,9 @@ DEFAULT_ENV_PATH = Path(".env")
 DEFAULT_ROWS_PER_SHARD = 3000
 DEFAULT_NUM_SHARDS = 20
 DEFAULT_SEED = 42
-DEFAULT_SHUFFLE_BUFFER = 10000
+DEFAULT_SHUFFLE_BUFFER = 20000
 DEFAULT_MIN_TOKENS = 500
-DEFAULT_MAX_TOKENS = 3000
+DEFAULT_MAX_TOKENS = 16384
 DEFAULT_ENCODING = "cl100k_base"
 DEFAULT_TARGET_ROWS = 2000
 
@@ -43,7 +44,8 @@ DEFAULT_MAX_OUTPUT_TOKENS = 20000
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_THINKING_LEVEL = "low"
 DEFAULT_BATCH = True
-DEFAULT_MAX_ROWS = 2000
+DEFAULT_MAX_CONCURRENT_REQUESTS = 500
+DEFAULT_MAX_ROWS = 5000
 DEFAULT_CONFIRM_THRESHOLD = 100
 DEFAULT_RETRY_LIMIT = 3
 DEFAULT_RETRY_SLEEP = 2.0
@@ -119,6 +121,7 @@ class TransformConfig:
         temperature: Sampling temperature.
         thinking_level: Gemini reasoning level.
         batch: Whether to use batch API.
+        max_concurrent_requests: Max concurrent async non-batch requests.
         retry_limit: Retry count for non-batch calls.
         retry_sleep_seconds: Backoff base.
         batch_poll_seconds: Batch polling interval.
@@ -135,6 +138,7 @@ class TransformConfig:
     temperature: float
     thinking_level: str | None
     batch: bool
+    max_concurrent_requests: int
     retry_limit: int
     retry_sleep_seconds: float
     batch_poll_seconds: float
@@ -240,6 +244,21 @@ class BatchRunResult:
 
     outputs: list[str]
     batch_job_name: str
+
+
+@dataclass(frozen=True)
+class AsyncTransformResult:
+    """Outputs and failures from async non-batch transform.
+
+    Args:
+        outputs: Output text aligned with think-block order.
+        failed_indexes: Failed think-block indexes using original text fallback.
+        failed_errors: Short error strings keyed by failed index.
+    """
+
+    outputs: list[str]
+    failed_indexes: list[int]
+    failed_errors: dict[int, str]
 
 
 def parse_dotenv(path: Path) -> dict[str, str]:
@@ -1131,23 +1150,96 @@ def call_model(
     Returns:
         Cleaned response text.
     """
+    response = client.models.generate_content(
+        model=model.model_id,
+        contents=user_prompt,
+        config=build_generate_config(model=model, system_prompt=system_prompt),
+    )
+    return clean_model_output(response.text or "")
+
+
+def build_generate_config(
+    model: TransformConfig,
+    system_prompt: str,
+) -> types.GenerateContentConfig:
+    """Build Gemini generation config for sync and async requests.
+
+    Args:
+        model: Transform config.
+        system_prompt: System prompt text.
+
+    Returns:
+        Generation config object.
+    """
     thinking_config = (
         types.ThinkingConfig(thinking_level=cast(Any, model.thinking_level))
         if model.thinking_level
         else None
     )
-    config = types.GenerateContentConfig(
+    return types.GenerateContentConfig(
         system_instruction=system_prompt,
         temperature=model.temperature,
         max_output_tokens=model.max_output_tokens,
         thinking_config=thinking_config,
     )
-    response = client.models.generate_content(
+
+
+async def call_model_async(
+    client: Any,
+    model: TransformConfig,
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    """Call async Gemini API once and normalize the response.
+
+    Args:
+        client: GenAI client exposing `aio.models`.
+        model: Transform config.
+        system_prompt: System prompt text.
+        user_prompt: User prompt text.
+
+    Returns:
+        Cleaned response text.
+    """
+    response = await client.aio.models.generate_content(
         model=model.model_id,
         contents=user_prompt,
-        config=config,
+        config=build_generate_config(model=model, system_prompt=system_prompt),
     )
-    return clean_model_output(response.text or "")
+    return clean_model_output(extract_response_text(response=response))
+
+
+def is_retryable_exception(exc: Exception) -> bool:
+    """Return True for transient API exceptions.
+
+    Args:
+        exc: Raised exception.
+
+    Returns:
+        Retryability decision.
+    """
+    message = str(exc).lower()
+    return any(
+        signature in message
+        for signature in ("429", "rate", "timeout", "deadline", "500", "503", "502", "504")
+    )
+
+
+def compute_retry_sleep_seconds(
+    model: TransformConfig,
+    attempt: int,
+) -> float:
+    """Compute capped exponential backoff with jitter.
+
+    Args:
+        model: Transform config.
+        attempt: 1-indexed retry attempt.
+
+    Returns:
+        Sleep duration in seconds.
+    """
+    exponential = model.retry_sleep_seconds * (2 ** (attempt - 1))
+    return min(exponential, 30.0) + random.random() * 0.5
 
 
 def transform_think_block(
@@ -1182,6 +1274,42 @@ def transform_think_block(
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             time.sleep(model.retry_sleep_seconds * attempt)
+    raise RuntimeError("Model call failed after retries") from last_error
+
+
+async def transform_prompt_async(
+    client: Any,
+    model: TransformConfig,
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    """Transform one rendered prompt with async retries.
+
+    Args:
+        client: GenAI client exposing `aio.models`.
+        model: Transform config.
+        system_prompt: System prompt text.
+        user_prompt: Rendered user prompt.
+
+    Returns:
+        Transformed content.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, model.retry_limit + 1):
+        try:
+            return await call_model_async(
+                client=client,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt >= model.retry_limit or not is_retryable_exception(exc=exc):
+                break
+            await asyncio.sleep(
+                compute_retry_sleep_seconds(model=model, attempt=attempt)
+            )
     raise RuntimeError("Model call failed after retries") from last_error
 
 
@@ -1247,6 +1375,106 @@ def collect_transform_rows(
         if len(rows) >= max_needed:
             break
     return rows
+
+
+def build_nonbatch_prompts(
+    rows: list[dict[str, object]],
+    user_template: str,
+) -> tuple[list[str], list[str]]:
+    """Render one user prompt and original block for every think block.
+
+    Args:
+        rows: Rows selected for transform.
+        user_template: User prompt template.
+
+    Returns:
+        Rendered prompts and original think blocks aligned with think-block order.
+    """
+    prompts: list[str] = []
+    original_blocks: list[str] = []
+    for row in rows:
+        messages = row.get("messages", [])
+        for message in messages if isinstance(messages, list) else []:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            for block in extract_think_blocks(text=content):
+                prompts.append(
+                    render_user_prompt(template=user_template, think_text=block)
+                )
+                original_blocks.append(block)
+    return prompts, original_blocks
+
+
+async def run_async_transform_prompts(
+    client: Any,
+    model: TransformConfig,
+    system_prompt: str,
+    user_prompts: list[str],
+    original_blocks: list[str],
+) -> AsyncTransformResult:
+    """Transform prompts concurrently with async Gemini calls.
+
+    Args:
+        client: GenAI client exposing `aio.models`.
+        model: Transform config.
+        system_prompt: System prompt text.
+        user_prompts: Rendered prompt list in output order.
+
+    Returns:
+        Outputs aligned with `user_prompts`, plus failure metadata.
+    """
+    del original_blocks
+    outputs = [""] * len(user_prompts)
+    failed_errors: dict[int, str] = {}
+    semaphore = asyncio.Semaphore(model.max_concurrent_requests)
+    progress_bar = tqdm(
+        total=len(user_prompts),
+        desc="Transforming think blocks",
+        unit="block",
+        dynamic_ncols=True,
+    )
+
+    async def _worker(index: int, user_prompt: str) -> None:
+        async with semaphore:
+            try:
+                outputs[index] = await transform_prompt_async(
+                    client=client,
+                    model=model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                )
+            except Exception as exc:  # noqa: BLE001
+                failed_errors[index] = format_exception_message(exc=exc)
+                print(
+                    "Async transform error: "
+                    f"request_index={index} error={failed_errors[index]}",
+                    flush=True,
+                )
+        progress_bar.update(1)
+
+    tasks = [
+        asyncio.create_task(_worker(index=index, user_prompt=user_prompt))
+        for index, user_prompt in enumerate(user_prompts)
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        progress_bar.close()
+    failed_indexes = sorted(failed_errors.keys())
+    if failed_indexes:
+        print(
+            "Async transform completed with failures for "
+            f"{len(failed_indexes)} request(s).",
+            flush=True,
+        )
+    return AsyncTransformResult(
+        outputs=outputs,
+        failed_indexes=failed_indexes,
+        failed_errors=failed_errors,
+    )
 
 
 def load_seen_ids(path: Path) -> set[str]:
@@ -1683,6 +1911,240 @@ def apply_transforms_to_rows(
     return updated_rows
 
 
+def build_transform_meta(
+    model: TransformConfig,
+    prompts: PromptConfig,
+    source_batch_job_name: str | None,
+    failed_async_blocks: int,
+    failed_async_error_examples: list[str],
+) -> dict[str, object]:
+    """Build per-row transform metadata payload.
+
+    Args:
+        model: Transform config.
+        prompts: Prompt config.
+        source_batch_job_name: Source batch job when batch mode is used.
+        failed_async_blocks: Failed block count for this row.
+        failed_async_error_examples: Short failure messages for this row.
+
+    Returns:
+        Metadata dictionary stored on each transformed row.
+    """
+    transform_meta: dict[str, object] = {
+        "model": model.model_id,
+        "mode": model.mode,
+        "batch": model.batch,
+        "max_output_tokens": model.max_output_tokens,
+        "thinking_level": model.thinking_level,
+        "system_prompt_path": str(prompts.system_prompt_path),
+        "user_prompt_path": str(prompts.user_prompt_path),
+    }
+    if source_batch_job_name:
+        transform_meta["source_batch"] = source_batch_job_name
+    if failed_async_blocks:
+        transform_meta["failed_async_blocks"] = failed_async_blocks
+        transform_meta["failed_async_error_examples"] = failed_async_error_examples
+    return transform_meta
+
+
+def format_exception_message(exc: Exception) -> str:
+    """Flatten the most relevant exception message for logs.
+
+    Args:
+        exc: Raised exception.
+
+    Returns:
+        Single-line error string.
+    """
+    root_error = exc.__cause__ if exc.__cause__ is not None else exc
+    return str(root_error).replace("\n", " ")[:240]
+
+
+def print_async_row_error(
+    row_id: str | None,
+    block_index: int,
+    exc: Exception,
+) -> str:
+    """Print an async transform error for one row/block failure.
+
+    Args:
+        row_id: Source row identifier when present.
+        block_index: Zero-based think block index within the row.
+        exc: Raised exception.
+
+    Returns:
+        Single-line error string that was printed.
+    """
+    error_text = format_exception_message(exc=exc)
+    row_label = row_id if row_id is not None else "<missing-id>"
+    print(
+        "Async transform error: "
+        f"row_id={row_label} block_index={block_index} error={error_text}",
+        flush=True,
+    )
+    return error_text
+
+
+async def transform_row_async(
+    client: Any,
+    model: TransformConfig,
+    prompts: PromptConfig,
+    system_prompt: str,
+    user_template: str,
+    row: dict[str, object],
+    semaphore: asyncio.Semaphore,
+) -> tuple[dict[str, object] | None, int, list[str]]:
+    """Transform one row and skip it when any block fails.
+
+    Args:
+        client: GenAI client exposing `aio.models`.
+        model: Transform config.
+        prompts: Prompt config.
+        system_prompt: System prompt text.
+        user_template: User prompt template.
+        row: Source row.
+        semaphore: Shared row concurrency limiter.
+
+    Returns:
+        Transformed row when every block succeeds, otherwise `None`,
+        plus failure count and up to five error examples.
+    """
+    async with semaphore:
+        updated_row = dict(row)
+        messages = row.get("messages", [])
+        updated_messages: list[dict[str, object]] = []
+        failed_errors: list[str] = []
+        failed_blocks = 0
+        row_id_value = row.get("id")
+        row_id = row_id_value if isinstance(row_id_value, str) else None
+        row_block_index = 0
+        for message in messages if isinstance(messages, list) else []:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                updated_messages.append(message)
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                updated_messages.append(message)
+                continue
+            replacements: list[str] = []
+            for block in extract_think_blocks(text=content):
+                user_prompt = render_user_prompt(template=user_template, think_text=block)
+                try:
+                    replacements.append(
+                        await transform_prompt_async(
+                            client=client,
+                            model=model,
+                            system_prompt=system_prompt,
+                            user_prompt=user_prompt,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    failed_blocks += 1
+                    if len(failed_errors) < 5:
+                        failed_errors.append(
+                            print_async_row_error(
+                                row_id=row_id,
+                                block_index=row_block_index,
+                                exc=exc,
+                            )
+                        )
+                    else:
+                        print_async_row_error(
+                            row_id=row_id,
+                            block_index=row_block_index,
+                            exc=exc,
+                        )
+                    return None, failed_blocks, failed_errors
+                row_block_index += 1
+            updated_message = dict(message)
+            updated_message["content"] = replace_think_blocks(
+                content=content,
+                replacements=iter(replacements),
+            )
+            updated_messages.append(updated_message)
+        updated_row["messages"] = updated_messages
+        updated_row["transform_meta"] = build_transform_meta(
+            model=model,
+            prompts=prompts,
+            source_batch_job_name=None,
+            failed_async_blocks=failed_blocks,
+            failed_async_error_examples=failed_errors,
+        )
+        return updated_row, failed_blocks, failed_errors
+
+
+async def stream_non_batch_transform_rows(
+    client: Any,
+    model: TransformConfig,
+    prompts: PromptConfig,
+    system_prompt: str,
+    user_template: str,
+    rows_to_transform: list[dict[str, object]],
+    output_path: Path,
+) -> tuple[int, int, int, list[str]]:
+    """Transform rows concurrently and append each completed row to JSONL.
+
+    Args:
+        client: GenAI client exposing `aio.models`.
+        model: Transform config.
+        prompts: Prompt config.
+        system_prompt: System prompt text.
+        user_template: User prompt template.
+        rows_to_transform: Source rows.
+        output_path: Destination JSONL path.
+
+    Returns:
+        Emitted row count, failed row count, failed block count, and error examples.
+    """
+    semaphore = asyncio.Semaphore(model.max_concurrent_requests)
+    progress_bar = tqdm(
+        total=len(rows_to_transform),
+        desc="Transforming rows",
+        unit="row",
+        dynamic_ncols=True,
+    )
+    tasks = [
+        asyncio.create_task(
+            transform_row_async(
+                client=client,
+                model=model,
+                prompts=prompts,
+                system_prompt=system_prompt,
+                user_template=user_template,
+                row=row,
+                semaphore=semaphore,
+            )
+        )
+        for row in rows_to_transform
+    ]
+    rows_emitted = 0
+    failed_rows = 0
+    failed_async_blocks = 0
+    failed_async_error_examples: list[str] = []
+    try:
+        for task in asyncio.as_completed(tasks):
+            output_row, row_failed_blocks, row_failed_errors = await task
+            if output_row is not None:
+                write_jsonl(output_path=output_path, row=output_row)
+                rows_emitted += 1
+            else:
+                failed_rows += 1
+            failed_async_blocks += row_failed_blocks
+            for error_text in row_failed_errors:
+                if len(failed_async_error_examples) >= 5:
+                    break
+                failed_async_error_examples.append(error_text)
+            progress_bar.update(1)
+    finally:
+        progress_bar.close()
+    return (
+        rows_emitted,
+        failed_rows,
+        failed_async_blocks,
+        failed_async_error_examples,
+    )
+
+
 def run_transform_stage(
     model: TransformConfig,
     prompts: PromptConfig,
@@ -1757,6 +2219,9 @@ def run_transform_stage(
     if batch_job_name and not model.batch:
         raise SystemExit("--batch-job requires batch mode. Remove --no-batch or omit --batch-job.")
     source_batch_job_name: str | None = None
+    failed_async_rows = 0
+    failed_async_blocks = 0
+    failed_async_error_examples: list[str] = []
 
     if model.batch:
         requests, _ = build_inline_batch_requests(
@@ -1784,66 +2249,48 @@ def run_transform_stage(
             rows=rows_to_transform,
             outputs=batch_result.outputs,
         )
+        rows_emitted = len(updated_rows)
     else:
+        (
+            rows_emitted,
+            failed_async_rows,
+            failed_async_blocks,
+            failed_async_error_examples,
+        ) = asyncio.run(
+            stream_non_batch_transform_rows(
+                client=client,
+                model=model,
+                prompts=prompts,
+                system_prompt=system_prompt,
+                user_template=user_template,
+                rows_to_transform=rows_to_transform,
+                output_path=paths.transformed_path,
+            )
+        )
         updated_rows = []
-        progress = tqdm(rows_to_transform, desc="Transforming rows", unit="row")
-        for row in progress:
-            messages = row.get("messages", [])
-            updated_messages: list[dict[str, object]] = []
-            for message in messages if isinstance(messages, list) else []:
-                if not isinstance(message, dict):
-                    updated_messages.append(message)
-                    continue
-                if message.get("role") != "assistant":
-                    updated_messages.append(message)
-                    continue
-                content = message.get("content")
-                if not isinstance(content, str):
-                    updated_messages.append(message)
-                    continue
-                blocks = extract_think_blocks(text=content)
-                transformed = [
-                    transform_think_block(
-                        client=client,
-                        model=model,
-                        system_prompt=system_prompt,
-                        user_template=user_template,
-                        think_text=block,
-                    )
-                    for block in blocks
-                ]
-                updated_content = replace_think_blocks(content=content, replacements=iter(transformed))
-                updated_message = dict(message)
-                updated_message["content"] = updated_content
-                updated_messages.append(updated_message)
-            output_row = dict(row)
-            output_row["messages"] = updated_messages
-            updated_rows.append(output_row)
 
     for row in updated_rows:
         output_row = dict(row)
-        transform_meta: dict[str, object] = {
-            "model": model.model_id,
-            "mode": model.mode,
-            "batch": model.batch,
-            "max_output_tokens": model.max_output_tokens,
-            "thinking_level": model.thinking_level,
-            "system_prompt_path": str(prompts.system_prompt_path),
-            "user_prompt_path": str(prompts.user_prompt_path),
-        }
-        if source_batch_job_name:
-            transform_meta["source_batch"] = source_batch_job_name
-        output_row["transform_meta"] = transform_meta
+        output_row["transform_meta"] = build_transform_meta(
+            model=model,
+            prompts=prompts,
+            source_batch_job_name=source_batch_job_name,
+            failed_async_blocks=failed_async_blocks,
+            failed_async_error_examples=failed_async_error_examples,
+        )
         write_jsonl(output_path=paths.transformed_path, row=output_row)
 
     return {
         "target_rows": model.max_rows,
         "existing_rows": existing_rows,
         "rows_selected": len(rows_to_transform),
-        "rows_emitted": len(updated_rows),
+        "rows_emitted": rows_emitted,
         "think_blocks": total_think_blocks,
         "batch": model.batch,
         "source_batch": source_batch_job_name,
+        "failed_async_rows": failed_async_rows,
+        "failed_async_blocks": failed_async_blocks,
+        "failed_async_error_examples": failed_async_error_examples,
     }
 
 
@@ -1891,6 +2338,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-limit", type=int, default=DEFAULT_RETRY_LIMIT)
     parser.add_argument("--retry-sleep", type=float, default=DEFAULT_RETRY_SLEEP)
     parser.add_argument("--batch-poll", type=float, default=DEFAULT_BATCH_POLL_SECONDS)
+    parser.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        default=DEFAULT_MAX_CONCURRENT_REQUESTS,
+    )
     parser.add_argument("--max-rows", type=int, default=DEFAULT_MAX_ROWS)
     parser.add_argument("--batch", action="store_true", default=DEFAULT_BATCH)
     parser.add_argument("--no-batch", dest="batch", action="store_false")
@@ -1955,6 +2407,7 @@ def build_configs(args: argparse.Namespace) -> tuple[RuntimeConfig, SamplingConf
         temperature=args.temperature,
         thinking_level=thinking_level,
         batch=args.batch,
+        max_concurrent_requests=args.max_concurrent_requests,
         retry_limit=args.retry_limit,
         retry_sleep_seconds=args.retry_sleep,
         batch_poll_seconds=args.batch_poll,

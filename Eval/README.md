@@ -101,6 +101,9 @@ export VLLM_SKIP_P2P_CHECK=0
 
 If topology probing fails or topology is not cross-NUMA, eval proceeds without forcing those overrides.
 
+On Ascend, the workaround is intentionally skipped on `quad` and `preemptible-quad`.
+It remains eligible on `nextgen` and `preemptible-nextgen`.
+
 ## Validation
 
 ```bash

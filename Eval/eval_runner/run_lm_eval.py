@@ -6,12 +6,12 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Union, cast
 
-from eval_runner.aime_avgk import build_aime_avgk_process_results
 from eval_runner.config_types import LmEvalConfig
+from eval_runner.model_reference import ModelReference, resolve_pretrained_arg
 
-ModelArgValue = str | int | float | bool
+ModelArgValue = Union[str, int, float, bool]
 ModelArgs = dict[str, ModelArgValue]
 GenKwargs = dict[str, ModelArgValue]
 AIME_TASK_NAMES: tuple[str, ...] = ("aime24", "aime25")
@@ -84,6 +84,8 @@ def _build_aime_task_override(task_name: str, aime_avg_k: int) -> dict[str, Any]
     Returns:
         Task override payload consumed by `lm_eval.get_task_dict`.
     """
+    from eval_runner.aime_avgk import build_aime_avgk_process_results
+
     metric_name = _build_aime_metric_name(aime_avg_k=aime_avg_k)
     filter_name = _build_aime_filter_name(aime_avg_k=aime_avg_k)
     return {
@@ -148,11 +150,11 @@ def _build_task_entries(config: LmEvalConfig) -> list[str | dict[str, Any]]:
     return task_entries
 
 
-def build_model_args(checkpoint_path: Path, config: LmEvalConfig) -> ModelArgs:
+def build_model_args(checkpoint_path: ModelReference, config: LmEvalConfig) -> ModelArgs:
     """Build the `model_args` value for `lm_eval.simple_evaluate`.
 
     Args:
-        checkpoint_path: Saved model checkpoint directory.
+        checkpoint_path: Saved model checkpoint directory or remote model id.
         config: Benchmark evaluation configuration.
 
     Returns:
@@ -166,7 +168,7 @@ def build_model_args(checkpoint_path: Path, config: LmEvalConfig) -> ModelArgs:
         >>> args["pretrained"]
         'checkpoint-100'
     """
-    model_args: ModelArgs = {"pretrained": str(checkpoint_path)}
+    model_args: ModelArgs = {"pretrained": resolve_pretrained_arg(model_reference=checkpoint_path)}
     if config.model_type == "vllm":
         model_args.update(
             {
@@ -179,12 +181,9 @@ def build_model_args(checkpoint_path: Path, config: LmEvalConfig) -> ModelArgs:
         )
     else:
         model_args["dtype"] = "bfloat16"
-    model_args.update(
-        {
-            "trust_remote_code": config.trust_remote_code,
-            "think_end_token": config.think_end_token,
-        }
-    )
+    model_args["trust_remote_code"] = config.trust_remote_code
+    if config.think_end_token is not None:
+        model_args["think_end_token"] = config.think_end_token
     return model_args
 
 
@@ -206,14 +205,14 @@ def build_gen_kwargs(config: LmEvalConfig) -> GenKwargs:
 
 
 def build_simple_evaluate_kwargs(
-    checkpoint_path: Path,
+    checkpoint_path: ModelReference,
     config: LmEvalConfig,
     limit: int | None = None,
 ) -> dict[str, Any]:
     """Build keyword args for `lm_eval.simple_evaluate`.
 
     Args:
-        checkpoint_path: Saved model checkpoint directory.
+        checkpoint_path: Saved model checkpoint directory or remote model id.
         config: Benchmark evaluation configuration.
         limit: Optional sample cap passed to `simple_evaluate(limit=...)`.
 
@@ -364,7 +363,7 @@ def find_sample_log_files(result_json_path: Path) -> list[Path]:
 
 
 def run_lm_eval_for_checkpoint(
-    checkpoint_path: Path,
+    checkpoint_path: ModelReference,
     output_json_path: Path,
     config: LmEvalConfig,
     limit: int | None = None,
@@ -372,7 +371,7 @@ def run_lm_eval_for_checkpoint(
     """Run `lm_eval.simple_evaluate` for one checkpoint.
 
     Args:
-        checkpoint_path: Saved model checkpoint directory.
+        checkpoint_path: Saved model checkpoint directory or remote model id.
         output_json_path: Requested result output JSON path.
         config: Benchmark evaluation configuration.
         limit: Optional sample cap passed to `simple_evaluate(limit=...)`.

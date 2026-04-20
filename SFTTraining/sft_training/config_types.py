@@ -26,6 +26,13 @@ def _resolve_path(base_dir: Path, value: str) -> Path:
     return (base_dir / candidate).resolve()
 
 
+SupervisionMode = Literal[
+    "completion_only",
+    "full_conversation",
+    "assistant_only",
+]
+
+
 @dataclass(frozen=True)
 class LmEvalConfig:
     """Configuration for benchmark evaluation with `lm-eval`.
@@ -101,6 +108,7 @@ class RunConfig:
         dataset_path: Path to transformed JSONL dataset.
         output_dir: Output directory for checkpoints/logs.
         deepspeed_config_path: Optional path to deepspeed config JSON.
+        chat_template_path: Optional path to a training chat template.
         wandb_project: W&B project name.
         wandb_entity: Optional W&B entity name.
         seed: Random seed for split/training.
@@ -110,6 +118,10 @@ class RunConfig:
         per_device_train_batch_size: Train micro-batch size per GPU.
         per_device_eval_batch_size: Eval micro-batch size per GPU.
         gradient_accumulation_steps: Gradient accumulation count.
+        gradient_checkpointing: Enables activation recomputation during backward.
+        activation_offloading: Offloads activations to CPU to reduce GPU memory.
+        supervision_mode: Whether to supervise only the final assistant
+            completion or the full rendered conversation.
         warmup_ratio: Warmup ratio for scheduler.
         optim: Optimizer name passed to TRL/Transformers trainer.
         adam_beta1: Adam beta1 coefficient.
@@ -119,6 +131,10 @@ class RunConfig:
         eval_split_ratio: Fraction of rows reserved for eval loss.
         save_total_limit: Maximum number of stored checkpoints.
         save_only_model: Save model weights only in checkpoints.
+        packing: Enables TRL sequence packing for training rows.
+        packing_strategy: TRL packing strategy, usually `bfd` or `wrapped`.
+        padding_free: Enables TRL padding-free packed batches.
+        eval_packing: Optional packing override for eval datasets.
         lora: Optional LoRA adapter configuration.
         lm_eval: Nested benchmark evaluation config.
 
@@ -135,6 +151,7 @@ class RunConfig:
     dataset_path: Path
     output_dir: Path
     deepspeed_config_path: Path | None
+    chat_template_path: Path | None
     wandb_project: str
     wandb_entity: str | None = None
     seed: int = 42
@@ -144,6 +161,9 @@ class RunConfig:
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
     gradient_accumulation_steps: int = 2
+    gradient_checkpointing: bool = True
+    activation_offloading: bool = False
+    supervision_mode: SupervisionMode = "completion_only"
     warmup_ratio: float = 0.03
     optim: str = "adamw_torch_fused"
     adam_beta1: float = 0.9
@@ -153,6 +173,10 @@ class RunConfig:
     eval_split_ratio: float = 0.05
     save_total_limit: int = 8
     save_only_model: bool = False
+    packing: bool = False
+    packing_strategy: Literal["bfd", "wrapped"] = "bfd"
+    padding_free: bool = False
+    eval_packing: bool | None = None
     lora: LoraConfig | None = None
     lm_eval: LmEvalConfig = field(default_factory=LmEvalConfig)
 
@@ -209,6 +233,7 @@ class RunConfig:
         return RunConfig(
             **_parse_common_kwargs(payload=payload, base_dir=base_dir),
             **_parse_numeric_kwargs(payload=payload),
+            **_parse_supervision_kwargs(payload=payload),
             lora=_parse_lora_config(payload=payload),
             lm_eval=_parse_lm_eval_config(payload=payload, base_dir=base_dir),
         )
@@ -333,6 +358,9 @@ def _parse_common_kwargs(payload: dict[str, Any], base_dir: Path) -> dict[str, A
         "deepspeed_config_path": _parse_deepspeed_path(
             payload=payload, base_dir=base_dir
         ),
+        "chat_template_path": _parse_chat_template_path(
+            payload=payload, base_dir=base_dir
+        ),
         "wandb_project": str(payload["wandb_project"]),
         "wandb_entity": payload.get("wandb_entity"),
     }
@@ -354,6 +382,22 @@ def _parse_deepspeed_path(payload: dict[str, Any], base_dir: Path) -> Path | Non
     return _resolve_path(base_dir=base_dir, value=str(deepspeed_value))
 
 
+def _parse_chat_template_path(payload: dict[str, Any], base_dir: Path) -> Path | None:
+    """Parse optional training chat-template path from run config.
+
+    Args:
+        payload: Raw top-level run config payload.
+        base_dir: Config parent directory for path resolution.
+
+    Returns:
+        Resolved template path when provided, otherwise `None`.
+    """
+    chat_template_value = payload.get("chat_template_path")
+    if chat_template_value is None:
+        return None
+    return _resolve_path(base_dir=base_dir, value=str(chat_template_value))
+
+
 def _parse_numeric_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     """Parse numeric run hyperparameters with defaults.
 
@@ -363,6 +407,11 @@ def _parse_numeric_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     Returns:
         Mapping of `RunConfig` numeric keyword arguments.
     """
+    packing_strategy = str(payload.get("packing_strategy", "bfd"))
+    valid_packing_strategies = ("bfd", "wrapped")
+    assert (
+        packing_strategy in valid_packing_strategies
+    ), "`packing_strategy` must be one of ('bfd', 'wrapped')."
     return {
         "seed": int(payload.get("seed", 42)),
         "num_train_epochs": int(payload.get("num_train_epochs", 8)),
@@ -375,6 +424,8 @@ def _parse_numeric_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         "gradient_accumulation_steps": int(
             payload.get("gradient_accumulation_steps", 2)
         ),
+        "gradient_checkpointing": bool(payload.get("gradient_checkpointing", True)),
+        "activation_offloading": bool(payload.get("activation_offloading", False)),
         "warmup_ratio": float(payload.get("warmup_ratio", 0.03)),
         "optim": str(payload.get("optim", "adamw_torch_fused")),
         "adam_beta1": float(payload.get("adam_beta1", 0.9)),
@@ -384,4 +435,40 @@ def _parse_numeric_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         "eval_split_ratio": float(payload.get("eval_split_ratio", 0.05)),
         "save_total_limit": int(payload.get("save_total_limit", 8)),
         "save_only_model": bool(payload.get("save_only_model", False)),
+        "packing": bool(payload.get("packing", False)),
+        "packing_strategy": cast(Literal["bfd", "wrapped"], packing_strategy),
+        "padding_free": bool(payload.get("padding_free", False)),
+        "eval_packing": _parse_eval_packing(payload=payload),
     }
+
+
+def _parse_supervision_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
+    """Parse supervision-mode settings from a run payload.
+
+    Args:
+        payload: Raw top-level run config payload.
+
+    Returns:
+        Mapping of supervision-related `RunConfig` keyword arguments.
+    """
+    supervision_mode = str(payload.get("supervision_mode", "completion_only"))
+    valid_modes = ("completion_only", "full_conversation", "assistant_only")
+    assert supervision_mode in valid_modes, "Invalid `supervision_mode` value."
+    return {
+        "supervision_mode": cast(SupervisionMode, supervision_mode),
+    }
+
+
+def _parse_eval_packing(payload: dict[str, Any]) -> bool | None:
+    """Parse optional eval packing override from a run payload.
+
+    Args:
+        payload: Raw top-level run config payload.
+
+    Returns:
+        `None` when unset, otherwise the configured boolean value.
+    """
+    eval_packing_value = payload.get("eval_packing")
+    if eval_packing_value is None:
+        return None
+    return bool(eval_packing_value)

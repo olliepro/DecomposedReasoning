@@ -1,0 +1,24 @@
+[project]
+name = "decomposed-reasoning-rl-dataset"
+version = "0.1.0"
+description = "Build a staged math-only RL dataset from Dolci-Think-RL-7B."
+requires-python = ">=3.11"
+dependencies = [
+  "datasets>=2.19.0",
+  "tqdm>=4.66.4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pyright>=1.1.380",
+  "pytest>=8.3.0",
+]
+
+[tool.pyright]
+typeCheckingMode = "basic"
+reportMissingImports = "none"
+reportMissingTypeStubs = "none"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

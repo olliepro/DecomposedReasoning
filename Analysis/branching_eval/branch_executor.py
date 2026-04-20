@@ -64,7 +64,7 @@ from branching_eval.tree_types import (
     TreeNode,
 )
 from chat_templating import build_raw_im_prompt
-from token_metrics import approximate_entropy
+from token_metrics import probability_from_logprob
 from vllm_client import GenerationChoice, ParsedToken, VllmClient, VllmRequestError
 
 INLINE_EPSILON_SELECTOR_MODE: SelectorMode = "embed_diverse_topk_random"
@@ -193,13 +193,14 @@ class BranchExecutor:
         active_selector: SelectorMode,
         seed: int,
         trigger_steer_enabled: bool,
-        trigger_entropy_enabled: bool,
         env_paths: tuple[Path, ...],
+        trigger_entropy_enabled: bool = False,
         on_leaf_completed: Callable[[LeafRollout], LeafRollout] | None = None,
         enable_request_priorities: bool = False,
         branch_task_semaphore: asyncio.Semaphore | None = None,
         allow_true_branching: bool = True,
     ) -> None:
+        _ = trigger_entropy_enabled
         self.client = client
         self.cluster_client = cluster_client
         self.prompt_text = prompt_text
@@ -215,7 +216,6 @@ class BranchExecutor:
         self.enable_request_priorities = enable_request_priorities
         self.allow_true_branching = allow_true_branching
         self.trigger_steer_enabled = trigger_steer_enabled
-        self.trigger_entropy_enabled = trigger_entropy_enabled
         self.random = random.Random(seed)
         self.request_counter = 0
         self.selector_params = SelectorParams(
@@ -916,7 +916,6 @@ class BranchExecutor:
                 payload={
                     "node_id": state.node_id,
                     "trigger_type": str(outcome.trigger_type),
-                    "entropy_value": outcome.entropy_value,
                 },
             )
             resumed_state = self._state_from_outcome(state=state, outcome=outcome)
@@ -936,7 +935,6 @@ class BranchExecutor:
             payload={
                 "node_id": state.node_id,
                 "trigger_type": str(outcome.trigger_type),
-                "entropy_value": outcome.entropy_value,
                 "generated_tokens": outcome.generated_tokens,
             },
         )
@@ -1099,7 +1097,6 @@ class BranchExecutor:
                     payload={
                         "node_id": state.node_id,
                         "trigger_type": str(outcome.trigger_type),
-                        "entropy_value": outcome.entropy_value,
                     },
                 )
                 maxed.append((state, outcome))
@@ -1110,7 +1107,6 @@ class BranchExecutor:
                 payload={
                     "node_id": state.node_id,
                     "trigger_type": str(outcome.trigger_type),
-                    "entropy_value": outcome.entropy_value,
                     "generated_tokens": outcome.generated_tokens,
                 },
             )
@@ -1217,7 +1213,6 @@ class BranchExecutor:
                     doc_id=doc_id,
                     state=state,
                     trigger_type=str(outcome.trigger_type),
-                    entropy_value=outcome.entropy_value,
                     assistant_prefix=outcome.assistant_prefix,
                     prompt_token_ids=outcome.prompt_token_ids,
                     generated_tokens=outcome.generated_tokens,
@@ -1252,7 +1247,6 @@ class BranchExecutor:
             branch_point_id=pool.branch_point_id,
             node_id=state.node_id,
             trigger_type=str(outcome.trigger_type),
-            entropy_value=outcome.entropy_value,
             candidate_pool_id=pool.candidate_pool_id,
             selections=selections,
         )
@@ -1524,7 +1518,6 @@ class BranchExecutor:
         continued = DecodeOutcome(
             event_type="continued",
             trigger_type=None,
-            entropy_value=None,
             assistant_prefix=outcome.assistant_prefix + candidate_text,
             prompt_token_ids=append_prompt_token_ids(
                 prompt_token_ids=outcome.prompt_token_ids,
@@ -1577,7 +1570,6 @@ class BranchExecutor:
             return DecodeOutcome(
                 event_type="terminated",
                 trigger_type=None,
-                entropy_value=None,
                 assistant_prefix=trigger_outcome.assistant_prefix,
                 prompt_token_ids=trigger_outcome.prompt_token_ids,
                 token_ids=trigger_outcome.token_ids,
@@ -1592,7 +1584,6 @@ class BranchExecutor:
             doc_id=context.doc_id,
             state=state,
             trigger_type="steer_boundary",
-            entropy_value=trigger_outcome.entropy_value,
             assistant_prefix=trigger_outcome.assistant_prefix,
             prompt_token_ids=trigger_outcome.prompt_token_ids,
             generated_tokens=trigger_outcome.generated_tokens,
@@ -1820,10 +1811,6 @@ class BranchExecutor:
             else branching_enabled
         )
         trigger_steer_enabled = self.trigger_steer_enabled and steer_mode_enabled
-        trigger_entropy_enabled = self.trigger_entropy_enabled and branching_enabled
-        entropy_threshold = (
-            self._resolved_entropy_threshold() if trigger_entropy_enabled else 0.0
-        )
         branch_prob = self.branching.branch_prob if branching_enabled else 0.0
         rollout_stop = rollout_stop_markers(steer_enabled=trigger_steer_enabled)
         exec_repetition_state = initialize_exec_repetition_state(
@@ -1902,7 +1889,6 @@ class BranchExecutor:
                 return DecodeOutcome(
                     event_type="terminated",
                     trigger_type=None,
-                    entropy_value=None,
                     assistant_prefix=assistant_prefix,
                     prompt_token_ids=prompt_token_ids,
                     token_ids=tuple(token_ids),
@@ -1926,7 +1912,6 @@ class BranchExecutor:
                 return DecodeOutcome(
                     event_type="terminated",
                     trigger_type=None,
-                    entropy_value=None,
                     assistant_prefix=assistant_prefix,
                     prompt_token_ids=prompt_token_ids,
                     token_ids=tuple(token_ids),
@@ -1993,7 +1978,6 @@ class BranchExecutor:
                     outcome=DecodeOutcome(
                         event_type="terminated",
                         trigger_type=None,
-                        entropy_value=None,
                         assistant_prefix=assistant_prefix,
                         prompt_token_ids=prompt_token_ids,
                         token_ids=tuple(token_ids),
@@ -2017,8 +2001,6 @@ class BranchExecutor:
                     and branching_enabled
                     and not explicit_steer_stop
                 ),
-                trigger_entropy=trigger_entropy_enabled,
-                entropy_threshold=entropy_threshold,
                 branch_prob=branch_prob,
                 rng=self.random,
             )
@@ -2220,7 +2202,6 @@ class BranchExecutor:
                     chunk_outcome,
                     event_type="trigger",
                     trigger_type="steer_boundary",
-                    entropy_value=None,
                     assistant_prefix=normalized_prefix,
                     prompt_token_ids=normalized_prompt_ids,
                     stop_reason="",
@@ -2455,7 +2436,6 @@ class BranchExecutor:
             outcome=DecodeOutcome(
                 event_type="terminated",
                 trigger_type=None,
-                entropy_value=None,
                 assistant_prefix=assistant_prefix,
                 prompt_token_ids=prompt_token_ids,
                 token_ids=tuple(token_ids),
@@ -2486,12 +2466,14 @@ class BranchExecutor:
         doc_id: int,
         state: PathState,
         trigger_type: str,
-        entropy_value: float | None,
+        entropy_value: float | None = None,
         assistant_prefix: str,
         prompt_token_ids: tuple[int, ...] | None,
         generated_tokens: int,
     ) -> CandidatePoolRecord:
         """Compatibility wrapper that executes async pool resolution."""
+
+        _ = entropy_value
 
         return asyncio.run(
             self._resolve_candidate_pool_async(
@@ -2511,7 +2493,7 @@ class BranchExecutor:
         doc_id: int,
         state: PathState,
         trigger_type: str,
-        entropy_value: float | None,
+        entropy_value: float | None = None,
         assistant_prefix: str,
         prompt_token_ids: tuple[int, ...] | None,
         generated_tokens: int,
@@ -2546,12 +2528,14 @@ class BranchExecutor:
         candidate_pool_id: str,
         state: PathState,
         trigger_type: str,
-        entropy_value: float | None,
+        entropy_value: float | None = None,
         assistant_prefix: str,
         prompt_token_ids: tuple[int, ...] | None,
         candidate_token_budget: int,
     ) -> CandidatePoolRecord:
         """Compatibility wrapper that executes async candidate generation."""
+
+        _ = entropy_value
 
         return asyncio.run(
             self._generate_candidate_pool_async(
@@ -2571,52 +2555,41 @@ class BranchExecutor:
         candidate_pool_id: str,
         state: PathState,
         trigger_type: str,
-        entropy_value: float | None,
+        entropy_value: float | None = None,
         assistant_prefix: str,
         prompt_token_ids: tuple[int, ...] | None,
         candidate_token_budget: int,
     ) -> CandidatePoolRecord:
         """Generate one candidate pool via async completions calls."""
 
-        if trigger_type == "steer_boundary":
-            canonical_prefix, canonical_prompt_ids = (
-                await self._normalize_steer_prefix_prompt_ids_async(
-                    assistant_prefix=assistant_prefix,
-                    prompt_token_ids=prompt_token_ids,
-                )
-            )
-            choices = await self._generate_many_async(
-                assistant_prefix=canonical_prefix,
-                prompt_token_ids=canonical_prompt_ids,
-                max_tokens=candidate_token_budget,
-                n=self.branching.num_candidates,
-                stop=("</steer",),
-                temperature=1.0,
-                request_kind="candidate_pool_steer_boundary",
-                request_stream_id=(
-                    f"candidate_pool:{state.node_id}:{trigger_type}:{candidate_pool_id}"
-                ),
-                enforce_prefix_chain=False,
-            )
-        else:
-            choices = await self._generate_many_async(
+        _ = entropy_value
+        assert (
+            trigger_type == "steer_boundary"
+        ), f"unsupported trigger_type: {trigger_type}"
+        canonical_prefix, canonical_prompt_ids = (
+            await self._normalize_steer_prefix_prompt_ids_async(
                 assistant_prefix=assistant_prefix,
                 prompt_token_ids=prompt_token_ids,
-                max_tokens=candidate_token_budget,
-                n=self.branching.num_candidates,
-                stop=None,
-                temperature=1.0,
-                request_kind="candidate_pool_high_entropy",
-                request_stream_id=(
-                    f"candidate_pool:{state.node_id}:{trigger_type}:{candidate_pool_id}"
-                ),
-                enforce_prefix_chain=False,
             )
+        )
+        choices = await self._generate_many_async(
+            assistant_prefix=canonical_prefix,
+            prompt_token_ids=canonical_prompt_ids,
+            max_tokens=candidate_token_budget,
+            n=self.branching.num_candidates,
+            stop=("</steer",),
+            temperature=1.0,
+            request_kind="candidate_pool_steer_boundary",
+            request_stream_id=(
+                f"candidate_pool:{state.node_id}:{trigger_type}:{candidate_pool_id}"
+            ),
+            enforce_prefix_chain=False,
+        )
         candidates = tuple(
             candidate_from_choice(
                 candidate_id=index,
                 choice=choice,
-                enforce_steer_stop_boundary=trigger_type == "steer_boundary",
+                enforce_steer_stop_boundary=True,
             )
             for index, choice in enumerate(choices)
         )
@@ -2625,7 +2598,6 @@ class BranchExecutor:
             branch_point_id=f"bp_{state.node_id}_{candidate_pool_id}",
             node_id=state.node_id,
             trigger_type=trigger_type,
-            entropy_value=entropy_value,
             candidates=candidates,
         )
 
@@ -2777,8 +2749,9 @@ class BranchExecutor:
         remaining_tokens = self.decoding.max_gen_toks - generated_tokens
         if remaining_tokens <= 0:
             return 0
-        if trigger_type != "steer_boundary":
-            return min(self.branching.candidate_span_tokens, remaining_tokens)
+        assert (
+            trigger_type == "steer_boundary"
+        ), f"unsupported trigger_type: {trigger_type}"
         return min(self.branching.max_steer_tokens, remaining_tokens)
 
     async def _candidate_token_budget_async(
@@ -2797,8 +2770,9 @@ class BranchExecutor:
         remaining_tokens = self.decoding.max_gen_toks - generated_tokens
         if remaining_tokens <= 0:
             return 0
-        if trigger_type != "steer_boundary":
-            return min(self.branching.candidate_span_tokens, remaining_tokens)
+        assert (
+            trigger_type == "steer_boundary"
+        ), f"unsupported trigger_type: {trigger_type}"
         return min(self.branching.max_steer_tokens, remaining_tokens)
 
     def _trigger_has_branch_budget(
@@ -2879,8 +2853,9 @@ class BranchExecutor:
         self, *, trigger_type: str, candidate: CandidateRecord
     ) -> tuple[str, tuple[int, ...]]:
         aligned_candidate = self._candidate_with_aligned_text(candidate=candidate)
-        if trigger_type != "steer_boundary":
-            return aligned_candidate.text, aligned_candidate.token_ids
+        assert (
+            trigger_type == "steer_boundary"
+        ), f"unsupported trigger_type: {trigger_type}"
         assert_no_text_after_first_steer_close(text=aligned_candidate.text)
         injected_suffix, _ = selected_candidate_normalization_suffix(
             text=aligned_candidate.text
@@ -2916,8 +2891,9 @@ class BranchExecutor:
         aligned_candidate = await self._candidate_with_aligned_text_async(
             candidate=candidate
         )
-        if trigger_type != "steer_boundary":
-            return aligned_candidate.text, aligned_candidate.token_ids
+        assert (
+            trigger_type == "steer_boundary"
+        ), f"unsupported trigger_type: {trigger_type}"
         assert_no_text_after_first_steer_close(text=aligned_candidate.text)
         injected_suffix, _ = selected_candidate_normalization_suffix(
             text=aligned_candidate.text
@@ -3032,13 +3008,6 @@ class BranchExecutor:
             f"{context}: detokenized text mismatch; "
             f"decoded={decoded_text!r} expected={text!r}"
         )
-
-    def _resolved_entropy_threshold(self) -> float:
-        if self.branching.entropy_threshold is None:
-            raise RuntimeError(
-                "entropy_threshold must be resolved before branching execution"
-            )
-        return self.branching.entropy_threshold
 
     def _append_tree_event(
         self,
@@ -3856,19 +3825,15 @@ class BranchExecutor:
         token_rows = []
         for token_index, parsed_token in enumerate(choice.tokens):
             token_id = token_ids[token_index] if token_index < len(token_ids) else None
-            probability, entropy, _ = approximate_entropy(
-                selected_token=parsed_token.token,
-                selected_logprob=parsed_token.logprob,
-                top_entries=parsed_token.top_entries,
-            )
             token_rows.append(
                 {
                     "token_index": token_index,
                     "token_id": token_id,
                     "token_text": parsed_token.token,
                     "selected_logprob": parsed_token.logprob,
-                    "selected_probability": probability,
-                    "selected_entropy": entropy,
+                    "selected_probability": probability_from_logprob(
+                        logprob=parsed_token.logprob
+                    ),
                 }
             )
         return {

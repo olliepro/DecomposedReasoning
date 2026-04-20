@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-SelectorMode = Literal["cluster_across", "embed_diverse", "within_cluster", "random"]
+SelectorMode = Literal[
+    "cluster_across",
+    "embed_diverse_topk_random",
+    "within_cluster",
+    "random",
+]
 WithinClusterHeuristic = Literal["random_non_other_min_k"]
 
 
@@ -41,6 +46,7 @@ class SelectionOutcome:
         selected_candidate_ids: Candidate ids chosen by this selector.
         cluster_by_candidate_id: Optional cluster label by candidate id.
         embedding_by_candidate_id: Optional embedding vectors by candidate id.
+        shortlist_candidate_ids: Optional shortlist ids prior to final sampling.
 
     Returns:
         Dataclass containing selection outputs and diagnostics.
@@ -50,3 +56,4 @@ class SelectionOutcome:
     selected_candidate_ids: tuple[int, ...]
     cluster_by_candidate_id: dict[int, str] | None = None
     embedding_by_candidate_id: dict[int, tuple[float, ...]] | None = None
+    shortlist_candidate_ids: tuple[int, ...] | None = None

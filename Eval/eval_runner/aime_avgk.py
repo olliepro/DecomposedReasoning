@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from lm_eval.tasks.aime import utils as aime_utils
-
-
 def extract_target_answer(doc: dict[str, Any]) -> str:
     """Extract the reference answer string from one AIME document.
 
@@ -19,6 +16,74 @@ def extract_target_answer(doc: dict[str, Any]) -> str:
     answer_key = next((key for key in doc if key.lower() == "answer"), None)
     assert answer_key is not None, "AIME doc is missing an answer field."
     return str(doc[answer_key])
+
+
+def last_boxed_only_string(response: str) -> str | None:
+    """Extract the final boxed segment from one response when present.
+
+    Args:
+        response: Model-generated response text.
+
+    Returns:
+        Final boxed substring or `None`.
+    """
+
+    boxed_index = response.rfind("\\boxed")
+    if "\\boxed " in response:
+        return "\\boxed " + response.split("\\boxed ")[-1].split("$")[0]
+    if boxed_index < 0:
+        return None
+    brace_balance = 0
+    right_brace_index = None
+    for position in range(boxed_index, len(response)):
+        if response[position] == "{":
+            brace_balance += 1
+        elif response[position] == "}":
+            brace_balance -= 1
+            if brace_balance == 0:
+                right_brace_index = position
+                break
+    if right_brace_index is None:
+        return None
+    return response[boxed_index : right_brace_index + 1]
+
+
+def remove_boxed(boxed_value: str) -> str:
+    """Remove the outer `\\boxed` wrapper from one extracted answer.
+
+    Args:
+        boxed_value: Boxed answer string.
+
+    Returns:
+        Inner boxed content.
+    """
+
+    if boxed_value.startswith("\\boxed "):
+        return boxed_value[len("\\boxed ") :]
+    prefix = "\\boxed{"
+    assert boxed_value.startswith(prefix), f"Unexpected boxed answer: {boxed_value}"
+    assert boxed_value.endswith("}"), f"Unexpected boxed answer: {boxed_value}"
+    return boxed_value[len(prefix) : -1]
+
+
+def normalize_answer_text(value: str) -> str:
+    """Normalize one short AIME answer string before equality comparison.
+
+    Args:
+        value: Candidate or target answer string.
+
+    Returns:
+        Normalized answer string.
+    """
+
+    normalized = value.strip()
+    normalized = normalized.replace("$", "")
+    normalized = normalized.replace(",", "")
+    normalized = normalized.replace("\\!", "")
+    normalized = normalized.replace("\\,", "")
+    normalized = normalized.replace(" ", "")
+    normalized = normalized.rstrip(".")
+    return normalized
 
 
 def _extract_dollar_wrapped_answer(response: str) -> str:
@@ -46,11 +111,11 @@ def extract_candidate_answer(response: str) -> str:
         Parsed candidate answer string.
     """
     candidate = _extract_dollar_wrapped_answer(response=response)
-    boxed_answer = aime_utils.last_boxed_only_string(response)
+    boxed_answer = last_boxed_only_string(response=response)
     if boxed_answer is None:
         return candidate
     try:
-        boxed_content = aime_utils.remove_boxed(boxed_answer)
+        boxed_content = remove_boxed(boxed_value=boxed_answer)
     except (AssertionError, IndexError):
         return candidate
     return candidate if boxed_content is None else str(boxed_content)
@@ -66,7 +131,9 @@ def is_correct_answer(candidate: str, target: str) -> int:
     Returns:
         `1` for a correct answer and `0` otherwise.
     """
-    return int(aime_utils.is_equiv(candidate, target))
+    return int(
+        normalize_answer_text(value=candidate) == normalize_answer_text(value=target)
+    )
 
 
 def compute_avg_at_k(responses: list[str], target: str) -> float:

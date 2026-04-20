@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import replace
 from pathlib import Path
 import time
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -30,7 +30,6 @@ from branching_eval.tree_types import (
     CandidateRecord,
     TokenTrace,
 )
-from io_utils import read_jsonl
 from vllm_client import GenerationChoice, ParsedToken, VllmClient
 
 
@@ -82,7 +81,14 @@ class FakeClient:
                 for index in range(n)
             )
         self.decode_calls += 1
-        return (make_choice(index=0, text=" x", entropy_logprob=-0.05),)
+        return (
+            make_choice(
+                index=0,
+                text=" x<steer>",
+                entropy_logprob=-0.05,
+                finish_reason="stop",
+            ),
+        )
 
     async def completions_async(
         self,
@@ -215,7 +221,13 @@ class AsyncDecodeClient(FakeClient):
         )
 
 
-def make_choice(*, index: int, text: str, entropy_logprob: float) -> GenerationChoice:
+def make_choice(
+    *,
+    index: int,
+    text: str,
+    entropy_logprob: float,
+    finish_reason: str = "length",
+) -> GenerationChoice:
     """Build one deterministic generation choice."""
 
     parsed_token = ParsedToken(
@@ -226,7 +238,7 @@ def make_choice(*, index: int, text: str, entropy_logprob: float) -> GenerationC
     return GenerationChoice(
         index=index,
         text=text,
-        finish_reason="length",
+        finish_reason=finish_reason,
         stop_reason=None,
         tokens=(parsed_token,),
         prompt_token_ids=(1, 2, 3),
@@ -277,7 +289,7 @@ def build_executor(
     branch_prob: float = 1.0,
     max_concurrent_branches: int = 20,
     branch_task_semaphore: asyncio.Semaphore | None = None,
-    trigger_steer_enabled: bool = False,
+    trigger_steer_enabled: bool = True,
     trigger_entropy_enabled: bool = True,
     debug_assert_text_token_alignment: bool = False,
 ) -> BranchExecutor:
@@ -317,6 +329,12 @@ def build_executor(
         env_paths=(),
         branch_task_semaphore=branch_task_semaphore,
     )
+
+
+def read_tree_event_rows(*, store: ArtifactStore) -> list[dict[str, Any]]:
+    """Read flushed tree event rows from one artifact store."""
+
+    return store.read_event_rows()
 
 
 def test_shared_pool_records_all_requested_selectors(
@@ -398,7 +416,7 @@ def test_selector_event_logs_cluster_details(tmp_path: Path, monkeypatch) -> Non
         fake_select_all_modes_async,
     )
     _ = executor.run_branching_rollouts(doc_id=10, task_name="aime24", model_id="m")
-    rows = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    rows = read_tree_event_rows(store=executor.artifact_store)
     selector_rows = [row for row in rows if row.get("event_type") == "selector_applied"]
     assert selector_rows
     payload = dict(selector_rows[0].get("payload", {}))
@@ -437,7 +455,7 @@ def test_leaf_budget_caps_realized_leaf_count(tmp_path: Path) -> None:
         leaf_budget=2,
     )
 
-    rows = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    rows = read_tree_event_rows(store=executor.artifact_store)
     rollout_started = next(
         row for row in rows if row.get("event_type") == "rollout_started"
     )
@@ -482,7 +500,7 @@ def test_leaf_budget_keeps_underproduced_no_trigger_rollouts_ragged(
         leaf_budget=2,
     )
 
-    rows = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    rows = read_tree_event_rows(store=executor.artifact_store)
     rollout_started = next(
         row for row in rows if row.get("event_type") == "rollout_started"
     )
@@ -736,7 +754,7 @@ def test_streaming_scheduler_resumes_maxed_state_without_blocking_siblings(
     assert "slow" in finish_times
     assert start_times["maxed_resume"] < finish_times["slow"]
     assert len(tree.leaves) == 2
-    rows = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    rows = read_tree_event_rows(store=executor.artifact_store)
     assert any(
         row.get("event_type") == "trigger_skipped_max_branch_points" for row in rows
     )
@@ -934,15 +952,15 @@ def test_branching_writes_incremental_tree_events_jsonl(tmp_path: Path) -> None:
     executor = build_executor(tmp_path=tmp_path)
     tree = executor.run_branching_rollouts(doc_id=3, task_name="aime24", model_id="m")
     events_path = tmp_path / "run" / "tree_events.jsonl"
+    executor.artifact_store.flush_events()
     assert events_path.exists()
-    rows = read_jsonl(path=events_path)
+    rows = read_tree_event_rows(store=executor.artifact_store)
     assert rows
     event_types = {str(row.get("event_type", "")) for row in rows}
     assert "rollout_started" in event_types
     assert "node_created" in event_types
     assert "trigger_fired" in event_types
     assert "decode_chunk" in event_types
-    assert "trigger_skipped_max_branch_points" in event_types
     assert "candidate_pool_resolved" in event_types
     assert "selector_applied" in event_types
     assert "edge_selected" in event_types
@@ -1009,7 +1027,7 @@ def test_decode_chunk_event_uses_state_delta(tmp_path: Path) -> None:
         token_ids_before=(1, 2, 3),
         token_ids_after=(1, 2, 3, 42, 43, 44),
     )
-    rows = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    rows = read_tree_event_rows(store=executor.artifact_store)
     assert rows
     payload = rows[-1]["payload"]
     assert payload["chunk_text"] == "<steer></steer></exec>\n\n<steer>"
@@ -1087,8 +1105,8 @@ def test_candidate_pool_generation_defers_alignment_until_selection(
         executor._generate_candidate_pool_async(
             candidate_pool_id="pool",
             state=_path_state(node_id="root"),
-            trigger_type="high_entropy",
-            entropy_value=0.3,
+            trigger_type="steer_boundary",
+            entropy_value=None,
             assistant_prefix="seed",
             prompt_token_ids=(1, 2, 3),
             candidate_token_budget=4,
@@ -1096,16 +1114,13 @@ def test_candidate_pool_generation_defers_alignment_until_selection(
     )
 
     assert detokenize_calls == []
-    selected_text, selected_token_ids = asyncio.run(
-        executor._normalized_child_candidate_async(
-            trigger_type="high_entropy",
-            candidate=pool.candidates[1],
-        )
+    aligned_candidate = asyncio.run(
+        executor._candidate_with_aligned_text_async(candidate=pool.candidates[1])
     )
 
     assert detokenize_calls == [(11,)]
-    assert selected_text == "decoded_11"
-    assert selected_token_ids == (11,)
+    assert aligned_candidate.text == "decoded_11"
+    assert aligned_candidate.token_ids == (11,)
 
 
 def test_selector_within_cluster_prefers_non_other() -> None:
@@ -1138,95 +1153,6 @@ def test_selector_random_returns_unique_k_ids() -> None:
     assert len(selected) == 4
     assert len(set(selected)) == 4
     assert all(0 <= candidate_id < 10 for candidate_id in selected)
-
-
-def test_entropy_span_pool_generation_uses_no_stop(tmp_path: Path, monkeypatch) -> None:
-    """Entropy-trigger pool generation should use `stop=None` without steer normalization."""
-
-    executor = build_executor(tmp_path=tmp_path)
-    called = {}
-
-    async def fake_generate_many(
-        *,
-        assistant_prefix: str,
-        prompt_token_ids: tuple[int, ...] | None,
-        max_tokens: int,
-        n: int,
-        stop: tuple[str, ...] | None,
-        temperature: float | None = None,
-        **kwargs: object,
-    ):
-        called["assistant_prefix"] = assistant_prefix
-        called["prompt_token_ids"] = prompt_token_ids
-        called["max_tokens"] = max_tokens
-        called["n"] = n
-        called["stop"] = stop
-        called["temperature"] = temperature
-        request_stream_id = str(kwargs.get("request_stream_id", ""))
-        if request_stream_id:
-            executor._request_stream_state[request_stream_id] = (
-                branch_executor_module._RequestStreamState(
-                    request_id="test-request",
-                    input_token_ids=prompt_token_ids or (),
-                    output_token_ids=(10,),
-                )
-            )
-        return tuple(
-            make_choice(index=index, text=f"c{index}", entropy_logprob=-0.4)
-            for index in range(n)
-        )
-
-    monkeypatch.setattr(executor, "_generate_many_async", fake_generate_many)
-    state = executor.run_branching_rollouts(doc_id=2, task_name="aime24", model_id="m")
-    assert state.candidate_pools
-    assert called["stop"] is None
-
-
-def test_entropy_span_generation_preserves_partial_steer_prefix(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """Entropy-trigger candidates should not normalize partial `<steer` prefixes."""
-
-    executor = build_executor(tmp_path=tmp_path)
-    captured_prefix: dict[str, str | float] = {}
-
-    async def fake_generate_many(
-        *,
-        assistant_prefix: str,
-        prompt_token_ids: tuple[int, ...] | None,
-        max_tokens: int,
-        n: int,
-        stop: tuple[str, ...] | None,
-        temperature: float | None = None,
-        **kwargs: object,
-    ):
-        captured_prefix["assistant_prefix"] = assistant_prefix
-        captured_prefix["temperature"] = -1.0 if temperature is None else temperature
-        _ = prompt_token_ids, max_tokens, stop
-        return tuple(
-            make_choice(index=index, text=f"c{index}", entropy_logprob=-0.4)
-            for index in range(n)
-        )
-
-    monkeypatch.setattr(executor, "_generate_many_async", fake_generate_many)
-    _ = executor._generate_candidate_pool(
-        candidate_pool_id="pool_00000001",
-        state=PathState(
-            node_id="node_x",
-            assistant_prefix="abc<steer",
-            prompt_token_ids=(1, 2, 3),
-            token_ids=(),
-            token_traces=(),
-            branch_points_used=0,
-        ),
-        trigger_type="high_entropy",
-        entropy_value=1.2,
-        assistant_prefix="abc<steer",
-        prompt_token_ids=(1, 2, 3),
-        candidate_token_budget=3,
-    )
-    assert captured_prefix["assistant_prefix"] == "abc<steer"
-    assert captured_prefix["temperature"] == 1.0
 
 
 def test_steer_pool_generation_applies_full_boundary_normalization(
@@ -1807,7 +1733,7 @@ def test_steer_stop_respects_branch_prob_and_continues(
     assert calls["continued"] == 1
     assert outcome.event_type == "terminated"
     assert outcome.stop_reason == "model_finished"
-    events = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    events = read_tree_event_rows(store=executor.artifact_store)
     steer_events = [
         row for row in events if row.get("event_type") == "steer_block_generated"
     ]
@@ -1927,7 +1853,7 @@ def test_maxed_path_keeps_steer_normalization_without_branching(
     assert calls["continued"] == 1
     assert outcome.event_type == "terminated"
     assert outcome.stop_reason == "model_finished"
-    events = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    events = read_tree_event_rows(store=executor.artifact_store)
     steer_events = [
         row for row in events if row.get("event_type") == "steer_block_generated"
     ]
@@ -2069,7 +1995,7 @@ def test_inline_epsilon_selection_stays_on_same_node(
     assert outcome.event_type == "terminated"
     assert outcome.stop_reason == "model_finished"
     assert outcome.branch_points_used == 0
-    events = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    events = read_tree_event_rows(store=executor.artifact_store)
     event_types = [str(row.get("event_type")) for row in events]
     assert "candidate_pool_resolved" in event_types
     assert "selector_applied" in event_types
@@ -2176,7 +2102,7 @@ def test_steer_exec_repeat_loop_terminates_branch(tmp_path: Path, monkeypatch) -
     assert outcome.stop_reason == "repeated_exec_block_loop"
     assert call_counts["generate"] == 3
     assert call_counts["continued"] == 2
-    events = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    events = read_tree_event_rows(store=executor.artifact_store)
     repeat_events = [
         row for row in events if row.get("event_type") == "exec_repeat_terminated"
     ]
@@ -2292,7 +2218,7 @@ def test_steer_exec_repeat_loop_terminates_on_alternating_blocks(
     assert outcome.stop_reason == "repeated_exec_block_loop"
     assert call_counts["generate"] == 3
     assert call_counts["continued"] == 2
-    events = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    events = read_tree_event_rows(store=executor.artifact_store)
     repeat_events = [
         row for row in events if row.get("event_type") == "exec_repeat_terminated"
     ]
@@ -2413,7 +2339,7 @@ def test_steer_block_repeat_loop_terminates_on_alternating_blocks(
     assert outcome.stop_reason == "repeated_steer_block_loop"
     assert call_counts["generate"] == len(exec_chunks)
     assert call_counts["continued"] == len(exec_chunks)
-    events = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    events = read_tree_event_rows(store=executor.artifact_store)
     repeat_events = [
         row for row in events if row.get("event_type") == "steer_repeat_terminated"
     ]
@@ -2765,7 +2691,7 @@ def test_steer_selected_child_is_closed_before_continuation(tmp_path: Path) -> N
     assert children[0].prompt_token_ids is not None
     assert children[0].prompt_token_ids[:5] == (1, 2, 3, 11, 12)
     assert children[0].prompt_token_ids[5:] == tuple(range(1000, 1016))
-    events = read_jsonl(path=tmp_path / "run" / "tree_events.jsonl")
+    events = read_tree_event_rows(store=executor.artifact_store)
     edge_events = [row for row in events if row.get("event_type") == "edge_selected"]
     assert edge_events
     edge_payload = dict(edge_events[-1].get("payload", {}))
@@ -2973,7 +2899,7 @@ def sample_pool(*, candidate_count: int) -> CandidatePoolRecord:
         candidate_pool_id="pool",
         branch_point_id="bp",
         node_id="node",
-        trigger_type="high_entropy",
+        trigger_type="steer_boundary",
         entropy_value=1.0,
         candidates=candidates,
     )

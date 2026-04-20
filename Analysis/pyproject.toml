@@ -6,8 +6,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "google-genai>=0.7.0",
+  "ipykernel>=7.2.0",
   "lm-eval[hf,vllm,math]>=0.4.7",
   "lmcache>=0.3.14",
+  "matplotlib>=3.10.8",
   "pyyaml>=6.0.0",
 ]
 

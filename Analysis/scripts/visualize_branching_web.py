@@ -232,6 +232,7 @@ def wrap_page(
     body_html: str,
     footer_text: str | None = None,
     script: str = "",
+    script_urls: tuple[str, ...] = (),
 ) -> str:
     """Wrap body HTML in a complete themed document shell.
 
@@ -241,6 +242,7 @@ def wrap_page(
         body_html: Main page HTML.
         footer_text: Optional footer text.
         script: Optional inline script tag contents.
+        script_urls: External script URLs appended at the end of the body.
 
     Returns:
         Complete HTML document string.
@@ -250,6 +252,9 @@ def wrap_page(
         f"<p class='muted' style='margin:0'>{escape(footer_text)}</p>"
         if footer_text
         else ""
+    )
+    external_scripts = "\n".join(
+        f'  <script src="{escape(script_url)}"></script>' for script_url in script_urls
     )
     return f"""<!doctype html>
 <html lang="en">
@@ -274,6 +279,7 @@ def wrap_page(
     {body_html}
     {footer_html}
   </main>
+{external_scripts}
   <script>{script}</script>
 </body>
 </html>

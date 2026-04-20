@@ -38,13 +38,14 @@ class DecodeOutcome:
     Args:
         event_type: `trigger` or `terminated`.
         trigger_type: Trigger type when event is `trigger`.
-        entropy_value: Entropy value when trigger is entropy-based.
         assistant_prefix: Updated assistant prefix.
         prompt_token_ids: Updated prompt token chain.
         token_ids: Updated token id chain.
         token_traces: Updated token traces.
         generated_tokens: Total generated tokens accumulated for this path state.
         stop_reason: Termination reason when event type is `terminated`.
+        branch_points_used: Logical trigger-count on the active path after this outcome.
+        entropy_value: Legacy compatibility field retained for replay/test fixtures.
 
     Returns:
         Decode outcome for branching expansion.
@@ -52,10 +53,11 @@ class DecodeOutcome:
 
     event_type: str
     trigger_type: str | None
-    entropy_value: float | None
     assistant_prefix: str
     prompt_token_ids: tuple[int, ...] | None
     token_ids: tuple[int, ...]
     token_traces: tuple[TokenTrace, ...]
     generated_tokens: int
     stop_reason: str
+    branch_points_used: int | None = None
+    entropy_value: float | None = None

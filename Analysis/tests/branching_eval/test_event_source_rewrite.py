@@ -299,6 +299,64 @@ def test_event_writer_monotonic_indices_and_float_quantization(tmp_path: Path) -
     one_payload = events[0].payload
     assert isinstance(one_payload["score"], float)
     assert one_payload["score"] == round(float(one_payload["score"]), 4)
+    store.close()
+
+
+def test_event_writer_failure_surfaces_across_flush_append_and_close(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Writer-thread failures should propagate through later public store methods."""
+
+    store = ArtifactStore(run_dir=tmp_path / "run")
+    context = EventContext(
+        run_id=store.run_id,
+        doc_id=0,
+        doc_attempt=0,
+        task_name="aime24",
+        model_id="fake",
+        selector_mode="random",
+    )
+    original_serialize = store._serialize_event_line
+    state = {"calls": 0}
+
+    def fail_once(*, event: Any) -> str:
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise OSError("boom")
+        return original_serialize(event=event)
+
+    monkeypatch.setattr(store, "_serialize_event_line", fail_once)
+    store.append_event(context=context, event_type="worker_event", payload={"score": 1})
+    with pytest.raises(RuntimeError, match="event writer failed"):
+        store.flush_events()
+    with pytest.raises(RuntimeError, match="event writer failed"):
+        store.append_event(
+            context=context,
+            event_type="worker_event",
+            payload={"score": 2},
+        )
+    with pytest.raises(RuntimeError, match="event writer failed"):
+        store.close()
+
+
+def test_event_writer_close_is_idempotent(tmp_path: Path) -> None:
+    """Closing the store twice should keep the first successful shutdown semantics."""
+
+    store = ArtifactStore(run_dir=tmp_path / "run")
+    context = EventContext(
+        run_id=store.run_id,
+        doc_id=0,
+        doc_attempt=0,
+        task_name="aime24",
+        model_id="fake",
+        selector_mode="random",
+    )
+    store.append_event(context=context, event_type="worker_event", payload={"score": 1})
+    store.close()
+    store.close()
+    rows = store.read_event_rows()
+    assert len(rows) == 1
+    assert rows[0]["event_type"] == "worker_event"
 
 
 def test_resume_planning_skips_finished_and_restarts_incomplete(tmp_path: Path) -> None:

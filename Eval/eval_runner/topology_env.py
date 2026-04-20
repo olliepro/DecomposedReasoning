@@ -16,6 +16,9 @@ CROSS_NUMA_ENV_OVERRIDES: Mapping[str, str] = {
     "VLLM_DISABLE_PYNCCL": "1",
     "VLLM_SKIP_P2P_CHECK": "0",
 }
+ASCEND_CROSS_NUMA_ALLOWED_PARTITIONS: frozenset[str] = frozenset(
+    {"nextgen", "preemptible-nextgen"}
+)
 
 
 def _strip_ansi_sequences(text: str) -> str:
@@ -85,6 +88,27 @@ def has_required_cross_numa_gpu_shape(gpu_product_names: list[str]) -> bool:
     if len(gpu_product_names) != 2:
         return False
     return all("A100" in gpu_name.upper() for gpu_name in gpu_product_names)
+
+
+def _allows_cross_numa_policy(slurm_partition: str | None) -> bool:
+    """Check whether cross-NUMA policy should run for the active partition.
+
+    Args:
+        slurm_partition: Active Slurm partition name, when available.
+
+    Returns:
+        `True` when the policy should be allowed to mutate env vars.
+    """
+    if slurm_partition is None:
+        return True
+    normalized_partition = slurm_partition.strip().lower()
+    if not normalized_partition:
+        return True
+    if normalized_partition in {"quad", "preemptible-quad"}:
+        return False
+    if normalized_partition in ASCEND_CROSS_NUMA_ALLOWED_PARTITIONS:
+        return True
+    return True
 
 
 def _extract_gpu_header_tokens(topology_text: str) -> list[str]:
@@ -215,6 +239,7 @@ def maybe_set_cross_numa_vllm_env(
     env: MutableMapping[str, str] | None = None,
     topology_text: str | None = None,
     gpu_product_names: list[str] | None = None,
+    slurm_partition: str | None = None,
 ) -> tuple[bool, str]:
     """Apply cross-NUMA vLLM env overrides when topology requires it.
 
@@ -223,12 +248,20 @@ def maybe_set_cross_numa_vllm_env(
         env: Optional environment mapping for mutation in tests.
         topology_text: Optional injected topology text for tests.
         gpu_product_names: Optional injected GPU product names for tests.
+        slurm_partition: Optional injected Slurm partition override for tests.
 
     Returns:
         Tuple `(applied, reason)` describing policy outcome.
     """
     if model_type != "vllm":
         return False, "model_type is not vllm"
+    active_partition = (
+        os.environ.get("SLURM_JOB_PARTITION")
+        if slurm_partition is None
+        else slurm_partition
+    )
+    if not _allows_cross_numa_policy(slurm_partition=active_partition):
+        return False, f"partition {active_partition} disables cross-NUMA policy"
     active_gpu_product_names = (
         read_gpu_product_names() if gpu_product_names is None else gpu_product_names
     )

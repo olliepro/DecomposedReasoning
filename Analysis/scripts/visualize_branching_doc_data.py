@@ -41,7 +41,8 @@ class AttemptLayoutData:
     Args:
         nodes: Node rows keyed by `node_id`.
         edges: Selected edge rows.
-        node_events: Node-scoped compact event rows.
+        graph_node_events: Node-scoped summary rows used for graph rendering.
+        node_events: Node-scoped full event rows used for lazy inspector payloads.
         node_summaries: Compact node summary rows for graph rendering.
         leaf_rows_by_node: Full leaf-detail rows keyed by terminal node id.
         meta: Run-attempt metadata used by the doc page.
@@ -52,6 +53,7 @@ class AttemptLayoutData:
 
     nodes: dict[str, NodeView]
     edges: list[EdgeView]
+    graph_node_events: dict[str, list[dict[str, Any]]]
     node_events: dict[str, list[dict[str, Any]]]
     node_summaries: list[dict[str, Any]]
     leaf_rows_by_node: dict[str, list[dict[str, Any]]]
@@ -76,13 +78,13 @@ def tree_payload_for_attempt(
     layout = build_attempt_layout(state=state, detail_base_url=detail_base_url)
     maxima = payload_maxima(
         node_rows=layout.node_summaries,
-        node_events=layout.node_events,
+        node_events=layout.graph_node_events,
     )
     return {
         "nodes": layout.node_summaries,
         "edges": edge_payload_rows(edges=layout.edges),
         "branches": [],
-        "node_events": layout.node_events,
+        "node_events": layout.graph_node_events,
         "meta": {
             **layout.meta,
             "x_max": maxima,
@@ -152,13 +154,14 @@ def build_attempt_layout(
         base_tokens=base_tokens,
         event_seconds_by_index=event_seconds,
     )
+    graph_node_events = graph_event_rows(node_events=node_events)
     leaf_rows_by_node = leaf_rows_by_node_id(state=state)
     depth_by_node = compute_depths(nodes=nodes)
     node_summaries = node_payload_rows(
         state=state,
         nodes=nodes,
         edges=edges,
-        node_events=node_events,
+        node_events=graph_node_events,
         leaf_rows_by_node=leaf_rows_by_node,
         depth_by_node=depth_by_node,
         final_steps=final_steps,
@@ -182,11 +185,45 @@ def build_attempt_layout(
     return AttemptLayoutData(
         nodes=nodes,
         edges=edges,
+        graph_node_events=graph_node_events,
         node_events=node_events,
         node_summaries=node_summaries,
         leaf_rows_by_node=leaf_rows_by_node,
         meta=meta,
     )
+
+
+def graph_event_rows(
+    *,
+    node_events: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Return summary-only event rows used by the initial graph payload."""
+
+    graph_rows: dict[str, list[dict[str, Any]]] = {}
+    keep_keys = (
+        "event_id",
+        "event_index",
+        "timestamp_utc",
+        "event_type",
+        "node_id",
+        "summary",
+        "step_delta",
+        "token_delta",
+        "metrics",
+    )
+    for node_id, rows in node_events.items():
+        graph_rows[node_id] = []
+        for row in rows:
+            graph_row = {key: row[key] for key in keep_keys if key in row}
+            details = row.get("details")
+            if row.get("event_type") == "leaf_scored" and isinstance(details, dict):
+                graph_row["details"] = {
+                    "leaf_id": details.get("leaf_id"),
+                    "verification": details.get("verification"),
+                    "stop_reason": details.get("stop_reason"),
+                }
+            graph_rows[node_id].append(graph_row)
+    return graph_rows
 
 
 def normalized_graph(
@@ -545,7 +582,11 @@ def vllm_step_details(
             "request_kind", response_payload.get("request_kind")
         ),
         "current_input_token_count": request_payload.get("current_input_token_count"),
+        "base_prefix_token_count": request_payload.get("base_prefix_token_count"),
         "delta_token_count": request_payload.get("delta_token_count"),
+        "assistant_prefix_char_count": request_payload.get(
+            "assistant_prefix_char_count"
+        ),
         "status": response_payload.get("status", "pending"),
         "latency_seconds": response_payload.get("latency_seconds"),
         "error_message": response_payload.get("error_message"),
@@ -700,10 +741,14 @@ def compute_depths(*, nodes: dict[str, NodeView]) -> dict[str, int]:
         if node_id in depth_by_node:
             return depth_by_node[node_id]
         node = nodes.get(node_id)
-        if node is None or node.parent_node_id in {None, ""}:
+        if node is None:
             depth_by_node[node_id] = 0
             return 0
-        depth_by_node[node_id] = depth_for(node.parent_node_id) + 1
+        parent_node_id = node.parent_node_id
+        if not parent_node_id:
+            depth_by_node[node_id] = 0
+            return 0
+        depth_by_node[node_id] = depth_for(parent_node_id) + 1
         return depth_by_node[node_id]
 
     for node_id in nodes:

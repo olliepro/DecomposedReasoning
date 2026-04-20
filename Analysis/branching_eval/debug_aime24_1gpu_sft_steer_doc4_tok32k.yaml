@@ -43,7 +43,6 @@ calibration:
 
 artifacts:
   output_root: output/branching_eval_debug_sft_steer_doc4_tok32k
-  reuse_candidate_pools: true
 
 run_matrix:
   include_baselines: false

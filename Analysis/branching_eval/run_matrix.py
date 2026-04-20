@@ -183,7 +183,6 @@ def selector_mode_for_spec(*, spec: ExperimentSpec) -> str:
         ...         seed=1234,
         ...         baseline_rollouts=32,
         ...         trigger_steer=True,
-        ...         trigger_entropy=False,
         ...     )
         ... )
         'structured_baseline'
@@ -376,7 +375,6 @@ def expand_experiments(
                             seed=seed,
                             baseline_rollouts=config.run_matrix.baseline_rollouts,
                             trigger_steer=False,
-                            trigger_entropy=False,
                         )
                     )
                 if config.run_matrix.include_structured_baselines:
@@ -389,7 +387,6 @@ def expand_experiments(
                             seed=seed,
                             baseline_rollouts=config.run_matrix.baseline_rollouts,
                             trigger_steer=model_spec.trigger_steer_default,
-                            trigger_entropy=False,
                         )
                     )
                 if not config.run_matrix.include_branching:
@@ -406,7 +403,6 @@ def expand_experiments(
                             seed=seed,
                             baseline_rollouts=config.run_matrix.baseline_rollouts,
                             trigger_steer=model_spec.trigger_steer_default,
-                            trigger_entropy=model_spec.trigger_entropy_default,
                         )
                     )
                 if not config.run_matrix.include_epsilon_greedy:
@@ -420,7 +416,6 @@ def expand_experiments(
                         seed=seed,
                         baseline_rollouts=config.run_matrix.baseline_rollouts,
                         trigger_steer=model_spec.trigger_steer_default,
-                        trigger_entropy=model_spec.trigger_entropy_default,
                     )
                 )
     return experiments
@@ -541,45 +536,44 @@ def run_one_experiment(
             "doc_ids": list(doc_ids) if doc_ids is not None else None,
         },
     )
-    resolved_branching = resolve_branching_config(
-        branching=config.branching,
-        calibration_path=config.calibration.entropy_threshold_path,
-    )
-    asyncio.run(
-        run_docs_with_limit_async(
-            plans=plans,
-            max_concurrent_docs=config.run_matrix.max_concurrent_docs,
-            config=config,
-            spec=spec,
-            client=client,
-            cluster_client=cluster_client,
-            model_name_for_generation=model_name_for_generation,
-            cluster_model_name_for_generation=cluster_model_name_for_generation,
-            task_name=spec.task_name,
-            model_id=spec.model_id,
-            resolved_branching=resolved_branching,
+    try:
+        asyncio.run(
+            run_docs_with_limit_async(
+                plans=plans,
+                max_concurrent_docs=config.run_matrix.max_concurrent_docs,
+                config=config,
+                spec=spec,
+                client=client,
+                cluster_client=cluster_client,
+                model_name_for_generation=model_name_for_generation,
+                cluster_model_name_for_generation=cluster_model_name_for_generation,
+                task_name=spec.task_name,
+                model_id=spec.model_id,
+                resolved_branching=config.branching,
+                store=store,
+                adapter=adapter,
+                events_snapshot=events_before,
+            )
+        )
+        summary = recompute_outputs_from_events(
             store=store,
             adapter=adapter,
-            events_snapshot=events_before,
+            selector_mode=selector_mode_for_spec(spec=spec),
         )
-    )
-    summary = recompute_outputs_from_events(
-        store=store,
-        adapter=adapter,
-        selector_mode=selector_mode_for_spec(spec=spec),
-    )
-    store.append_event(
-        context=run_context,
-        event_type="run_finished",
-        payload={
-            "resume": resume_run_dir is not None,
-            "doc_count_total": len(docs),
-            "doc_count_scheduled": len(plans),
-            "doc_count_skipped": skipped_doc_count,
-            **summary,
-        },
-    )
-    return run_dir
+        store.append_event(
+            context=run_context,
+            event_type="run_finished",
+            payload={
+                "resume": resume_run_dir is not None,
+                "doc_count_total": len(docs),
+                "doc_count_scheduled": len(plans),
+                "doc_count_skipped": skipped_doc_count,
+                **summary,
+            },
+        )
+        return run_dir
+    finally:
+        store.close()
 
 
 def _initialize_or_validate_run_metadata(
@@ -771,7 +765,6 @@ def run_doc_rollouts(
         on_leaf_completed=on_leaf_completed,
         seed=seed_for_doc(base_seed=spec.seed, doc_id=doc_id),
         trigger_steer_enabled=spec.trigger_steer,
-        trigger_entropy_enabled=spec.trigger_entropy,
         env_paths=env_paths,
         enable_request_priorities=config.serve.scheduling_policy == "priority",
     )
@@ -893,7 +886,6 @@ async def run_doc_rollouts_async(
         on_leaf_completed=on_leaf_completed,
         seed=seed_for_doc(base_seed=spec.seed, doc_id=doc_id),
         trigger_steer_enabled=spec.trigger_steer,
-        trigger_entropy_enabled=spec.trigger_entropy,
         env_paths=env_paths,
         enable_request_priorities=config.serve.scheduling_policy == "priority",
         branch_task_semaphore=branch_task_semaphore,
@@ -1447,9 +1439,7 @@ def resolve_answer_extractor(*, adapter: LmEvalAdapter) -> Callable[[str], str]:
 
     extracted = getattr(adapter, "extract_answer", None)
     if callable(extracted):
-        return lambda response_text: str(
-            extracted(response_text=response_text)
-        )
+        return lambda response_text: str(extracted(response_text=response_text))
     return lambda response_text: " ".join(str(response_text).split()).casefold()
 
 
@@ -1649,32 +1639,6 @@ def build_baseline_doc_diagnostics(
     return build_doc_diagnostics(tree=baseline_tree)
 
 
-def resolve_branching_config(
-    *,
-    branching: BranchingConfig,
-    calibration_path: Path,
-) -> BranchingConfig:
-    """Resolve entropy threshold from config or calibration JSON.
-
-    Args:
-        branching: Branching config.
-        calibration_path: Calibration JSON path.
-
-    Returns:
-        Branching config with entropy threshold set.
-    """
-
-    if branching.entropy_threshold is not None:
-        return branching
-    payload = json.loads(calibration_path.read_text(encoding="utf-8"))
-    assert isinstance(payload, dict), "calibration payload must be a mapping"
-    profile = payload.get(branching.entropy_profile_name)
-    assert isinstance(profile, dict), "calibration profile missing"
-    threshold = profile.get("entropy_threshold")
-    assert isinstance(threshold, (int, float)), "entropy_threshold missing in profile"
-    return replace(branching, entropy_threshold=float(threshold))
-
-
 def build_run_dir(*, config: BranchingEvalConfig, spec: ExperimentSpec) -> Path:
     """Build deterministic experiment run directory path.
 
@@ -1719,7 +1683,6 @@ def build_config_snapshot(
         "serve": asdict(config.serve),
         "decoding": asdict(config.decoding),
         "branching": asdict(config.branching),
-        "calibration": asdict(config.calibration),
         "artifacts": asdict(config.artifacts),
         "run_matrix": asdict(config.run_matrix),
     }

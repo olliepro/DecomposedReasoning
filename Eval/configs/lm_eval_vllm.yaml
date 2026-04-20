@@ -10,6 +10,6 @@ gpu_memory_utilization: 0.8
 data_parallel_size: 1
 num_fewshot: null
 apply_chat_template: true
-think_end_token: "</think>"
+think_end_token: null
 max_gen_toks: 32768
 log_samples: false

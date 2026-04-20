@@ -39,6 +39,48 @@ def should_branch_at_trigger(*, executor: BranchExecutor) -> bool:
     return executor.random.random() <= executor.branching.branch_prob
 
 
+def _build_steer_continuation_outcome(
+    *,
+    executor: BranchExecutor,
+    canonical_prefix: str,
+    updated_prompt_ids: tuple[int, ...] | None,
+    token_ids: tuple[int, ...],
+    token_traces: tuple[TokenTrace, ...],
+    steer_text: str,
+    steer_token_ids: tuple[int, ...],
+    steer_candidate_tokens: tuple[TokenTrace, ...],
+    generated_tokens: int,
+) -> DecodeOutcome:
+    """Build one normalized steer-continuation outcome under the path token cap.
+
+    Args:
+        executor: Active branch executor.
+        canonical_prefix: Canonicalized prefix at steer boundary.
+        updated_prompt_ids: Prompt token chain after suffix injection.
+        token_ids: Existing generated token ids.
+        token_traces: Existing generated token traces.
+        steer_text: Normalized steer continuation text.
+        steer_token_ids: Normalized steer continuation token ids.
+        steer_candidate_tokens: Raw vLLM token traces for the steer candidate.
+        generated_tokens: Tokens already realized before continuation.
+
+    Returns:
+        Continued decode outcome with normalized steer suffix appended in-path.
+    """
+
+    updated_generated_tokens = generated_tokens + len(steer_token_ids)
+    return DecodeOutcome(
+        event_type="continued",
+        trigger_type=None,
+        assistant_prefix=canonical_prefix + steer_text,
+        prompt_token_ids=updated_prompt_ids,
+        token_ids=tuple(token_ids) + tuple(steer_token_ids),
+        token_traces=tuple(token_traces) + tuple(steer_candidate_tokens),
+        generated_tokens=updated_generated_tokens,
+        stop_reason="",
+    )
+
+
 def continue_with_single_steer_candidate(
     *,
     executor: BranchExecutor,
@@ -64,12 +106,14 @@ def continue_with_single_steer_candidate(
         otherwise a terminal outcome.
     """
 
-    remaining = executor.decoding.max_gen_toks - generated_tokens
-    if remaining <= 0:
+    steer_budget = executor._candidate_token_budget(
+        trigger_type="steer_boundary",
+        generated_tokens=generated_tokens,
+    )
+    if steer_budget <= 0:
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
-            entropy_value=None,
             assistant_prefix=assistant_prefix,
             prompt_token_ids=prompt_token_ids,
             token_ids=token_ids,
@@ -83,10 +127,13 @@ def continue_with_single_steer_candidate(
             prompt_token_ids=prompt_token_ids,
         )
     )
+    # Steer normalization can rewrite the prompt boundary, so the next request
+    # must start a fresh prefix chain for this stream.
+    executor._reset_request_stream_state(request_stream_id=request_stream_id)
     steer_choice = executor._generate_choice(
         assistant_prefix=canonical_prefix,
         prompt_token_ids=canonical_prompt_ids,
-        max_tokens=min(executor.branching.max_steer_tokens, remaining),
+        max_tokens=steer_budget,
         stop=("</steer",),
         n=1,
         request_kind="steer_single_candidate",
@@ -97,7 +144,6 @@ def continue_with_single_steer_candidate(
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
-            entropy_value=None,
             assistant_prefix=canonical_prefix,
             prompt_token_ids=canonical_prompt_ids,
             token_ids=token_ids,
@@ -114,7 +160,6 @@ def continue_with_single_steer_candidate(
         trigger_type="steer_boundary",
         candidate=steer_candidate,
     )
-    consumed = len(steer_candidate.token_ids)
     updated_prompt_ids = append_prompt_token_ids(
         prompt_token_ids=canonical_prompt_ids,
         continuation_token_ids=tuple(steer_candidate.token_ids),
@@ -127,16 +172,20 @@ def continue_with_single_steer_candidate(
             prompt_token_ids=updated_prompt_ids,
             continuation_token_ids=extra_ids,
         )
-    return DecodeOutcome(
-        event_type="continued",
-        trigger_type=None,
-        entropy_value=None,
-        assistant_prefix=canonical_prefix + steer_text,
-        prompt_token_ids=updated_prompt_ids,
-        token_ids=tuple(token_ids) + tuple(steer_token_ids),
-        token_traces=tuple(token_traces) + tuple(steer_candidate.tokens),
-        generated_tokens=generated_tokens + consumed,
-        stop_reason="",
+    executor._update_request_stream_state_output_ids(
+        request_stream_id=request_stream_id,
+        consumed_output_token_ids=tuple(steer_choice.token_ids or ()),
+    )
+    return _build_steer_continuation_outcome(
+        executor=executor,
+        canonical_prefix=canonical_prefix,
+        updated_prompt_ids=updated_prompt_ids,
+        token_ids=token_ids,
+        token_traces=token_traces,
+        steer_text=steer_text,
+        steer_token_ids=tuple(steer_token_ids),
+        steer_candidate_tokens=tuple(steer_candidate.tokens),
+        generated_tokens=generated_tokens,
     )
 
 
@@ -152,12 +201,14 @@ async def continue_with_single_steer_candidate_async(
 ) -> DecodeOutcome:
     """Async variant of single-candidate steer continuation."""
 
-    remaining = executor.decoding.max_gen_toks - generated_tokens
-    if remaining <= 0:
+    steer_budget = await executor._candidate_token_budget_async(
+        trigger_type="steer_boundary",
+        generated_tokens=generated_tokens,
+    )
+    if steer_budget <= 0:
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
-            entropy_value=None,
             assistant_prefix=assistant_prefix,
             prompt_token_ids=prompt_token_ids,
             token_ids=token_ids,
@@ -171,10 +222,13 @@ async def continue_with_single_steer_candidate_async(
             prompt_token_ids=prompt_token_ids,
         )
     )
+    # Steer normalization can rewrite the prompt boundary, so the next request
+    # must start a fresh prefix chain for this stream.
+    executor._reset_request_stream_state(request_stream_id=request_stream_id)
     steer_choice = await executor._generate_choice_async(
         assistant_prefix=canonical_prefix,
         prompt_token_ids=canonical_prompt_ids,
-        max_tokens=min(executor.branching.max_steer_tokens, remaining),
+        max_tokens=steer_budget,
         stop=("</steer",),
         n=1,
         request_kind="steer_single_candidate",
@@ -185,7 +239,6 @@ async def continue_with_single_steer_candidate_async(
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
-            entropy_value=None,
             assistant_prefix=canonical_prefix,
             prompt_token_ids=canonical_prompt_ids,
             token_ids=token_ids,
@@ -202,7 +255,6 @@ async def continue_with_single_steer_candidate_async(
         trigger_type="steer_boundary",
         candidate=steer_candidate,
     )
-    consumed = len(steer_candidate.token_ids)
     updated_prompt_ids = append_prompt_token_ids(
         prompt_token_ids=canonical_prompt_ids,
         continuation_token_ids=tuple(steer_candidate.token_ids),
@@ -215,16 +267,20 @@ async def continue_with_single_steer_candidate_async(
             prompt_token_ids=updated_prompt_ids,
             continuation_token_ids=extra_ids,
         )
-    return DecodeOutcome(
-        event_type="continued",
-        trigger_type=None,
-        entropy_value=None,
-        assistant_prefix=canonical_prefix + steer_text,
-        prompt_token_ids=updated_prompt_ids,
-        token_ids=tuple(token_ids) + tuple(steer_token_ids),
-        token_traces=tuple(token_traces) + tuple(steer_candidate.tokens),
-        generated_tokens=generated_tokens + consumed,
-        stop_reason="",
+    executor._update_request_stream_state_output_ids(
+        request_stream_id=request_stream_id,
+        consumed_output_token_ids=tuple(steer_choice.token_ids or ()),
+    )
+    return _build_steer_continuation_outcome(
+        executor=executor,
+        canonical_prefix=canonical_prefix,
+        updated_prompt_ids=updated_prompt_ids,
+        token_ids=token_ids,
+        token_traces=token_traces,
+        steer_text=steer_text,
+        steer_token_ids=tuple(steer_token_ids),
+        steer_candidate_tokens=tuple(steer_candidate.tokens),
+        generated_tokens=generated_tokens,
     )
 
 
@@ -262,7 +318,6 @@ def resolve_think_close_outcome(
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
-            entropy_value=None,
             assistant_prefix=assistant_prefix,
             prompt_token_ids=prompt_token_ids,
             token_ids=token_ids,
@@ -302,7 +357,6 @@ async def resolve_think_close_outcome_async(
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
-            entropy_value=None,
             assistant_prefix=assistant_prefix,
             prompt_token_ids=prompt_token_ids,
             token_ids=token_ids,
@@ -350,7 +404,6 @@ def continue_after_think_close(
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
-            entropy_value=None,
             assistant_prefix=assistant_prefix,
             prompt_token_ids=prompt_token_ids,
             token_ids=token_ids,
@@ -372,7 +425,6 @@ def continue_after_think_close(
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
-            entropy_value=None,
             assistant_prefix=assistant_prefix,
             prompt_token_ids=prompt_token_ids,
             token_ids=token_ids,
@@ -387,8 +439,6 @@ def continue_after_think_close(
         token_traces=list(token_traces),
         generated_tokens=generated_tokens,
         trigger_steer=False,
-        trigger_entropy=False,
-        entropy_threshold=0.0,
         branch_prob=0.0,
         rng=executor.random,
     )
@@ -397,6 +447,12 @@ def continue_after_think_close(
         current_prompt_token_ids=prompt_token_ids,
         choice=continuation_choice,
         consumed_tokens=consumed_tokens,
+    )
+    executor._update_request_stream_state_output_ids(
+        request_stream_id=request_stream_id,
+        consumed_output_token_ids=tuple(continuation_choice.token_ids or ())[
+            :consumed_tokens
+        ],
     )
     stop_reason = (
         "max_gen_toks_reached"
@@ -428,7 +484,6 @@ async def continue_after_think_close_async(
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
-            entropy_value=None,
             assistant_prefix=assistant_prefix,
             prompt_token_ids=prompt_token_ids,
             token_ids=token_ids,
@@ -450,7 +505,6 @@ async def continue_after_think_close_async(
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
-            entropy_value=None,
             assistant_prefix=assistant_prefix,
             prompt_token_ids=prompt_token_ids,
             token_ids=token_ids,
@@ -465,8 +519,6 @@ async def continue_after_think_close_async(
         token_traces=list(token_traces),
         generated_tokens=generated_tokens,
         trigger_steer=False,
-        trigger_entropy=False,
-        entropy_threshold=0.0,
         branch_prob=0.0,
         rng=executor.random,
     )
@@ -475,6 +527,12 @@ async def continue_after_think_close_async(
         current_prompt_token_ids=prompt_token_ids,
         choice=continuation_choice,
         consumed_tokens=consumed_tokens,
+    )
+    executor._update_request_stream_state_output_ids(
+        request_stream_id=request_stream_id,
+        consumed_output_token_ids=tuple(continuation_choice.token_ids or ())[
+            :consumed_tokens
+        ],
     )
     stop_reason = (
         "max_gen_toks_reached"
@@ -532,7 +590,6 @@ def resolve_steer_length_outcome(
         return DecodeOutcome(
             event_type="trigger",
             trigger_type="steer_boundary",
-            entropy_value=None,
             assistant_prefix=normalized_prefix,
             prompt_token_ids=normalized_prompt_ids,
             token_ids=token_ids,
@@ -561,7 +618,6 @@ def resolve_steer_length_outcome(
     return DecodeOutcome(
         event_type="trigger",
         trigger_type="steer_boundary",
-        entropy_value=None,
         assistant_prefix=forced_prefix,
         prompt_token_ids=forced_prompt_ids,
         token_ids=token_ids,
@@ -601,7 +657,6 @@ async def resolve_steer_length_outcome_async(
         return DecodeOutcome(
             event_type="trigger",
             trigger_type="steer_boundary",
-            entropy_value=None,
             assistant_prefix=normalized_prefix,
             prompt_token_ids=normalized_prompt_ids,
             token_ids=token_ids,
@@ -630,7 +685,6 @@ async def resolve_steer_length_outcome_async(
     return DecodeOutcome(
         event_type="trigger",
         trigger_type="steer_boundary",
-        entropy_value=None,
         assistant_prefix=forced_prefix,
         prompt_token_ids=forced_prompt_ids,
         token_ids=token_ids,

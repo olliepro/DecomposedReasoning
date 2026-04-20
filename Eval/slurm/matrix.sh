@@ -3,6 +3,12 @@ set -euo pipefail
 shopt -s nullglob
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+MATRIX_DRY_RUN="${MATRIX_DRY_RUN:-0}"
+SBATCH_BIN="${SBATCH_BIN:-sbatch}"
+DEFAULT_JOB_TIMESTAMP="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+MATRIX_JOB_TIMESTAMP="${SFT_JOB_TIMESTAMP:-${DEFAULT_JOB_TIMESTAMP}}"
 
 # Backward-compatible behavior:
 # 1) RUN_DIRS (space-delimited) if provided
@@ -46,6 +52,28 @@ if [[ ${#RUN_DIR_PATHS[@]} -eq 0 ]]; then
   exit 1
 fi
 
+discover_checkpoint_paths() {
+  local run_dir_path="$1"
+  PYTHONPATH="${PROJECT_DIR}" "${PYTHON_BIN}" -m eval_runner.checkpoint_sweep \
+    discover \
+    --run-dir "${run_dir_path}"
+}
+
+submit_eval_job() {
+  local export_spec="$1"
+  local job_name="$2"
+  shift 2
+  if [[ "${MATRIX_DRY_RUN}" == "1" ]]; then
+    printf 'DRY_RUN %q --export=%q --job-name %q' "${SBATCH_BIN}" "${export_spec}" "${job_name}"
+    for arg in "$@"; do
+      printf ' %q' "${arg}"
+    done
+    printf '\n'
+    return
+  fi
+  "${SBATCH_BIN}" --export="${export_spec}" --job-name "${job_name}" "$@"
+}
+
 submitted_job_count=0
 for run_dir_path in "${RUN_DIR_PATHS[@]}"; do
   if [[ ! -d "${run_dir_path}" ]]; then
@@ -54,7 +82,10 @@ for run_dir_path in "${RUN_DIR_PATHS[@]}"; do
   fi
 
   mkdir -p "${run_dir_path}/benchmark_evals"
-  checkpoint_paths=( "${run_dir_path}"/checkpoint-*-hf "${run_dir_path}"/final_model-hf )
+  mapfile -t checkpoint_paths < <(discover_checkpoint_paths "${run_dir_path}")
+  run_dir_name="$(basename "${run_dir_path}")"
+  run_group_name="${SFT_WANDB_GROUP:-${run_dir_name}_checkpoint_eval_${MATRIX_JOB_TIMESTAMP}}"
+  export_spec="ALL,SFT_JOB_TIMESTAMP=${MATRIX_JOB_TIMESTAMP},SFT_WANDB_GROUP=${run_group_name},SFT_WANDB_RUN_ID="
 
   valid_checkpoint_count=0
   for checkpoint_path in "${checkpoint_paths[@]}"; do
@@ -63,8 +94,9 @@ for run_dir_path in "${RUN_DIR_PATHS[@]}"; do
     checkpoint_label="$(basename "${checkpoint_path}")"
     for task_name in "${TASK_NAMES[@]}"; do
       output_json="${run_dir_path}/benchmark_evals/${checkpoint_label}_${task_name}.json"
-      sbatch \
-        --job-name "eval-${checkpoint_label}-${task_name}" \
+      submit_eval_job \
+        "${export_spec}" \
+        "eval-${checkpoint_label}-${task_name}" \
         "${SBATCH_SCRIPT}" \
         "${checkpoint_path}" \
         "${CONFIG}" \
@@ -75,8 +107,12 @@ for run_dir_path in "${RUN_DIR_PATHS[@]}"; do
   done
 
   if [[ "${valid_checkpoint_count}" -eq 0 ]]; then
-    echo "No *-hf checkpoints found under: ${run_dir_path}"
+    echo "No raw checkpoint directories found under: ${run_dir_path}"
+    continue
   fi
+
+  echo "Ranking command after jobs finish:"
+  echo "PYTHONPATH=\"${PROJECT_DIR}\" ${PYTHON_BIN} -m eval_runner.checkpoint_sweep rank --run-dir \"${run_dir_path}\""
 done
 
 if [[ "${INCLUDE_BASELINE_MODEL}" == "1" ]]; then
@@ -91,10 +127,13 @@ if [[ "${INCLUDE_BASELINE_MODEL}" == "1" ]]; then
     baseline_output_parent="${RUN_DIR_PATHS[0]}"
   fi
   mkdir -p "${baseline_output_parent}/benchmark_evals_base"
+  baseline_group_name="${SFT_WANDB_GROUP:-$(basename "${baseline_output_parent}")_checkpoint_eval_${MATRIX_JOB_TIMESTAMP}}"
+  baseline_export_spec="ALL,SFT_JOB_TIMESTAMP=${MATRIX_JOB_TIMESTAMP},SFT_WANDB_GROUP=${baseline_group_name},SFT_WANDB_RUN_ID="
   for task_name in "${TASK_NAMES[@]}"; do
     output_json="${baseline_output_parent}/benchmark_evals_base/${BASELINE_LABEL}_${task_name}.json"
-    sbatch \
-      --job-name "eval-${BASELINE_LABEL}-${task_name}" \
+    submit_eval_job \
+      "${baseline_export_spec}" \
+      "eval-${BASELINE_LABEL}-${task_name}" \
       "${SBATCH_SCRIPT}" \
       "${BASELINE_MODEL}" \
       "${CONFIG}" \

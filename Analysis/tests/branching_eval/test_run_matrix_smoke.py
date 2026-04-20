@@ -80,7 +80,7 @@ class FakeRuntimeClient:
             return tuple(
                 _choice(index=index, text=f"cand_{index}") for index in range(n)
             )
-        return (_choice(index=0, text=" final 42"),)
+        return (_choice(index=0, text=" final 42<steer>", finish_reason="stop"),)
 
     async def completions_async(
         self,
@@ -213,7 +213,7 @@ def test_run_matrix_smoke_writes_expected_artifacts(
             ModelSpec(
                 model_id="non_sft",
                 checkpoint_or_repo="fake/checkpoint",
-                trigger_steer_default=False,
+                trigger_steer_default=True,
                 trigger_entropy_default=True,
             ),
         ),
@@ -356,7 +356,7 @@ def test_run_matrix_smoke_writes_epsilon_greedy_artifacts(
             ModelSpec(
                 model_id="non_sft",
                 checkpoint_or_repo="fake/checkpoint",
-                trigger_steer_default=False,
+                trigger_steer_default=True,
                 trigger_entropy_default=True,
             ),
         ),
@@ -516,7 +516,7 @@ def test_branching_scores_leaves_before_rollout_finished(
             ModelSpec(
                 model_id="non_sft",
                 checkpoint_or_repo="fake/checkpoint",
-                trigger_steer_default=False,
+                trigger_steer_default=True,
                 trigger_entropy_default=True,
             ),
         ),
@@ -583,7 +583,9 @@ def test_branching_scores_leaves_before_rollout_finished(
     assert max(leaf_scored_indices) < min(rollout_finished_indices)
 
 
-def _choice(*, index: int, text: str) -> GenerationChoice:
+def _choice(
+    *, index: int, text: str, finish_reason: str = "length"
+) -> GenerationChoice:
     """Build one deterministic completion choice row."""
 
     parsed_token = ParsedToken(
@@ -594,7 +596,7 @@ def _choice(*, index: int, text: str) -> GenerationChoice:
     return GenerationChoice(
         index=index,
         text=text,
-        finish_reason="length",
+        finish_reason=finish_reason,
         stop_reason=None,
         tokens=(parsed_token,),
         prompt_token_ids=(1, 2),
@@ -613,7 +615,7 @@ def test_run_matrix_caps_doc_async_concurrency_to_five(
             ModelSpec(
                 model_id="non_sft",
                 checkpoint_or_repo="fake/checkpoint",
-                trigger_steer_default=False,
+                trigger_steer_default=True,
                 trigger_entropy_default=True,
             ),
         ),

@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=12
-#SBATCH --time=4-00:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
@@ -46,20 +46,6 @@ NUM_PROCESSES="$(echo "${GPU_COUNT_RAW:-}" | grep -oE '[0-9]+' | head -n 1)"
 NUM_PROCESSES="${NUM_PROCESSES:-1}"
 NUM_MACHINES="${SLURM_JOB_NUM_NODES:-1}"
 MACHINE_RANK="${SLURM_NODEID:-0}"
-
-# Mitigate a reproducible NCCL barrier deadlock for 2-GPU ZeRO-2 runs.
-# Users can override any of these by pre-setting env vars at launch time.
-# if [[ "${NUM_PROCESSES}" -eq 2 ]]; then
-#   export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
-#   export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
-#   export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
-#   export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
-#   echo "Applied 2-GPU NCCL stability defaults (override via env):"
-#   echo "  NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE}"
-#   echo "  NCCL_IB_DISABLE=${NCCL_IB_DISABLE}"
-#   echo "  NCCL_CUMEM_ENABLE=${NCCL_CUMEM_ENABLE}"
-#   echo "  TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING}"
-# fi
 
 if [[ ! -f "${RUN_CONFIG}" ]]; then
   echo "Run config not found: ${RUN_CONFIG}"
@@ -148,6 +134,11 @@ RUN_OUTPUT_DIR="$(
 )"
 EVAL_OUTPUT_DIR="${RUN_OUTPUT_DIR}/benchmark_evals"
 mkdir -p "${EVAL_OUTPUT_DIR}"
+SKIP_EVAL="${SKIP_EVAL:-0}"
+if [[ "${SKIP_EVAL}" == "1" ]]; then
+  echo "SKIP_EVAL=1, skipping post-training standalone benchmark eval."
+  exit 0
+fi
 EVAL_LIMIT="${EVAL_LIMIT:-}"
 EVAL_LIMIT_ARGS=()
 if [[ -n "${EVAL_LIMIT}" ]]; then

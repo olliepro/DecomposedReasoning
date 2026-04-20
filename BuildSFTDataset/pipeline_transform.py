@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import random
 import re
 import time
 from pathlib import Path
-from typing import Any, Iterator, cast
+from typing import Any, Callable, Iterator, cast
 
 from google import genai
 from google.genai import types
 from tqdm import tqdm
 
 from pipeline_common import count_jsonl_rows, extract_think_blocks, iter_jsonl, write_jsonl
-from pipeline_types import PromptConfig, ThinkTask, TransformConfig
+from pipeline_types import AsyncTransformResult, PromptConfig, ThinkTask, TransformConfig
 
 
 def clean_model_output(text: str) -> str:
@@ -174,7 +176,7 @@ def build_client(config: TransformConfig) -> genai.Client:
     if config.mode == "gemini":
         return genai.Client(api_key=config.api_key)
 
-    http_options = types.HttpOptions(apiVersion="v1")
+    http_options = types.HttpOptions(api_version="v1")
     if config.mode == "vertex":
         if not config.project_id or not config.location:
             raise SystemExit("--project and --location are required in vertex mode.")
@@ -202,23 +204,96 @@ def call_model(
     Returns:
         Cleaned model output.
     """
+    response = client.models.generate_content(
+        model=config.model_id,
+        contents=user_prompt,
+        config=build_generate_config(config=config, system_prompt=system_prompt),
+    )
+    return clean_model_output(response.text or "")
+
+
+def build_generate_config(
+    config: TransformConfig,
+    system_prompt: str,
+) -> types.GenerateContentConfig:
+    """Build Gemini generation config for sync and async calls.
+
+    Args:
+        config: Transform config.
+        system_prompt: System prompt text.
+
+    Returns:
+        Generation config object.
+    """
     thinking_config = (
-        types.ThinkingConfig(thinking_level=config.thinking_level)
+        types.ThinkingConfig(thinking_level=cast(Any, config.thinking_level))
         if config.thinking_level
         else None
     )
-    gen_config = types.GenerateContentConfig(
+    return types.GenerateContentConfig(
         system_instruction=system_prompt,
         temperature=config.temperature,
         max_output_tokens=config.max_output_tokens,
         thinking_config=thinking_config,
     )
-    response = client.models.generate_content(
+
+
+async def call_model_async(
+    client: Any,
+    config: TransformConfig,
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    """Call async Gemini API and normalize the response text.
+
+    Args:
+        client: GenAI client exposing `aio.models`.
+        config: Transform config.
+        system_prompt: System prompt text.
+        user_prompt: User prompt text.
+
+    Returns:
+        Cleaned model output.
+    """
+    response = await client.aio.models.generate_content(
         model=config.model_id,
         contents=user_prompt,
-        config=gen_config,
+        config=build_generate_config(config=config, system_prompt=system_prompt),
     )
-    return clean_model_output(response.text or "")
+    return clean_model_output(extract_response_text(response=response))
+
+
+def is_retryable_exception(exc: Exception) -> bool:
+    """Return True when an async API error should be retried.
+
+    Args:
+        exc: Raised exception.
+
+    Returns:
+        Retryability decision.
+    """
+    message = str(exc).lower()
+    return any(
+        signature in message
+        for signature in ("429", "rate", "timeout", "deadline", "503", "502", "504")
+    )
+
+
+def compute_retry_sleep_seconds(
+    config: TransformConfig,
+    attempt: int,
+) -> float:
+    """Compute capped exponential backoff with jitter.
+
+    Args:
+        config: Transform config.
+        attempt: 1-indexed retry attempt.
+
+    Returns:
+        Sleep duration in seconds.
+    """
+    exponential = config.retry_sleep_seconds * (2 ** (attempt - 1))
+    return min(exponential, 30.0) + random.random() * 0.5
 
 
 def transform_think_block(
@@ -253,6 +328,42 @@ def transform_think_block(
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             time.sleep(config.retry_sleep_seconds * attempt)
+    raise RuntimeError("Model call failed after retries") from last_error
+
+
+async def transform_prompt_async(
+    client: Any,
+    config: TransformConfig,
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    """Transform one rendered prompt with async retries.
+
+    Args:
+        client: GenAI client exposing `aio.models`.
+        config: Transform config.
+        system_prompt: System prompt text.
+        user_prompt: Rendered user prompt text.
+
+    Returns:
+        Transformed content.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, config.retry_limit + 1):
+        try:
+            return await call_model_async(
+                client=client,
+                config=config,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt >= config.retry_limit or not is_retryable_exception(exc=exc):
+                break
+            await asyncio.sleep(
+                compute_retry_sleep_seconds(config=config, attempt=attempt)
+            )
     raise RuntimeError("Model call failed after retries") from last_error
 
 
@@ -318,6 +429,101 @@ def collect_transform_rows(
         if len(rows) >= max_needed:
             break
     return rows
+
+
+def build_nonbatch_prompts(
+    rows: list[dict[str, object]],
+    user_template: str,
+) -> tuple[list[str], list[str]]:
+    """Render one user prompt and original block for every think block.
+
+    Args:
+        rows: Rows selected for transform.
+        user_template: User prompt template.
+
+    Returns:
+        Rendered prompts and original think blocks aligned with think-block order.
+    """
+    prompts: list[str] = []
+    original_blocks: list[str] = []
+    for row in rows:
+        messages = row.get("messages", [])
+        for message in messages if isinstance(messages, list) else []:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            for block in extract_think_blocks(text=content):
+                prompts.append(
+                    render_user_prompt(template=user_template, think_text=block)
+                )
+                original_blocks.append(block)
+    return prompts, original_blocks
+
+
+async def run_async_transform_prompts(
+    client: Any,
+    model: TransformConfig,
+    system_prompt: str,
+    user_prompts: list[str],
+    original_blocks: list[str],
+) -> AsyncTransformResult:
+    """Transform prompts concurrently with async Gemini calls.
+
+    Args:
+        client: GenAI client exposing `aio.models`.
+        model: Transform config.
+        system_prompt: System prompt text.
+        user_prompts: Rendered prompt list in output order.
+
+    Returns:
+        Outputs aligned with `user_prompts`, plus failure metadata.
+    """
+    outputs = [""] * len(user_prompts)
+    failed_errors: dict[int, str] = {}
+    semaphore = asyncio.Semaphore(model.max_concurrent_requests)
+    progress_bar = tqdm(
+        total=len(user_prompts),
+        desc="Transforming think blocks",
+        unit="block",
+        dynamic_ncols=True,
+    )
+
+    async def _worker(index: int, user_prompt: str) -> None:
+        async with semaphore:
+            try:
+                outputs[index] = await transform_prompt_async(
+                    client=client,
+                    config=model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                )
+            except Exception as exc:  # noqa: BLE001
+                outputs[index] = original_blocks[index]
+                failed_errors[index] = str(exc).replace("\n", " ")[:240]
+        progress_bar.update(1)
+
+    tasks = [
+        asyncio.create_task(_worker(index=index, user_prompt=user_prompt))
+        for index, user_prompt in enumerate(user_prompts)
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        progress_bar.close()
+    failed_indexes = sorted(failed_errors.keys())
+    if failed_indexes:
+        print(
+            "Async transform completed with fallback to original think blocks "
+            f"for {len(failed_indexes)} request(s).",
+            flush=True,
+        )
+    return AsyncTransformResult(
+        outputs=outputs,
+        failed_indexes=failed_indexes,
+        failed_errors=failed_errors,
+    )
 
 
 def load_seen_ids(path: Path) -> set[str]:
@@ -439,7 +645,7 @@ def run_batch_requests(
 
     batch_job = client.batches.create(
         model=resolve_batch_model_id(model_id=config.model_id),
-        src=inline_requests,
+        src=cast(Any, inline_requests),
         config={"display_name": f"build-sft-{int(time.time())}"},
     )
     assert batch_job.name is not None
@@ -447,7 +653,7 @@ def run_batch_requests(
 
     poll_count = 0
     while True:
-        batch_job = client.batches.get(name=batch_job.name)
+        batch_job = client.batches.get(name=cast(str, batch_job.name))
         state_obj = getattr(batch_job, "state", None)
         state_name = getattr(state_obj, "name", str(state_obj))
         poll_count += 1
@@ -589,16 +795,16 @@ def apply_transforms_to_rows(
 
 
 def run_non_batch_transform(
-    client: genai.Client,
+    client: Any,
     config: TransformConfig,
     system_prompt: str,
     user_template: str,
     rows_to_transform: list[dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Transform rows with direct model calls.
+    """Transform rows with concurrent async model calls.
 
     Args:
-        client: GenAI client.
+        client: GenAI client exposing `aio.models`.
         config: Transform config.
         system_prompt: System prompt text.
         user_template: User prompt template.
@@ -607,44 +813,23 @@ def run_non_batch_transform(
     Returns:
         Transformed rows.
     """
-    updated_rows: list[dict[str, object]] = []
-    progress = tqdm(rows_to_transform, desc="Transforming rows", unit="row")
-
-    for row in progress:
-        messages = row.get("messages", [])
-        updated_messages: list[dict[str, object]] = []
-        for message in messages if isinstance(messages, list) else []:
-            if not isinstance(message, dict) or message.get("role") != "assistant":
-                updated_messages.append(message)
-                continue
-            content = message.get("content")
-            if not isinstance(content, str):
-                updated_messages.append(message)
-                continue
-            blocks = extract_think_blocks(text=content)
-            transformed_blocks = [
-                transform_think_block(
-                    client=client,
-                    config=config,
-                    system_prompt=system_prompt,
-                    user_template=user_template,
-                    think_text=block,
-                )
-                for block in blocks
-            ]
-            updated_content = replace_think_blocks(
-                content=content,
-                replacements=iter(transformed_blocks),
-            )
-            updated_message = dict(message)
-            updated_message["content"] = updated_content
-            updated_messages.append(updated_message)
-
-        output_row = dict(row)
-        output_row["messages"] = updated_messages
-        updated_rows.append(output_row)
-
-    return updated_rows
+    user_prompts, original_blocks = build_nonbatch_prompts(
+        rows=rows_to_transform,
+        user_template=user_template,
+    )
+    async_result = asyncio.run(
+        run_async_transform_prompts(
+            client=client,
+            model=config,
+            system_prompt=system_prompt,
+            user_prompts=user_prompts,
+            original_blocks=original_blocks,
+        )
+    )
+    return apply_transforms_to_rows(
+        rows=rows_to_transform,
+        outputs=async_result.outputs,
+    )
 
 
 def write_transformed_rows(

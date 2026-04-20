@@ -123,6 +123,7 @@ def build_test_model() -> TransformConfig:
         temperature=0.0,
         thinking_level="LOW",
         batch=True,
+        max_concurrent_requests=500,
         retry_limit=2,
         retry_sleep_seconds=0.0,
         batch_poll_seconds=0.0,

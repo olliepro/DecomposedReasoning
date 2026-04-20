@@ -1,106 +1,44 @@
-"""Selector execution helpers, embedding cache, and candidate-pool keys."""
+"""Selector execution helpers for branching candidate pools."""
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import json
-import math
+import aiohttp
 import random
 from collections import Counter
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from candidate_clustering import (
-    ClusteringCache,
     DedupItem,
     build_cluster_prompt,
-    cached_or_live_clusters,
     coerce_assignments,
+    parse_clusters_payload,
     parse_dotenv,
+    strip_steer_suffix,
+    validate_clusters_response,
 )
-from branching_eval.config_types import BranchingConfig, DecodingConfig
+from branching_eval.embedding_selection import (
+    openai_diverse_topk_random_ids,
+    openai_diverse_topk_random_ids_async,
+    resolve_openai_api_key,
+)
 from branching_eval.selector_types import SelectionOutcome, SelectorMode, SelectorParams
 from branching_eval.tree_types import CandidatePoolRecord, CandidateRecord
+from io_utils import append_jsonl
+from vllm_client import VllmClient
 
-
-class EmbeddingCache:
-    """Persistent Gemini embedding cache keyed by text hash.
-
-    Args:
-        cache_path: Cache file path.
-        model_name: Gemini embedding model name.
-
-    Returns:
-        Cache helper for embedding lookups.
-    """
-
-    def __init__(self, *, cache_path: Path, model_name: str) -> None:
-        self.cache_path = cache_path
-        self.model_name = model_name
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self.entries = self._load_entries()
-
-    def embeddings_for_texts(
-        self,
-        *,
-        texts: list[str],
-        gemini_api_key: str,
-    ) -> dict[str, tuple[float, ...]]:
-        """Return embeddings for texts using cache and Gemini fallback.
-
-        Args:
-            texts: Input candidate texts.
-            gemini_api_key: Gemini API key.
-
-        Returns:
-            Mapping from text to embedding vector.
-        """
-
-        missing = [
-            text for text in texts if self._cache_key(text=text) not in self.entries
-        ]
-        if missing:
-            self._resolve_missing(missing=missing, gemini_api_key=gemini_api_key)
-        return {text: tuple(self.entries[self._cache_key(text=text)]) for text in texts}
-
-    def _resolve_missing(self, *, missing: list[str], gemini_api_key: str) -> None:
-        from google import genai
-
-        client = genai.Client(api_key=gemini_api_key)
-        for batch in _batch_items(items=missing, batch_size=32):
-            response = client.models.embed_content(
-                model=self.model_name,
-                contents=cast(Any, batch),
-            )
-            vectors = _embedding_vectors_from_response(
-                response=response, expected_size=len(batch)
-            )
-            for text, vector in zip(batch, vectors):
-                self.entries[self._cache_key(text=text)] = list(vector)
-        self._flush()
-
-    def _flush(self) -> None:
-        payload = {"model": self.model_name, "entries": self.entries}
-        self.cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-    def _load_entries(self) -> dict[str, list[float]]:
-        if not self.cache_path.exists():
-            return {}
-        payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            return {}
-        entries = payload.get("entries", {})
-        if not isinstance(entries, dict):
-            return {}
-        return {
-            str(key): [float(value) for value in values]
-            for key, values in entries.items()
-            if isinstance(values, list)
-        }
-
-    def _cache_key(self, *, text: str) -> str:
-        payload = f"embedding\n{self.model_name}\n{text}".encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()
+CLUSTER_PROMPT_MAX_TOKENS = 8192
+CLUSTER_PROMPT_TOP_P = 0.95
+CLUSTER_PROMPT_TOP_LOGPROBS = 0
+CLUSTER_PROMPT_SEED = 0
+CLUSTER_PROMPT_BASE_TEMPERATURE = 0.6
+CLUSTER_PROMPT_TEMPERATURE_STEP = 0.05
+CLUSTER_PROMPT_STOP = ("]}]}",)
+CLUSTER_PROMPT_MAX_ATTEMPTS = 10
+OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_CLUSTER_MODEL = "openai/gpt-oss-20b"
 
 
 def select_candidates_all_modes(
@@ -109,9 +47,11 @@ def select_candidates_all_modes(
     selector_params: SelectorParams,
     selector_modes: tuple[SelectorMode, ...],
     rng: random.Random,
-    cluster_cache: ClusteringCache,
-    embedding_cache: EmbeddingCache,
-    gemini_api_key: str | None,
+    openrouter_api_key: str | None,
+    openai_api_key: str | None = None,
+    cluster_client: VllmClient | None = None,
+    cluster_model_name: str | None = None,
+    cluster_log_path: Path | None = None,
 ) -> tuple[SelectionOutcome, ...]:
     """Compute selection outcomes for requested selector modes.
 
@@ -120,9 +60,11 @@ def select_candidates_all_modes(
         selector_params: Selector parameter bundle.
         selector_modes: Selector modes to execute.
         rng: RNG instance.
-        cluster_cache: Gemini clustering cache.
-        embedding_cache: Gemini embedding cache.
-        gemini_api_key: Gemini API key.
+        openrouter_api_key: OpenRouter API key for clustering selectors.
+        openai_api_key: OpenAI API key for diverse-top-k selector mode.
+        cluster_client: Optional served-model client for cluster prompts.
+        cluster_model_name: Optional served-model name for cluster prompts.
+        cluster_log_path: Optional JSONL debug log for clustering requests.
 
     Returns:
         Selection outcomes in requested-mode order.
@@ -131,24 +73,32 @@ def select_candidates_all_modes(
     require_clusters = any(
         mode in {"cluster_across", "within_cluster"} for mode in selector_modes
     )
-    require_embeddings = any(mode == "embed_diverse" for mode in selector_modes)
-    if (require_clusters or require_embeddings) and not gemini_api_key:
-        raise RuntimeError("Gemini API key required for requested selector modes")
+    require_openai_embeddings = any(
+        mode == "embed_diverse_topk_random" for mode in selector_modes
+    )
+    if require_clusters and not openrouter_api_key:
+        raise RuntimeError("cluster selectors require OPEN_ROUTER_KEY")
+    if require_openai_embeddings and not openai_api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY required for embed_diverse_topk_random selector mode"
+        )
     cluster_assignment = None
     if require_clusters:
-        assert gemini_api_key is not None
+        assert openrouter_api_key is not None
         cluster_assignment = _cluster_assignments(
             pool=pool,
-            gemini_api_key=gemini_api_key,
-            cluster_cache=cluster_cache,
+            rng=rng,
+            openrouter_api_key=openrouter_api_key,
+            cluster_log_path=cluster_log_path,
         )
-    embedding_by_candidate = None
-    if require_embeddings:
-        assert gemini_api_key is not None
-        embedding_by_candidate = _embedding_by_candidate(
+    diverse_topk_random = None
+    if require_openai_embeddings:
+        assert openai_api_key is not None
+        diverse_topk_random = openai_diverse_topk_random_ids(
             pool=pool,
-            embedding_cache=embedding_cache,
-            gemini_api_key=gemini_api_key,
+            branch_count=selector_params.branch_fanout,
+            rng=rng,
+            openai_api_key=openai_api_key,
         )
     return tuple(
         SelectionOutcome(
@@ -159,54 +109,142 @@ def select_candidates_all_modes(
                 selector_params=selector_params,
                 rng=rng,
                 cluster_assignment=cluster_assignment,
-                embedding_by_candidate=embedding_by_candidate,
+                openai_selected_candidate_ids=(
+                    None if diverse_topk_random is None else diverse_topk_random[1]
+                ),
             ),
             cluster_by_candidate_id=cluster_assignment,
-            embedding_by_candidate_id=embedding_by_candidate,
+            shortlist_candidate_ids=_select_shortlist_ids(
+                selector_mode=selector_mode,
+                openai_shortlist_candidate_ids=(
+                    None if diverse_topk_random is None else diverse_topk_random[0]
+                ),
+            ),
         )
         for selector_mode in selector_modes
     )
 
 
-def parse_selection_outcomes_from_cache(
-    *, cached: dict[str, Any]
+async def select_candidates_all_modes_async(
+    *,
+    pool: CandidatePoolRecord,
+    selector_params: SelectorParams,
+    selector_modes: tuple[SelectorMode, ...],
+    rng: random.Random,
+    openrouter_api_key: str | None,
+    openai_api_key: str | None = None,
+    cluster_client: VllmClient | None = None,
+    cluster_model_name: str | None = None,
+    cluster_log_path: Path | None = None,
+    http_session: aiohttp.ClientSession | None = None,
 ) -> tuple[SelectionOutcome, ...]:
-    """Parse serialized selection cache into typed outcomes.
+    """Compute selection outcomes asynchronously for requested selector modes.
 
     Args:
-        cached: Cached selection payload mapping.
+        pool: Candidate pool.
+        selector_params: Selector parameter bundle.
+        selector_modes: Selector modes to execute.
+        rng: RNG instance.
+        openrouter_api_key: OpenRouter API key for clustering selectors.
+        openai_api_key: OpenAI API key for diverse-top-k selector mode.
+        cluster_client: Optional served-model client for cluster prompts.
+        cluster_model_name: Optional served-model name for cluster prompts.
+        cluster_log_path: Optional JSONL debug log for clustering requests.
+        http_session: Optional shared HTTP session reused across selector calls.
 
     Returns:
-        Parsed `SelectionOutcome` rows.
+        Selection outcomes in requested-mode order.
     """
 
-    outcomes: list[SelectionOutcome] = []
-    for selector_mode in sorted(cached):
-        parsed_mode = _coerce_selector_mode(value=selector_mode)
-        if parsed_mode is None:
-            continue
-        payload = cached[selector_mode]
-        if not isinstance(payload, dict):
-            continue
-        selected_ids_raw = payload.get("selected_candidate_ids", [])
-        selected_candidate_ids = tuple(int(item) for item in selected_ids_raw)
-        outcomes.append(
-            SelectionOutcome(
-                selector_mode=parsed_mode,
-                selected_candidate_ids=selected_candidate_ids,
-                cluster_by_candidate_id=_parse_optional_cluster_map(
-                    raw=payload.get("cluster_by_candidate_id")
-                ),
-                embedding_by_candidate_id=_parse_optional_embedding_map(
-                    raw=payload.get("embedding_by_candidate_id")
-                ),
-            )
+    require_clusters = any(
+        mode in {"cluster_across", "within_cluster"} for mode in selector_modes
+    )
+    require_openai_embeddings = any(
+        mode == "embed_diverse_topk_random" for mode in selector_modes
+    )
+    if require_clusters and not openrouter_api_key:
+        raise RuntimeError("cluster selectors require OPEN_ROUTER_KEY")
+    if require_openai_embeddings and not openai_api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY required for embed_diverse_topk_random selector mode"
         )
-    return tuple(outcomes)
+    if http_session is None:
+        async with aiohttp.ClientSession() as owned_session:
+            return await select_candidates_all_modes_async(
+                pool=pool,
+                selector_params=selector_params,
+                selector_modes=selector_modes,
+                rng=rng,
+                openrouter_api_key=openrouter_api_key,
+                openai_api_key=openai_api_key,
+                cluster_client=cluster_client,
+                cluster_model_name=cluster_model_name,
+                cluster_log_path=cluster_log_path,
+                http_session=owned_session,
+            )
+    cluster_assignment = None
+    if require_clusters:
+        assert openrouter_api_key is not None
+        cluster_assignment = await _cluster_assignments_async(
+            pool=pool,
+            rng=rng,
+            openrouter_api_key=openrouter_api_key,
+            cluster_log_path=cluster_log_path,
+            http_session=http_session,
+        )
+    diverse_topk_random = None
+    if require_openai_embeddings:
+        assert openai_api_key is not None
+        diverse_topk_random = await openai_diverse_topk_random_ids_async(
+            pool=pool,
+            branch_count=selector_params.branch_fanout,
+            rng=rng,
+            openai_api_key=openai_api_key,
+            session=http_session,
+        )
+    return tuple(
+        SelectionOutcome(
+            selector_mode=selector_mode,
+            selected_candidate_ids=_select_ids(
+                pool=pool,
+                selector_mode=selector_mode,
+                selector_params=selector_params,
+                rng=rng,
+                cluster_assignment=cluster_assignment,
+                openai_selected_candidate_ids=(
+                    None if diverse_topk_random is None else diverse_topk_random[1]
+                ),
+            ),
+            cluster_by_candidate_id=cluster_assignment,
+            shortlist_candidate_ids=_select_shortlist_ids(
+                selector_mode=selector_mode,
+                openai_shortlist_candidate_ids=(
+                    None if diverse_topk_random is None else diverse_topk_random[0]
+                ),
+            ),
+        )
+        for selector_mode in selector_modes
+    )
 
 
-def resolve_gemini_api_key(*, env_paths: tuple[Path, ...]) -> str | None:
-    """Resolve Gemini API key from env vars or dotenv files.
+def _cluster_attempt_temperature(*, attempt_number: int) -> float:
+    """Return the clustering temperature for a retry attempt.
+
+    Args:
+        attempt_number: One-based retry attempt counter.
+
+    Returns:
+        Temperature for the current attempt.
+    """
+
+    assert attempt_number >= 1, "attempt_number must be one-based"
+    return CLUSTER_PROMPT_BASE_TEMPERATURE + (
+        CLUSTER_PROMPT_TEMPERATURE_STEP * (attempt_number - 1)
+    )
+
+
+def resolve_openrouter_api_key(*, env_paths: tuple[Path, ...]) -> str | None:
+    """Resolve OpenRouter API key from env vars or dotenv files.
 
     Args:
         env_paths: Dotenv paths.
@@ -217,62 +255,15 @@ def resolve_gemini_api_key(*, env_paths: tuple[Path, ...]) -> str | None:
 
     import os
 
-    env_key = (
-        os.getenv("VERTEX_KEY")
-        or os.getenv("GEMINI_API_KEY")
-        or os.getenv("GOOGLE_API_KEY")
-    )
+    env_key = os.getenv("OPEN_ROUTER_KEY")
     if env_key:
         return env_key
     for path in env_paths:
         values = parse_dotenv(path=path)
-        for key in ("VERTEX_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
-            value = values.get(key)
-            if value:
-                return value
+        value = values.get("OPEN_ROUTER_KEY")
+        if value:
+            return value
     return None
-
-
-def build_candidate_pool_cache_key(
-    *,
-    doc_id: int,
-    node_id: str,
-    trigger_type: str,
-    seed: int,
-    model_name: str,
-    decoding: DecodingConfig,
-    branching: BranchingConfig,
-) -> str:
-    """Build stable candidate-pool cache key.
-
-    Args:
-        doc_id: Document id.
-        node_id: Node id.
-        trigger_type: Trigger type.
-        seed: Seed value.
-        model_name: Model name.
-        decoding: Decoding settings.
-        branching: Branching settings.
-
-    Returns:
-        SHA256 cache key.
-    """
-
-    payload = {
-        "doc_id": doc_id,
-        "node_id": node_id,
-        "trigger_type": trigger_type,
-        "seed": seed,
-        "model_name": model_name,
-        "temperature": decoding.temperature,
-        "top_p": decoding.top_p,
-        "max_gen_toks": decoding.max_gen_toks,
-        "num_candidates": branching.num_candidates,
-        "candidate_span_tokens": branching.candidate_span_tokens,
-        "max_steer_tokens": branching.max_steer_tokens,
-    }
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _select_ids(
@@ -282,17 +273,13 @@ def _select_ids(
     selector_params: SelectorParams,
     rng: random.Random,
     cluster_assignment: dict[int, str] | None,
-    embedding_by_candidate: dict[int, tuple[float, ...]] | None,
+    openai_selected_candidate_ids: tuple[int, ...] | None,
 ) -> tuple[int, ...]:
     if selector_mode == "random":
         return _random_ids(pool=pool, max_count=selector_params.branch_fanout, rng=rng)
-    if selector_mode == "embed_diverse":
-        assert embedding_by_candidate is not None, "embedding data required"
-        return _diverse_embedding_ids(
-            embedding_by_candidate=embedding_by_candidate,
-            max_count=selector_params.branch_fanout,
-            rng=rng,
-        )
+    if selector_mode == "embed_diverse_topk_random":
+        assert openai_selected_candidate_ids is not None, "selected ids required"
+        return openai_selected_candidate_ids
     assert cluster_assignment is not None, "cluster assignments required"
     if selector_mode == "cluster_across":
         return _cluster_across_ids(
@@ -310,50 +297,322 @@ def _select_ids(
     )
 
 
+def _select_shortlist_ids(
+    *,
+    selector_mode: SelectorMode,
+    openai_shortlist_candidate_ids: tuple[int, ...] | None,
+) -> tuple[int, ...] | None:
+    """Return shortlist ids for selector modes with pre-selection diagnostics."""
+
+    if selector_mode != "embed_diverse_topk_random":
+        return None
+    assert openai_shortlist_candidate_ids is not None, "shortlist ids required"
+    return openai_shortlist_candidate_ids
+
+
 def _cluster_assignments(
     *,
     pool: CandidatePoolRecord,
-    gemini_api_key: str,
-    cluster_cache: ClusteringCache,
+    rng: random.Random,
+    openrouter_api_key: str,
+    cluster_log_path: Path | None,
 ) -> dict[int, str]:
-    items = _dedup_items(candidates=pool.candidates)
+    items = _dedup_items(candidates=pool.candidates, rng=rng)
     prompt = build_cluster_prompt(
         previous_selected_count=0,
         previous_selected_chain="",
         previous_execution_tail="",
         items=items,
     )
-    clusters = cached_or_live_clusters(
-        cache=cluster_cache,
+    clusters = _live_openrouter_clusters(
+        items=items,
         prompt=prompt,
-        model_id="gemini-3-flash-preview",
-        temperature=0.2,
-        api_key=gemini_api_key,
+        api_key=openrouter_api_key,
+        cluster_log_path=cluster_log_path,
     )
-    cluster_cache.flush()
     assignments = coerce_assignments(items=items, clusters=clusters)
-    cluster_by_text = {item.text: assignments[item.item_id] for item in items}
+    cluster_by_text = {
+        candidate.text: assignments[
+            _item_id_by_clean_text(items=items)[strip_steer_suffix(text=candidate.text)]
+        ]
+        for candidate in pool.candidates
+    }
     return {
         candidate.candidate_id: cluster_by_text.get(candidate.text, "other")
         for candidate in pool.candidates
     }
 
 
-def _embedding_by_candidate(
+async def _cluster_assignments_async(
     *,
     pool: CandidatePoolRecord,
-    embedding_cache: EmbeddingCache,
-    gemini_api_key: str,
-) -> dict[int, tuple[float, ...]]:
-    texts = [candidate.text for candidate in pool.candidates]
-    embeddings_by_text = embedding_cache.embeddings_for_texts(
-        texts=texts,
-        gemini_api_key=gemini_api_key,
+    rng: random.Random,
+    openrouter_api_key: str,
+    cluster_log_path: Path | None,
+    http_session: aiohttp.ClientSession,
+) -> dict[int, str]:
+    """Resolve cluster assignments asynchronously for served-model clustering.
+
+    Args:
+        pool: Candidate pool to cluster.
+        openrouter_api_key: OpenRouter API key for clustering.
+        cluster_log_path: Optional JSONL debug log path.
+
+    Returns:
+        Candidate-id to cluster-name mapping.
+    """
+
+    items = _dedup_items(candidates=pool.candidates, rng=rng)
+    prompt = build_cluster_prompt(
+        previous_selected_count=0,
+        previous_selected_chain="",
+        previous_execution_tail="",
+        items=items,
     )
-    return {
-        candidate.candidate_id: embeddings_by_text[candidate.text]
+    clusters = await _live_openrouter_clusters_async(
+        items=items,
+        prompt=prompt,
+        api_key=openrouter_api_key,
+        cluster_log_path=cluster_log_path,
+        http_session=http_session,
+    )
+    assignments = coerce_assignments(items=items, clusters=clusters)
+    cluster_by_text = {
+        candidate.text: assignments[
+            _item_id_by_clean_text(items=items)[strip_steer_suffix(text=candidate.text)]
+        ]
         for candidate in pool.candidates
     }
+    return {
+        candidate.candidate_id: cluster_by_text.get(candidate.text, "other")
+        for candidate in pool.candidates
+    }
+
+
+def _live_openrouter_clusters(
+    *,
+    items: tuple[DedupItem, ...],
+    prompt: str,
+    api_key: str,
+    cluster_log_path: Path | None,
+) -> list[dict[str, Any]]:
+    """Resolve clusters from one live OpenRouter request sequence."""
+
+    return asyncio.run(
+        _live_openrouter_clusters_sync_async(
+            items=items,
+            prompt=prompt,
+            api_key=api_key,
+            cluster_log_path=cluster_log_path,
+        )
+    )
+
+
+async def _live_openrouter_clusters_sync_async(
+    *,
+    items: tuple[DedupItem, ...],
+    prompt: str,
+    api_key: str,
+    cluster_log_path: Path | None,
+) -> list[dict[str, Any]]:
+    """Resolve clusters with a one-off session for sync entrypoints."""
+
+    async with aiohttp.ClientSession() as session:
+        return await _call_openrouter_clusters_with_retries_async(
+            http_session=session,
+            api_key=api_key,
+            items=items,
+            prompt=prompt,
+            cluster_log_path=cluster_log_path,
+        )
+
+
+async def _live_openrouter_clusters_async(
+    *,
+    items: tuple[DedupItem, ...],
+    prompt: str,
+    api_key: str,
+    cluster_log_path: Path | None,
+    http_session: aiohttp.ClientSession,
+) -> list[dict[str, Any]]:
+    """Resolve clusters from one live async OpenRouter request sequence."""
+
+    return await _call_openrouter_clusters_with_retries_async(
+        api_key=api_key,
+        items=items,
+        prompt=prompt,
+        cluster_log_path=cluster_log_path,
+        http_session=http_session,
+    )
+
+
+async def _call_openrouter_clusters_once_async(
+    *,
+    http_session: aiohttp.ClientSession,
+    api_key: str,
+    items: tuple[DedupItem, ...],
+    prompt: str,
+    attempt_number: int,
+    cluster_log_path: Path | None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Call OpenRouter once and parse cluster JSON assignments.
+
+    Args:
+        api_key: OpenRouter API key.
+        items: Deduplicated prompt items expected in the response.
+        prompt: Cluster prompt text.
+        attempt_number: One-based retry attempt counter.
+        cluster_log_path: Optional JSONL debug log path.
+
+    Returns:
+        Parsed cluster rows and raw response text.
+    """
+
+    attempt_temperature = _cluster_attempt_temperature(attempt_number=attempt_number)
+    payload = {
+        "model": OPENROUTER_CLUSTER_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": attempt_temperature,
+        "top_p": CLUSTER_PROMPT_TOP_P,
+        "max_tokens": CLUSTER_PROMPT_MAX_TOKENS,
+        "reasoning": {"effort": "low"},
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    async with http_session.post(
+        OPENROUTER_CHAT_COMPLETIONS_URL,
+        headers=headers,
+        json=payload,
+    ) as response:
+        response_text = await response.text()
+        if response.status >= 400:
+            raise RuntimeError(f"OpenRouter error {response.status}: {response_text}")
+    response_payload = json.loads(response_text)
+    choices = response_payload.get("choices")
+    assert isinstance(choices, list) and choices, "OpenRouter response missing choices"
+    message = choices[0].get("message", {})
+    assert isinstance(message, dict), "OpenRouter response missing message object"
+    raw_text = str(message.get("content", "") or "")
+    _append_cluster_log(
+        cluster_log_path=cluster_log_path,
+        payload={
+            "event": "attempt_raw_response",
+            "attempt_number": attempt_number,
+            "model_id": OPENROUTER_CLUSTER_MODEL,
+            "item_count": len(items),
+            "temperature": attempt_temperature,
+            "prompt": prompt,
+            "raw_text": raw_text,
+        },
+    )
+    clusters = parse_clusters_payload(raw_text=raw_text)
+    validate_clusters_response(items=items, clusters=clusters)
+    _append_cluster_log(
+        cluster_log_path=cluster_log_path,
+        payload={
+            "event": "attempt_success",
+            "attempt_number": attempt_number,
+            "model_id": OPENROUTER_CLUSTER_MODEL,
+            "item_count": len(items),
+            "assignment_rate": _cluster_assignment_rate(items=items, clusters=clusters),
+        },
+    )
+    return clusters, raw_text
+
+
+async def _call_openrouter_clusters_with_retries_async(
+    *,
+    http_session: aiohttp.ClientSession,
+    api_key: str,
+    items: tuple[DedupItem, ...],
+    prompt: str,
+    cluster_log_path: Path | None,
+) -> list[dict[str, Any]]:
+    """Call OpenRouter with retries for invalid or weak cluster output.
+
+    Args:
+        api_key: OpenRouter API key.
+        items: Deduplicated prompt items expected in the response.
+        prompt: Cluster prompt text.
+        cluster_log_path: Optional JSONL debug log path.
+
+    Returns:
+        Parsed cluster rows from one successful response.
+    """
+
+    last_error: Exception | None = None
+    for attempt_index in range(CLUSTER_PROMPT_MAX_ATTEMPTS):
+        try:
+            clusters, _ = await _call_openrouter_clusters_once_async(
+                http_session=http_session,
+                api_key=api_key,
+                items=items,
+                prompt=prompt,
+                attempt_number=attempt_index + 1,
+                cluster_log_path=cluster_log_path,
+            )
+            return clusters
+        except Exception as error:
+            last_error = error
+            _append_cluster_log(
+                cluster_log_path=cluster_log_path,
+                payload={
+                    "event": "attempt_failure",
+                    "attempt_number": attempt_index + 1,
+                    "model_id": OPENROUTER_CLUSTER_MODEL,
+                    "item_count": len(items),
+                    "error": str(error),
+                },
+            )
+            if attempt_index < (CLUSTER_PROMPT_MAX_ATTEMPTS - 1):
+                await asyncio.sleep(0.35 * (2**attempt_index))
+    assert last_error is not None, "OpenRouter clustering failed without exception"
+    raise last_error
+
+
+def _cluster_assignment_rate(
+    *, items: tuple[DedupItem, ...], clusters: list[dict[str, Any]]
+) -> float:
+    """Compute explicit cluster assignment coverage over deduplicated items.
+
+    Args:
+        items: Deduplicated candidate items in the prompt.
+        clusters: Parsed cluster rows.
+
+    Returns:
+        Fraction of item ids assigned by the cluster response.
+    """
+
+    item_ids = {item.item_id for item in items}
+    if not item_ids:
+        return 0.0
+    assigned_item_ids = {
+        int(member_id)
+        for cluster in clusters
+        for member_id in cluster.get("member_ids", [])
+        if int(member_id) in item_ids
+    }
+    return len(assigned_item_ids) / len(item_ids)
+
+
+def _append_cluster_log(
+    *, cluster_log_path: Path | None, payload: dict[str, Any]
+) -> None:
+    """Append one clustering debug row when logging is enabled.
+
+    Args:
+        cluster_log_path: Optional JSONL log path.
+        payload: Row payload to append.
+
+    Returns:
+        None.
+    """
+
+    if cluster_log_path is None:
+        return
+    append_jsonl(path=cluster_log_path, payload=payload)
 
 
 def _cluster_across_ids(
@@ -413,59 +672,6 @@ def _group_candidates_by_cluster(
     return grouped
 
 
-def _diverse_embedding_ids(
-    *,
-    embedding_by_candidate: dict[int, tuple[float, ...]],
-    max_count: int,
-    rng: random.Random,
-) -> tuple[int, ...]:
-    candidate_ids = sorted(embedding_by_candidate)
-    if len(candidate_ids) <= max_count:
-        return tuple(candidate_ids)
-    selected: list[int] = [rng.choice(candidate_ids)]
-    remaining = [
-        candidate_id for candidate_id in candidate_ids if candidate_id not in selected
-    ]
-    while remaining and len(selected) < max_count:
-        best_candidate = max(
-            remaining,
-            key=lambda candidate_id: _min_distance_to_selected(
-                candidate_id=candidate_id,
-                selected_ids=selected,
-                embedding_by_candidate=embedding_by_candidate,
-            ),
-        )
-        selected.append(best_candidate)
-        remaining.remove(best_candidate)
-    return tuple(selected)
-
-
-def _min_distance_to_selected(
-    *,
-    candidate_id: int,
-    selected_ids: list[int],
-    embedding_by_candidate: dict[int, tuple[float, ...]],
-) -> float:
-    vector = embedding_by_candidate[candidate_id]
-    distances = [
-        _cosine_distance(vector_a=vector, vector_b=embedding_by_candidate[selected_id])
-        for selected_id in selected_ids
-    ]
-    return min(distances) if distances else 0.0
-
-
-def _cosine_distance(
-    *, vector_a: tuple[float, ...], vector_b: tuple[float, ...]
-) -> float:
-    dot_product = sum(a * b for a, b in zip(vector_a, vector_b))
-    norm_a = math.sqrt(sum(a * a for a in vector_a))
-    norm_b = math.sqrt(sum(b * b for b in vector_b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 1.0
-    cosine = dot_product / (norm_a * norm_b)
-    return 1.0 - max(-1.0, min(1.0, cosine))
-
-
 def _random_ids(
     *, pool: CandidatePoolRecord, max_count: int, rng: random.Random
 ) -> tuple[int, ...]:
@@ -475,67 +681,38 @@ def _random_ids(
     return tuple(rng.sample(candidate_ids, k=max_count))
 
 
-def _batch_items(*, items: list[str], batch_size: int) -> list[list[str]]:
-    return [
-        items[index : index + batch_size] for index in range(0, len(items), batch_size)
-    ]
-
-
-def _coerce_selector_mode(*, value: object) -> SelectorMode | None:
-    if value in {"cluster_across", "embed_diverse", "within_cluster", "random"}:
-        return cast(SelectorMode, value)
-    return None
-
-
-def _embedding_vectors_from_response(
-    *, response: Any, expected_size: int
-) -> list[tuple[float, ...]]:
-    raw_embeddings = getattr(response, "embeddings", None)
-    assert isinstance(raw_embeddings, list), "embedding response missing list"
-    assert len(raw_embeddings) == expected_size, "embedding response length mismatch"
-    vectors = [
-        tuple(float(value) for value in getattr(item, "values", []) or [])
-        for item in raw_embeddings
-    ]
-    assert all(vector for vector in vectors), "embedding vectors must be non-empty"
-    return vectors
-
-
-def _dedup_items(*, candidates: tuple[CandidateRecord, ...]) -> tuple[DedupItem, ...]:
-    counts = Counter(candidate.text for candidate in candidates)
-    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+def _dedup_items(
+    *, candidates: tuple[CandidateRecord, ...], rng: random.Random
+) -> tuple[DedupItem, ...]:
+    counts = Counter(
+        strip_steer_suffix(text=candidate.text) for candidate in candidates
+    )
+    ordered = list(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+    rng.shuffle(ordered)
     return tuple(
         DedupItem(item_id=index + 1, text=text, count=count)
         for index, (text, count) in enumerate(ordered)
     )
 
 
-def _parse_optional_cluster_map(*, raw: object) -> dict[int, str] | None:
-    if not isinstance(raw, dict):
-        return None
-    return {int(key): str(value) for key, value in raw.items()}
+def _item_id_by_clean_text(*, items: tuple[DedupItem, ...]) -> dict[str, int]:
+    """Return item-id lookup keyed by cleaned cluster-prompt text.
 
+    Args:
+        items: Deduplicated cleaned prompt items.
 
-def _parse_optional_embedding_map(
-    *, raw: object
-) -> dict[int, tuple[float, ...]] | None:
-    if not isinstance(raw, dict):
-        return None
-    parsed: dict[int, tuple[float, ...]] = {}
-    for key, value in raw.items():
-        if not isinstance(value, (list, tuple)):
-            continue
-        parsed[int(key)] = tuple(float(item) for item in value)
-    return parsed
+    Returns:
+        Mapping from cleaned text to item id.
+    """
+
+    return {item.text: item.item_id for item in items}
 
 
 __all__ = [
-    "EmbeddingCache",
-    "build_candidate_pool_cache_key",
-    "parse_selection_outcomes_from_cache",
-    "resolve_gemini_api_key",
+    "resolve_openai_api_key",
+    "resolve_openrouter_api_key",
     "select_candidates_all_modes",
+    "select_candidates_all_modes_async",
     "_cluster_across_ids",
-    "_diverse_embedding_ids",
     "_within_cluster_ids",
 ]

@@ -11,8 +11,9 @@ models:
 serve:
   host: 127.0.0.1
   base_port: 8020
-  tensor_parallel_size: 1
-  gpu_memory_utilization: 0.9
+  tensor_parallel_size: 2
+  gpu_memory_utilization: 0.85
+  kv_offloading_size_gb: 0.0
   dtype: auto
   scheduling_policy: priority
   trust_remote_code: true
@@ -44,7 +45,6 @@ calibration:
 
 artifacts:
   output_root: output/branching_eval_debug_sft_steer_doc4_tok32k
-  reuse_candidate_pools: true
 
 run_matrix:
   include_baselines: false

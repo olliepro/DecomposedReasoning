@@ -45,7 +45,6 @@ calibration:
 
 artifacts:
   output_root: output/branching_eval
-  reuse_candidate_pools: true
 
 run_matrix:
   include_baselines: true
@@ -53,7 +52,7 @@ run_matrix:
   include_branching: true
   selectors:
     - cluster_across
-    - embed_diverse
+    - embed_diverse_topk_random
     - within_cluster
     - random
   seed_values:

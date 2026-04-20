@@ -1,5 +1,7 @@
 """Unit tests for `eval_runner.run_lm_eval`."""
 
+# pyright: reportMissingImports=false
+
 from __future__ import annotations
 
 import json
@@ -95,6 +97,24 @@ def test_build_model_args_for_vllm_includes_parallel_and_sampling_fields(
     assert model_args["disable_log_stats"] is False
     assert model_args["trust_remote_code"] is True
     assert model_args["think_end_token"] == "</think>"
+
+
+def test_build_model_args_omits_think_end_token_when_disabled(tmp_path: Path) -> None:
+    """Model arg builder should preserve raw thinking traces when token is unset."""
+    model_args = build_model_args(
+        checkpoint_path=tmp_path / "checkpoint-12",
+        config=LmEvalConfig(model_type="vllm", think_end_token=None),
+    )
+    assert "think_end_token" not in model_args
+
+
+def test_build_model_args_preserves_hf_repo_id() -> None:
+    """Repo ids should remain untouched instead of becoming local cwd-relative paths."""
+    model_args = build_model_args(
+        checkpoint_path="allenai/Olmo-3-7B-Think-SFT",
+        config=LmEvalConfig(model_type="vllm"),
+    )
+    assert model_args["pretrained"] == "allenai/Olmo-3-7B-Think-SFT"
 
 
 def test_build_gen_kwargs_uses_temperature_and_top_p() -> None:

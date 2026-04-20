@@ -5,11 +5,18 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import aiohttp
+import pytest
+
 from analysis_types import RunConfig
 from vllm_client import (
+    ChatMessage,
     VllmClient,
+    build_chat_completions_payload,
     build_completions_payload,
     build_detokenize_payload,
+    normalize_vllm_base_url,
+    parse_chat_completions_choices,
     parse_completions_choices,
     parse_detokenize_text,
     parse_tokenize_ids,
@@ -100,6 +107,58 @@ def test_build_completions_payload_for_token_prompt() -> None:
     assert "repetition_penalty" not in payload
 
 
+def test_build_chat_completions_payload_shape() -> None:
+    """Chat payload should include messages and chat logprob settings."""
+
+    payload = build_chat_completions_payload(
+        model="m",
+        messages=(ChatMessage(role="user", content="cluster these"),),
+        temperature=0.2,
+        top_p=0.95,
+        max_tokens=64,
+        n=1,
+        seed=3,
+        stop=None,
+        top_logprobs=5,
+        priority=11,
+        repetition_penalty=1.03,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+    assert payload["messages"] == [{"role": "user", "content": "cluster these"}]
+    assert payload["logprobs"] is True
+    assert payload["top_logprobs"] == 5
+    assert payload["priority"] == 11
+    assert payload["repetition_penalty"] == 1.03
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_parse_chat_completions_choice_with_message_content() -> None:
+    """Chat parser should normalize assistant message content into text."""
+
+    payload = {
+        "prompt_token_ids": [1, 2, 3],
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "stop_reason": None,
+                "message": {"role": "assistant", "content": '{"clusters":[]}'},
+                "token_ids": [10, 11],
+                "logprobs": {
+                    "tokens": ["{", "}"],
+                    "token_logprobs": [-0.1, -0.2],
+                    "top_logprobs": [{"{": -0.1}, {"}": -0.2}],
+                },
+            }
+        ],
+    }
+    choices = parse_chat_completions_choices(response_payload=payload)
+    assert len(choices) == 1
+    assert choices[0].text == '{"clusters":[]}'
+    assert choices[0].prompt_token_ids == (1, 2, 3)
+    assert choices[0].token_ids == (10, 11)
+
+
 def test_parse_tokenize_ids_accepts_standard_key() -> None:
     """Tokenize parser should read token IDs from standard payload key."""
     token_ids = parse_tokenize_ids(response_payload={"token_ids": [1, 3, 5]})
@@ -117,6 +176,20 @@ def test_parse_detokenize_text_accepts_prompt_key() -> None:
     """Detokenize parser should read decoded text from `prompt` field."""
 
     assert parse_detokenize_text(response_payload={"prompt": "abc"}) == "abc"
+
+
+def test_normalize_vllm_base_url_accepts_bare_host_port() -> None:
+    """Bare Ray server addresses should become absolute `/v1` URLs."""
+
+    normalized = normalize_vllm_base_url(base_url="10.8.2.8:42269")
+    assert normalized == "http://10.8.2.8:42269/v1"
+
+
+def test_normalize_vllm_base_url_preserves_existing_v1_url() -> None:
+    """Already-normalized base URLs should pass through unchanged."""
+
+    normalized = normalize_vllm_base_url(base_url="http://127.0.0.1:8000/v1")
+    assert normalized == "http://127.0.0.1:8000/v1"
 
 
 def test_tokenize_posts_to_root_endpoint_only() -> None:
@@ -228,3 +301,168 @@ def test_async_completions_posts_to_v1_endpoint() -> None:
     assert client.paths == ["/completions"]
     assert len(choices) == 1
     assert choices[0].text == "abc"
+
+
+def test_async_post_url_reuses_single_client_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Async HTTP requests should reuse one `aiohttp.ClientSession` per client."""
+
+    session_create_count = 0
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self) -> FakeResponse:
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            _ = exc_type, exc, tb
+
+        async def text(self) -> str:
+            return '{"ok": true}'
+
+    class FakeSession:
+        closed = False
+
+        def __init__(self, *, timeout: Any) -> None:
+            _ = timeout
+
+        def post(self, *, url: str, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+            _ = url, json, headers
+            return FakeResponse()
+
+        async def close(self) -> None:
+            self.closed = True
+
+    def fake_client_session(*, timeout: Any) -> FakeSession:
+        nonlocal session_create_count
+        session_create_count += 1
+        return FakeSession(timeout=timeout)
+
+    monkeypatch.setattr("vllm_client.aiohttp.ClientSession", fake_client_session)
+    client = VllmClient(base_url="http://127.0.0.1:8000/v1")
+
+    async def run_requests() -> None:
+        first = await client._post_url_async(
+            url="http://127.0.0.1:8000/v1/completions",
+            payload={"x": 1},
+        )
+        second = await client._post_url_async(
+            url="http://127.0.0.1:8000/v1/completions",
+            payload={"x": 2},
+        )
+        assert first == {"ok": True}
+        assert second == {"ok": True}
+        await client.close_async()
+
+    asyncio.run(run_requests())
+    assert session_create_count == 1
+
+
+def test_async_post_url_retries_after_connection_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Async HTTP requests should recreate the session after a dropped connection."""
+
+    session_create_count = 0
+    close_count = 0
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self) -> FakeResponse:
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            _ = exc_type, exc, tb
+
+        async def text(self) -> str:
+            return '{"ok": true}'
+
+    class FakeSession:
+        closed = False
+
+        def __init__(self, *, timeout: Any, should_fail: bool) -> None:
+            _ = timeout
+            self.should_fail = should_fail
+
+        def post(
+            self, *, url: str, json: dict[str, Any], headers: dict[str, str]
+        ) -> FakeResponse:
+            _ = url, json, headers
+            if self.should_fail:
+                raise aiohttp.ServerDisconnectedError(message="disconnected")
+            return FakeResponse()
+
+        async def close(self) -> None:
+            nonlocal close_count
+            self.closed = True
+            close_count += 1
+
+    def fake_client_session(*, timeout: Any) -> FakeSession:
+        nonlocal session_create_count
+        session_create_count += 1
+        return FakeSession(timeout=timeout, should_fail=session_create_count == 1)
+
+    monkeypatch.setattr("vllm_client.aiohttp.ClientSession", fake_client_session)
+    client = VllmClient(base_url="http://127.0.0.1:8000/v1")
+
+    async def run_request() -> None:
+        response = await client._post_url_async(
+            url="http://127.0.0.1:8000/v1/completions",
+            payload={"x": 1},
+        )
+        assert response == {"ok": True}
+        await client.close_async()
+
+    asyncio.run(run_request())
+    assert session_create_count == 2
+    assert close_count == 2
+
+
+def test_chat_completions_posts_to_chat_endpoint() -> None:
+    """Chat completions should call `/v1/chat/completions`."""
+
+    class ChatCompletionsClient(VllmClient):
+        def __init__(self) -> None:
+            super().__init__(base_url="http://127.0.0.1:8000/v1")
+            self.paths: list[str] = []
+
+        def _post(self, *, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+            self.paths.append(path)
+            assert payload["messages"] == [{"role": "user", "content": "cluster"}]
+            assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+            assert payload["stop"] == ["]}]}"]
+            assert payload["include_stop_str_in_output"] is True
+            return {
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "stop_reason": None,
+                        "message": {"role": "assistant", "content": '{"clusters":[]}'},
+                        "token_ids": [10],
+                        "logprobs": {
+                            "tokens": ["{"],
+                            "token_logprobs": [-0.1],
+                            "top_logprobs": [{"{": -0.1}],
+                        },
+                    }
+                ]
+            }
+
+    client = ChatCompletionsClient()
+    choices = client.chat_completions(
+        model="m",
+        messages=(ChatMessage(role="user", content="cluster"),),
+        temperature=0.2,
+        top_p=0.95,
+        max_tokens=32,
+        n=1,
+        seed=0,
+        stop=("]}]}",),
+        top_logprobs=2,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+    assert client.paths == ["/chat/completions"]
+    assert len(choices) == 1
+    assert choices[0].text == '{"clusters":[]}'

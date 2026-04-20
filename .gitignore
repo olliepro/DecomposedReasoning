@@ -26,6 +26,7 @@ venv/
 # Generated dataset artifacts
 BuildSFTDataset/output/
 BuildSFTDataset/output_nonbatch5/
+BuildSFTDataset/output_transform*/
 
 # Streamlit cache
 .streamlit/
@@ -37,7 +38,36 @@ wandb/
 slurm-*.out
 Analysis/output/
 Analysis/branching_eval/output/
+Analysis/profiling/*.raw
 Analysis/scripts/_tmp_*.sh
+Analysis/.codex
+Eval/output/
 Eval/benchmark_evals_base/
+BuildRLDataset/.pytest_cache/
+BuildRLDataset/.venv/
+BuildRLDataset/__pycache__/
+BuildRLDataset/tests/__pycache__/
+BuildRLDataset/output/
 SFTTraining/benchmark_evals_base/
+SFTTraining/unsloth_compiled_cache/
+RLTraining/.pytest_cache/
+RLTraining/.venv/
+RLTraining/branching_dapo/__pycache__/
+RLTraining/tests/__pycache__/
+RLTraining/logs/
+RLTraining/outputs/
+RLTraining/wandb/
+RLTraining/verl/.venv/
+RLTraining/verl/verl.egg-info/
+/manual_runs/*/logs/
+/manual_runs/*/__pycache__/
+/.codex
+/outputs/
+/scratch_checkpoints
+/priority_score_violin.png
 logs/
+*.log
+*.yaml
+*.json
+*.sbatch
+*.csv

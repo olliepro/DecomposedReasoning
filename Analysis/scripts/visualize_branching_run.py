@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import time
+from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 
@@ -13,6 +15,7 @@ ANALYSIS_ROOT = Path(__file__).resolve().parents[1]
 if str(ANALYSIS_ROOT) not in sys.path:
     sys.path.insert(0, str(ANALYSIS_ROOT))
 
+from branching_eval.artifact_store import ArtifactStore
 from branching_eval.event_types import EventEnvelope
 
 try:
@@ -30,7 +33,10 @@ try:
         replay_attempts,
         selected_attempts_by_doc,
     )
-    from scripts.visualize_branching_payload import tree_payload_for_attempt
+    from scripts.visualize_branching_payload import (
+        node_detail_payloads_for_attempt,
+        tree_payload_for_attempt,
+    )
     from scripts.visualize_branching_web import wrap_page
 except ModuleNotFoundError:
     from visualize_branching_interactive import (
@@ -47,8 +53,48 @@ except ModuleNotFoundError:
         replay_attempts,
         selected_attempts_by_doc,
     )
-    from visualize_branching_payload import tree_payload_for_attempt
+    from visualize_branching_payload import (
+        node_detail_payloads_for_attempt,
+        tree_payload_for_attempt,
+    )
     from visualize_branching_web import wrap_page
+
+
+@dataclass(frozen=True)
+class ProgressAttemptView:
+    """Lightweight per-doc summary row sourced from progress snapshots."""
+
+    doc_id: int
+    doc_attempt: int
+    task_name: str
+    model_id: str
+    selector_mode: str
+    rollout_mode: str
+    status: str
+    leaf_count: int
+    passrate: float
+    avg_token_length: float
+    correct_count: int
+    incorrect_count: int
+    natural_count: int
+    max_count: int
+    repeating_count: int
+    other_count: int
+    unique_answer_count: int
+    last_update_timestamp: str
+
+    def slug(self) -> str:
+        """Return filesystem-safe page slug for this attempt."""
+
+        return (
+            f"doc_{self.doc_id}_attempt_{self.doc_attempt}_"
+            f"{self.task_name}_{self.model_id}_{self.selector_mode}"
+        ).replace("/", "_")
+
+    def label(self) -> str:
+        """Return concise display label."""
+
+        return f"doc {self.doc_id} · attempt {self.doc_attempt}"
 
 
 def render_attempt_page(
@@ -60,8 +106,20 @@ def render_attempt_page(
 ) -> None:
     """Render one per-attempt HTML page."""
 
-    tree_payload = tree_payload_for_attempt(state=state)
+    detail_base_url = f"data/{state.key.slug()}"
+    tree_payload = tree_payload_for_attempt(
+        state=state,
+        detail_base_url=detail_base_url,
+    )
+    detail_payloads = node_detail_payloads_for_attempt(
+        state=state,
+        detail_base_url=detail_base_url,
+    )
     write_json_atomic(path=graph_path, payload=tree_payload)
+    write_node_detail_payloads(
+        detail_payloads=detail_payloads,
+        detail_dir=graph_path.parent / state.key.slug() / "nodes",
+    )
     title = (
         f"{state.key.label()} · {state.key.task_name} · "
         f"{state.key.model_id} · {state.key.selector_mode}"
@@ -340,7 +398,7 @@ def heatmap_cell_style(*, count: int, max_count: int, verification: int) -> str:
 def status_badge_class(*, status: str) -> str:
     """Return CSS class for attempt status badge."""
 
-    if status == "completed":
+    if status in {"complete", "completed"}:
         return "good"
     if status == "incomplete":
         return "warn"
@@ -362,6 +420,114 @@ def verification_counts_text(*, state: AttemptState) -> str:
     return f"{correct_count}/{incorrect_count}"
 
 
+def progress_verification_counts_text(*, progress: ProgressAttemptView) -> str:
+    """Return `correct/incorrect` text from one progress snapshot."""
+
+    return f"{progress.correct_count}/{progress.incorrect_count}"
+
+
+def progress_finish_reason_text(*, progress: ProgressAttemptView) -> str:
+    """Return a readable finish-reason summary for one progress snapshot.
+
+    Args:
+        progress: Selected progress snapshot row for one doc attempt.
+
+    Returns:
+        Human-readable finish-reason summary for gallery/index display.
+
+    Example:
+        >>> progress_finish_reason_text(progress=ProgressAttemptView(
+        ...     doc_id=0, doc_attempt=0, task_name="a", model_id="m",
+        ...     selector_mode="s", rollout_mode="r", status="complete",
+        ...     leaf_count=4, passrate=0.5, avg_token_length=12.0,
+        ...     correct_count=2, incorrect_count=2,
+        ...     natural_count=1, max_count=2, repeating_count=1,
+        ...     other_count=0, unique_answer_count=3,
+        ...     last_update_timestamp="2026-01-01T00:00:00+00:00",
+        ... ))
+        'mixed(natural=1, max=2, repeating=1)'
+    """
+
+    labeled_counts = [
+        ("natural", progress.natural_count),
+        ("max", progress.max_count),
+        ("repeating", progress.repeating_count),
+        ("other", progress.other_count),
+    ]
+    nonzero_counts = [
+        (label, count) for label, count in labeled_counts if int(count) > 0
+    ]
+    if not nonzero_counts:
+        return "none"
+    if len(nonzero_counts) == 1 and nonzero_counts[0][1] == progress.leaf_count:
+        return nonzero_counts[0][0]
+    detail_text = ", ".join(
+        f"{label}={count}" for label, count in nonzero_counts
+    )
+    return f"mixed({detail_text})"
+
+
+def read_progress_attempts(*, run_dir: Path) -> list[ProgressAttemptView]:
+    """Read compact per-doc progress snapshots for one run."""
+
+    payloads = ArtifactStore(run_dir=run_dir).read_doc_progress_snapshots()
+    attempts: list[ProgressAttemptView] = []
+    for payload in payloads:
+        attempts.append(
+            ProgressAttemptView(
+                doc_id=int(payload.get("doc_id", 0)),
+                doc_attempt=int(payload.get("doc_attempt", 0)),
+                task_name=str(payload.get("task_name", "")),
+                model_id=str(payload.get("model_id", "")),
+                selector_mode=str(payload.get("selector_mode", "")),
+                rollout_mode=str(payload.get("rollout_mode", "")),
+                status=str(payload.get("status", "incomplete")),
+                leaf_count=int(payload.get("leaf_count", 0)),
+                passrate=float(payload.get("passrate", 0.0)),
+                avg_token_length=float(payload.get("avg_token_length", 0.0)),
+                correct_count=int(payload.get("correct_count", 0)),
+                incorrect_count=int(payload.get("incorrect_count", 0)),
+                natural_count=int(payload.get("natural_count", 0)),
+                max_count=int(payload.get("max_count", 0)),
+                repeating_count=int(payload.get("repeating_count", 0)),
+                other_count=int(payload.get("other_count", 0)),
+                unique_answer_count=int(payload.get("unique_answer_count", 0)),
+                last_update_timestamp=str(payload.get("last_update_timestamp", "")),
+            )
+        )
+    return attempts
+
+
+def selected_progress_attempts_by_doc(
+    *, progress_attempts: list[ProgressAttemptView]
+) -> list[ProgressAttemptView]:
+    """Select one preferred progress row per doc.
+
+    Completed attempts win over incomplete attempts. Within the same status
+    bucket, later attempts win.
+    """
+
+    selected_by_doc: dict[int, ProgressAttemptView] = {}
+    for progress in progress_attempts:
+        existing = selected_by_doc.get(progress.doc_id)
+        if existing is None:
+            selected_by_doc[progress.doc_id] = progress
+            continue
+        progress_rank = (
+            1 if progress.status in {"complete", "completed"} else 0,
+            progress.doc_attempt,
+            progress.last_update_timestamp,
+        )
+        existing_rank = (
+            1 if existing.status in {"complete", "completed"} else 0,
+            existing.doc_attempt,
+            existing.last_update_timestamp,
+        )
+        if progress_rank > existing_rank:
+            selected_by_doc[progress.doc_id] = progress
+    return [selected_by_doc[doc_id] for doc_id in sorted(selected_by_doc)]
+
+
 def render_index_page(
     *,
     run_dir: Path,
@@ -369,13 +535,19 @@ def render_index_page(
     events: list[EventEnvelope],
     states: dict[AttemptKey, AttemptState],
     selected_states: list[AttemptState],
+    selected_progress_attempts: list[ProgressAttemptView],
 ) -> None:
     """Render run-level index page linking all replayed attempt pages."""
 
     source_path = str(run_dir / "tree_events.jsonl")
     selected_rows = "".join(
-        index_selected_row_html(state=state) for state in selected_states
+        index_selected_row_html(progress=progress)
+        for progress in selected_progress_attempts
     )
+    if not selected_rows:
+        selected_rows = "".join(
+            index_selected_fallback_row_html(state=state) for state in selected_states
+        )
     if not selected_rows:
         selected_rows = (
             "<tr><td colspan='9'>No completed or partial doc attempts found.</td></tr>"
@@ -399,7 +571,7 @@ def render_index_page(
   <div class="pill-row">
     <span class="pill">events={len(events)}</span>
     <span class="pill">attempts={len(states)}</span>
-    <span class="pill">selected_docs={len(selected_states)}</span>
+    <span class="pill">selected_docs={len(selected_progress_attempts) if selected_progress_attempts else len(selected_states)}</span>
   </div>
   <p style="margin:0.75rem 0 0 0"><a href="gallery.html">Open all selected docs in one page</a></p>
 </section>
@@ -407,7 +579,7 @@ def render_index_page(
   <h2>Default Doc View (Latest Completed Attempt)</h2>
   <table>
     <thead>
-      <tr><th>doc</th><th>attempt</th><th>status</th><th>selector</th><th>nodes</th><th>leaves</th><th>correct/incorrect</th><th>vllm</th><th>view</th></tr>
+      <tr><th>doc</th><th>attempt</th><th>status</th><th>mode</th><th>selector</th><th>passrate</th><th>avg_tok</th><th>correct/incorrect</th><th>unique_answers</th><th>view</th></tr>
     </thead>
     <tbody>{selected_rows}</tbody>
   </table>
@@ -431,31 +603,28 @@ def render_index_page(
     write_text_atomic(path=output_dir / "index.html", text=page)
 
 
-def gallery_card_html(*, state: AttemptState) -> str:
-    """Build one gallery card embedding a selected attempt page.
+def gallery_card_html(*, progress: ProgressAttemptView) -> str:
+    """Build one gallery card using progress snapshots as the summary source."""
 
-    Args:
-        state: Replayed selected-doc attempt state.
-
-    Returns:
-        HTML card string with iframe embed and summary pills.
-    """
-
-    rel_link = f"docs/{state.key.slug()}.html"
-    status = state.status()
-    verification_counts = verification_counts_text(state=state)
+    rel_link = f"docs/{progress.slug()}.html"
+    status = progress.status
+    verification_counts = progress_verification_counts_text(progress=progress)
+    finish_reason_text = progress_finish_reason_text(progress=progress)
     return f"""
 <section class="panel gallery-card">
   <div class="pill-row" style="margin-bottom:0.65rem">
-    <span class="pill {status_badge_class(status=status)}">{escape(state.key.label())}</span>
-    <span class="pill">selector={escape(state.key.selector_mode)}</span>
-    <span class="pill">nodes={len(state.nodes)}</span>
-    <span class="pill">leaves={state.leaf_count()}</span>
+    <span class="pill {status_badge_class(status=status)}">{escape(progress.label())}</span>
+    <span class="pill">mode={escape(progress.rollout_mode)}</span>
+    <span class="pill">selector={escape(progress.selector_mode)}</span>
+    <span class="pill">passrate={escape(_format_metric(progress.passrate))}</span>
+    <span class="pill">avg_tok={escape(_format_metric(progress.avg_token_length))}</span>
+    <span class="pill">leaves={progress.leaf_count}</span>
     <span class="pill">correct/incorrect={verification_counts}</span>
-    <span class="pill">vllm={state.vllm_request_count}/{state.vllm_response_count}</span>
+    <span class="pill">finish={escape(finish_reason_text)}</span>
+    <span class="pill">unique_answers={progress.unique_answer_count}</span>
     <a href="{escape(rel_link)}">open full page</a>
   </div>
-  <iframe class="gallery-frame" src="{escape(rel_link)}" loading="lazy" title="{escape(state.key.label())}"></iframe>
+  <iframe class="gallery-frame" src="{escape(rel_link)}" loading="lazy" title="{escape(progress.label())}"></iframe>
 </section>
 """
 
@@ -464,7 +633,7 @@ def render_gallery_page(
     *,
     run_dir: Path,
     output_dir: Path,
-    selected_states: list[AttemptState],
+    selected_progress_attempts: list[ProgressAttemptView],
 ) -> None:
     """Render one page containing all selected-doc attempt iframes.
 
@@ -478,8 +647,8 @@ def render_gallery_page(
     """
 
     gallery_cards = "".join(
-        gallery_card_html(state=state)
-        for state in sorted(selected_states, key=lambda item: (item.key.doc_id, item.key.doc_attempt))
+        gallery_card_html(progress=progress)
+        for progress in selected_progress_attempts
     )
     if not gallery_cards:
         gallery_cards = (
@@ -494,9 +663,9 @@ def render_gallery_page(
 </style>
 <section class="panel">
   <h1>All Selected Docs: {escape(run_dir.name)}</h1>
-  <p class="muted" style="margin:0.45rem 0 0.9rem 0">Latest completed attempt per doc, embedded in one page.</p>
+  <p class="muted" style="margin:0.45rem 0 0.9rem 0">Gallery summaries come from per-doc progress snapshots.</p>
   <div class="pill-row">
-    <span class="pill">selected_docs={len(selected_states)}</span>
+    <span class="pill">selected_docs={len(selected_progress_attempts)}</span>
   </div>
   <p style="margin:0.75rem 0 0 0"><a href="index.html">Back to run index</a></p>
 </section>
@@ -511,8 +680,30 @@ def render_gallery_page(
     write_text_atomic(path=output_dir / "gallery.html", text=page)
 
 
-def index_selected_row_html(*, state: AttemptState) -> str:
-    """Build one selected-doc row for index page."""
+def index_selected_row_html(*, progress: ProgressAttemptView) -> str:
+    """Build one selected-doc row sourced from a progress snapshot."""
+
+    rel_link = f"docs/{progress.slug()}.html"
+    status = progress.status
+    verification_counts = progress_verification_counts_text(progress=progress)
+    return (
+        "<tr>"
+        f"<td>{progress.doc_id}</td>"
+        f"<td>{progress.doc_attempt}</td>"
+        f"<td><span class='pill {status_badge_class(status=status)}'>{escape(status)}</span></td>"
+        f"<td><code>{escape(progress.rollout_mode)}</code></td>"
+        f"<td><code>{escape(progress.selector_mode)}</code></td>"
+        f"<td>{escape(_format_metric(progress.passrate))}</td>"
+        f"<td>{escape(_format_metric(progress.avg_token_length))}</td>"
+        f"<td>{verification_counts}</td>"
+        f"<td>{progress.unique_answer_count}</td>"
+        f"<td><a href='{escape(rel_link)}'>open</a></td>"
+        "</tr>"
+    )
+
+
+def index_selected_fallback_row_html(*, state: AttemptState) -> str:
+    """Build one selected-doc row from replay state when progress is unavailable."""
 
     rel_link = f"docs/{state.key.slug()}.html"
     status = state.status()
@@ -522,11 +713,12 @@ def index_selected_row_html(*, state: AttemptState) -> str:
         f"<td>{state.key.doc_id}</td>"
         f"<td>{state.key.doc_attempt}</td>"
         f"<td><span class='pill {status_badge_class(status=status)}'>{escape(status)}</span></td>"
+        f"<td><code>unknown</code></td>"
         f"<td><code>{escape(state.key.selector_mode)}</code></td>"
-        f"<td>{len(state.nodes)}</td>"
-        f"<td>{state.leaf_count()}</td>"
+        f"<td>-</td>"
+        f"<td>-</td>"
         f"<td>{verification_counts}</td>"
-        f"<td>{state.vllm_request_count}/{state.vllm_response_count}</td>"
+        f"<td>-</td>"
         f"<td><a href='{escape(rel_link)}'>open</a></td>"
         "</tr>"
     )
@@ -560,6 +752,7 @@ def write_summary_json(
     events: list[EventEnvelope],
     states: dict[AttemptKey, AttemptState],
     selected_states: list[AttemptState],
+    selected_progress_attempts: list[ProgressAttemptView],
 ) -> None:
     """Write machine-readable replay summary JSON."""
 
@@ -567,24 +760,54 @@ def write_summary_json(
         "run_dir": str(run_dir),
         "event_count": len(events),
         "attempt_count": len(states),
-        "selected_doc_count": len(selected_states),
-        "selected_attempts": [
-            {
-                "doc_id": state.key.doc_id,
-                "doc_attempt": state.key.doc_attempt,
-                "task_name": state.key.task_name,
-                "model_id": state.key.model_id,
-                "selector_mode": state.key.selector_mode,
-                "status": state.status(),
-                "leaf_count": state.leaf_count(),
-                "node_count": len(state.nodes),
-                "vllm_request_count": state.vllm_request_count,
-                "vllm_response_count": state.vllm_response_count,
-                "vllm_error_count": state.vllm_error_count,
-                "last_event_index": state.last_event_index,
-            }
-            for state in selected_states
-        ],
+        "selected_doc_count": (
+            len(selected_progress_attempts)
+            if selected_progress_attempts
+            else len(selected_states)
+        ),
+        "selected_attempts": (
+            [
+                {
+                    "doc_id": progress.doc_id,
+                    "doc_attempt": progress.doc_attempt,
+                    "task_name": progress.task_name,
+                    "model_id": progress.model_id,
+                    "selector_mode": progress.selector_mode,
+                    "rollout_mode": progress.rollout_mode,
+                    "status": progress.status,
+                    "leaf_count": progress.leaf_count,
+                    "passrate": progress.passrate,
+                    "avg_token_length": progress.avg_token_length,
+                    "correct_count": progress.correct_count,
+                    "incorrect_count": progress.incorrect_count,
+                    "natural_count": progress.natural_count,
+                    "max_count": progress.max_count,
+                    "repeating_count": progress.repeating_count,
+                    "other_count": progress.other_count,
+                    "unique_answer_count": progress.unique_answer_count,
+                    "last_update_timestamp": progress.last_update_timestamp,
+                }
+                for progress in selected_progress_attempts
+            ]
+            if selected_progress_attempts
+            else [
+                {
+                    "doc_id": state.key.doc_id,
+                    "doc_attempt": state.key.doc_attempt,
+                    "task_name": state.key.task_name,
+                    "model_id": state.key.model_id,
+                    "selector_mode": state.key.selector_mode,
+                    "status": state.status(),
+                    "leaf_count": state.leaf_count(),
+                    "node_count": len(state.nodes),
+                    "vllm_request_count": state.vllm_request_count,
+                    "vllm_response_count": state.vllm_response_count,
+                    "vllm_error_count": state.vllm_error_count,
+                    "last_event_index": state.last_event_index,
+                }
+                for state in selected_states
+            ]
+        ),
     }
     write_text_atomic(
         path=output_dir / "summary.json",
@@ -610,6 +833,22 @@ def write_json_atomic(*, path: Path, payload: dict[str, object]) -> None:
     )
 
 
+def write_node_detail_payloads(
+    *,
+    detail_payloads: dict[str, dict[str, object]],
+    detail_dir: Path,
+) -> None:
+    """Write per-node lazy inspector payload files."""
+
+    if detail_dir.parent.exists():
+        shutil.rmtree(detail_dir.parent)
+    for node_id, payload in detail_payloads.items():
+        write_json_atomic(
+            path=detail_dir / f"{node_id}.json",
+            payload=payload,
+        )
+
+
 def render_snapshot(*, run_dir: Path, output_dir: Path) -> RenderSummary:
     """Render one snapshot from current `tree_events.jsonl` content."""
 
@@ -617,6 +856,10 @@ def render_snapshot(*, run_dir: Path, output_dir: Path) -> RenderSummary:
     events = read_events_lenient(path=events_path)
     states = replay_attempts(events=events)
     selected_states = selected_attempts_by_doc(states=states)
+    progress_attempts = read_progress_attempts(run_dir=run_dir)
+    selected_progress_attempts = selected_progress_attempts_by_doc(
+        progress_attempts=progress_attempts
+    )
     docs_dir = output_dir / "docs"
     graph_dir = docs_dir / "data"
     docs_dir.mkdir(parents=True, exist_ok=True)
@@ -634,11 +877,42 @@ def render_snapshot(*, run_dir: Path, output_dir: Path) -> RenderSummary:
         events=events,
         states=states,
         selected_states=selected_states,
+        selected_progress_attempts=selected_progress_attempts,
     )
     render_gallery_page(
         run_dir=run_dir,
         output_dir=output_dir,
-        selected_states=selected_states,
+        selected_progress_attempts=(
+            selected_progress_attempts
+            if selected_progress_attempts
+            else [
+                ProgressAttemptView(
+                    doc_id=state.key.doc_id,
+                    doc_attempt=state.key.doc_attempt,
+                    task_name=state.key.task_name,
+                    model_id=state.key.model_id,
+                    selector_mode=state.key.selector_mode,
+                    rollout_mode="unknown",
+                    status=state.status(),
+                    leaf_count=state.leaf_count(),
+                    passrate=0.0,
+                    avg_token_length=0.0,
+                    correct_count=sum(
+                        1 for leaf in state.leaves.values() if leaf.verification == 1
+                    ),
+                    incorrect_count=sum(
+                        1 for leaf in state.leaves.values() if leaf.verification == 0
+                    ),
+                    natural_count=0,
+                    max_count=0,
+                    repeating_count=0,
+                    other_count=0,
+                    unique_answer_count=0,
+                    last_update_timestamp=state.last_timestamp_utc or "",
+                )
+                for state in selected_states
+            ]
+        ),
     )
     write_summary_json(
         run_dir=run_dir,
@@ -646,11 +920,16 @@ def render_snapshot(*, run_dir: Path, output_dir: Path) -> RenderSummary:
         events=events,
         states=states,
         selected_states=selected_states,
+        selected_progress_attempts=selected_progress_attempts,
     )
     return RenderSummary(
         event_count=len(events),
         attempt_count=len(states),
-        selected_doc_count=len(selected_states),
+        selected_doc_count=(
+            len(selected_progress_attempts)
+            if selected_progress_attempts
+            else len(selected_states)
+        ),
     )
 
 

@@ -39,8 +39,12 @@ class ModelSpec:
         base_model: Optional base model id for LoRA serving.
         lora_adapter: Optional LoRA adapter directory.
         lora_name: Optional LoRA module alias.
+        base_url: Optional external OpenAI-compatible vLLM base URL (`.../v1`).
+        served_model_name: Optional request-time model name for external serving.
+        clustering_base_url: Optional external base URL for cluster selectors.
+        clustering_served_model_name: Optional request-time model for clustering.
         trigger_steer_default: Enables steer trigger for branching by default.
-        trigger_entropy_default: Enables entropy trigger for branching by default.
+        trigger_entropy_default: Legacy compatibility field ignored by runtime.
 
     Returns:
         Dataclass describing one model input.
@@ -56,8 +60,25 @@ class ModelSpec:
     base_model: str | None = None
     lora_adapter: str | None = None
     lora_name: str | None = None
+    base_url: str | None = None
+    served_model_name: str | None = None
+    clustering_base_url: str | None = None
+    clustering_served_model_name: str | None = None
     trigger_steer_default: bool = False
     trigger_entropy_default: bool = True
+
+    @property
+    def uses_external_server(self) -> bool:
+        """Return whether this spec points at a pre-existing vLLM server.
+
+        Args:
+            None.
+
+        Returns:
+            True when `base_url` is configured.
+        """
+
+        return self.base_url is not None
 
     @property
     def has_lora(self) -> bool:
@@ -98,6 +119,40 @@ class ModelSpec:
         """
 
         assert self.model_id.strip(), "model_id must be non-empty"
+        if self.clustering_base_url is not None:
+            assert (
+                self.clustering_base_url.strip()
+            ), "clustering_base_url must be non-empty when provided"
+            assert self.clustering_base_url.rstrip("/").endswith(
+                "/v1"
+            ), "clustering_base_url must end with /v1"
+            assert (
+                self.clustering_served_model_name is not None
+                and self.clustering_served_model_name.strip()
+            ), "clustering_served_model_name required with clustering_base_url"
+        if self.uses_external_server:
+            assert (
+                self.base_url is not None and self.base_url.strip()
+            ), "base_url must be non-empty when provided"
+            assert self.base_url.rstrip("/").endswith(
+                "/v1"
+            ), "base_url must end with /v1"
+            assert (
+                self.served_model_name is not None and self.served_model_name.strip()
+            ), "served_model_name required with external base_url"
+            assert (
+                self.checkpoint_or_repo is None
+            ), "checkpoint_or_repo must be empty with external base_url"
+            assert (
+                self.base_model is None
+            ), "base_model must be empty with external base_url"
+            assert (
+                self.lora_adapter is None
+            ), "lora_adapter must be empty with external base_url"
+            assert (
+                self.lora_name is None
+            ), "lora_name must be empty with external base_url"
+            return
         has_checkpoint = self.checkpoint_or_repo is not None
         has_lora_fields = self.base_model is not None or self.lora_adapter is not None
         assert (
@@ -163,6 +218,8 @@ class DecodingConfig:
         max_gen_toks: Max completion token budget per rollout.
         top_logprobs: Requested top-logprob alternatives.
         decode_chunk_tokens: Tokens per decode chunk before event re-check.
+        debug_assert_text_token_alignment: Enables expensive tokenizer/text
+            alignment assertions for debug runs.
 
     Returns:
         Dataclass containing generation settings.
@@ -173,6 +230,7 @@ class DecodingConfig:
     max_gen_toks: int = 16384
     top_logprobs: int = 20
     decode_chunk_tokens: int = 512
+    debug_assert_text_token_alignment: bool = False
 
 
 @dataclass(frozen=True)
@@ -182,14 +240,18 @@ class BranchingConfig:
     Args:
         branch_prob: Probability of branching at eligible trigger points.
         max_branch_points_per_rollout: Maximum chosen branch points on one path.
+        max_concurrent_branches: Maximum in-flight decode/expansion tasks shared
+            across active docs in one run.
         num_candidates: Candidate count generated per branch point.
         branch_fanout: Number of selected candidates kept per branch point.
         max_clusters: Max clusters for `cluster_across` selection.
-        candidate_span_tokens: Span used for entropy-trigger candidate generation.
+        candidate_span_tokens: Legacy compatibility field ignored by runtime.
         max_steer_tokens: Max generated tokens for steer-trigger candidates.
         steer_repetition_penalty: Repetition penalty applied to steer-token requests.
-        entropy_threshold: Optional explicit entropy threshold override.
-        entropy_profile_name: Calibration profile key.
+        epsilon_greedy_prob: Probability of one-path exploration at eligible
+            triggers for `epsilon_greedy` runs.
+        entropy_threshold: Legacy compatibility field ignored by runtime.
+        entropy_profile_name: Legacy compatibility field ignored by runtime.
 
     Returns:
         Dataclass with branching behavior controls.
@@ -197,30 +259,16 @@ class BranchingConfig:
 
     branch_prob: float = 0.05
     max_branch_points_per_rollout: int = 2
+    max_concurrent_branches: int = 40
     num_candidates: int = 100
     branch_fanout: int = 4
     max_clusters: int = 4
     candidate_span_tokens: int = 15
     max_steer_tokens: int = 15
     steer_repetition_penalty: float = 1.01
+    epsilon_greedy_prob: float = 0.05
     entropy_threshold: float | None = None
     entropy_profile_name: str = "aime24_default"
-
-
-@dataclass(frozen=True)
-class CalibrationConfig:
-    """Entropy calibration lookup configuration.
-
-    Args:
-        entropy_threshold_path: JSON file with calibrated thresholds.
-
-    Returns:
-        Dataclass describing threshold source.
-    """
-
-    entropy_threshold_path: Path = Path(
-        "branching_eval/calibration/entropy_thresholds.json"
-    )
 
 
 @dataclass(frozen=True)
@@ -229,14 +277,12 @@ class ArtifactConfig:
 
     Args:
         output_root: Root directory for run outputs.
-        reuse_candidate_pools: Reuse persisted candidate pools across reruns.
 
     Returns:
         Dataclass containing output behavior.
     """
 
     output_root: Path = Path("output/branching_eval")
-    reuse_candidate_pools: bool = True
 
 
 @dataclass(frozen=True)
@@ -245,27 +291,34 @@ class RunMatrixConfig:
 
     Args:
         include_baselines: Enables baseline N-rollout runs.
+        include_structured_baselines: Enables steer/exec-structured N-rollout runs
+            without tree branching.
         baseline_rollouts: Baseline rollout count (`N`).
         include_branching: Enables branching runs.
+        include_epsilon_greedy: Enables single-path epsilon-greedy runs.
         selectors: Selector modes executed for branching.
         seed_values: Seeds used for matrix expansion.
         default_limit: Optional doc limit for quick runs.
+        max_concurrent_docs: Maximum in-flight docs per run.
 
     Returns:
         Dataclass controlling matrix expansion.
     """
 
     include_baselines: bool = True
+    include_structured_baselines: bool = False
     baseline_rollouts: int = 16
     include_branching: bool = True
+    include_epsilon_greedy: bool = False
     selectors: tuple[SelectorMode, ...] = (
         "cluster_across",
-        "embed_diverse",
+        "embed_diverse_topk_random",
         "within_cluster",
         "random",
     )
     seed_values: tuple[int, ...] = (1234,)
     default_limit: int | None = None
+    max_concurrent_docs: int = 2
 
 
 @dataclass(frozen=True)
@@ -278,7 +331,6 @@ class BranchingEvalConfig:
         serve: vLLM serving configuration.
         decoding: Shared decoding settings.
         branching: Branching policy settings.
-        calibration: Entropy threshold source config.
         artifacts: Artifact output settings.
         run_matrix: Matrix orchestration settings.
 
@@ -296,7 +348,6 @@ class BranchingEvalConfig:
     serve: ServeConfig = field(default_factory=ServeConfig)
     decoding: DecodingConfig = field(default_factory=DecodingConfig)
     branching: BranchingConfig = field(default_factory=BranchingConfig)
-    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
     run_matrix: RunMatrixConfig = field(default_factory=RunMatrixConfig)
 
@@ -338,9 +389,15 @@ class BranchingEvalConfig:
             self.branching.max_branch_points_per_rollout >= 1
         ), "max_branch_points_per_rollout must be >= 1"
         assert (
+            self.branching.max_concurrent_branches >= 1
+        ), "max_concurrent_branches must be >= 1"
+        assert (
             self.branching.num_candidates >= self.branching.branch_fanout
         ), "num_candidates must be >= branch_fanout"
         assert 0.0 <= self.branching.branch_prob <= 1.0, "branch_prob must be in [0, 1]"
+        assert (
+            0.0 <= self.branching.epsilon_greedy_prob <= 1.0
+        ), "epsilon_greedy_prob must be in [0, 1]"
         assert (
             self.branching.steer_repetition_penalty >= 1.0
         ), "steer_repetition_penalty must be >= 1.0"
@@ -355,12 +412,12 @@ class ExperimentSpec:
     Args:
         task_name: lm_eval task name.
         model_id: Model label from `ModelSpec`.
-        mode: `baseline` or `branching`.
+        mode: `baseline`, `structured_baseline`, `branching`, or `epsilon_greedy`.
         selector: Selector mode for branching runs.
         seed: RNG seed value.
         baseline_rollouts: Baseline rollout count (`N`) for baseline mode.
         trigger_steer: Enables steer trigger.
-        trigger_entropy: Enables entropy trigger.
+        trigger_entropy: Legacy compatibility field ignored by runtime.
 
     Returns:
         Concrete experiment run specification.
@@ -373,7 +430,7 @@ class ExperimentSpec:
     seed: int
     baseline_rollouts: int
     trigger_steer: bool
-    trigger_entropy: bool
+    trigger_entropy: bool = False
 
 
 @dataclass(frozen=True)
@@ -384,7 +441,7 @@ class RuntimeModelConfig:
         model_spec: Source model specification.
         model_name_for_generation: Model name used in generation requests.
         base_url: OpenAI-compatible base URL for this model.
-        server_port: Bound server port.
+        server_port: Bound server port when locally managed, else `None`.
 
     Returns:
         Runtime model connection metadata.
@@ -393,7 +450,7 @@ class RuntimeModelConfig:
     model_spec: ModelSpec
     model_name_for_generation: str
     base_url: str
-    server_port: int
+    server_port: int | None
 
 
 def load_branching_eval_config(*, config_path: Path) -> BranchingEvalConfig:
@@ -418,7 +475,6 @@ def load_branching_eval_config(*, config_path: Path) -> BranchingEvalConfig:
         serve=_parse_serve(payload=payload),
         decoding=_parse_decoding(payload=payload),
         branching=_parse_branching(payload=payload),
-        calibration=_parse_calibration(payload=payload, base_dir=base_dir),
         artifacts=_parse_artifacts(payload=payload, base_dir=base_dir),
         run_matrix=_parse_run_matrix(payload=payload),
     )
@@ -452,8 +508,13 @@ def _parse_models(*, payload: dict[str, Any]) -> tuple[ModelSpec, ...]:
                 base_model=_optional_str(value=row.get("base_model")),
                 lora_adapter=_optional_str(value=row.get("lora_adapter")),
                 lora_name=_optional_str(value=row.get("lora_name")),
+                base_url=_optional_str(value=row.get("base_url")),
+                served_model_name=_optional_str(value=row.get("served_model_name")),
+                clustering_base_url=_optional_str(value=row.get("clustering_base_url")),
+                clustering_served_model_name=_optional_str(
+                    value=row.get("clustering_served_model_name")
+                ),
                 trigger_steer_default=bool(row.get("trigger_steer_default", False)),
-                trigger_entropy_default=bool(row.get("trigger_entropy_default", True)),
             )
         )
     return tuple(parsed)
@@ -471,9 +532,7 @@ def _parse_serve(*, payload: dict[str, Any]) -> ServeConfig:
         dtype=str(serve_payload.get("dtype", "auto")),
         scheduling_policy=str(serve_payload.get("scheduling_policy", "priority")),
         kv_offloading_size_gb=float(serve_payload.get("kv_offloading_size_gb", 64.0)),
-        kv_offloading_backend=str(
-            serve_payload.get("kv_offloading_backend", "native")
-        ),
+        kv_offloading_backend=str(serve_payload.get("kv_offloading_backend", "native")),
         trust_remote_code=bool(serve_payload.get("trust_remote_code", True)),
         max_logprobs=int(serve_payload.get("max_logprobs", 20)),
         startup_timeout_seconds=float(
@@ -493,6 +552,9 @@ def _parse_decoding(*, payload: dict[str, Any]) -> DecodingConfig:
         max_gen_toks=int(decoding_payload.get("max_gen_toks", 16384)),
         top_logprobs=int(decoding_payload.get("top_logprobs", 20)),
         decode_chunk_tokens=int(decoding_payload.get("decode_chunk_tokens", 512)),
+        debug_assert_text_token_alignment=bool(
+            decoding_payload.get("debug_assert_text_token_alignment", False)
+        ),
     )
 
 
@@ -505,39 +567,16 @@ def _parse_branching(*, payload: dict[str, Any]) -> BranchingConfig:
         max_branch_points_per_rollout=int(
             branch_payload.get("max_branch_points_per_rollout", 2)
         ),
+        max_concurrent_branches=int(branch_payload.get("max_concurrent_branches", 20)),
         num_candidates=int(branch_payload.get("num_candidates", 100)),
         branch_fanout=int(branch_payload.get("branch_fanout", 4)),
         max_clusters=int(branch_payload.get("max_clusters", 4)),
-        candidate_span_tokens=int(branch_payload.get("candidate_span_tokens", 15)),
         max_steer_tokens=int(branch_payload.get("max_steer_tokens", 15)),
         steer_repetition_penalty=float(
             branch_payload.get("steer_repetition_penalty", 1.01)
         ),
-        entropy_threshold=_optional_float(
-            value=branch_payload.get("entropy_threshold")
-        ),
-        entropy_profile_name=str(
-            branch_payload.get("entropy_profile_name", "aime24_default")
-        ),
+        epsilon_greedy_prob=float(branch_payload.get("epsilon_greedy_prob", 0.05)),
     )
-
-
-def _parse_calibration(*, payload: dict[str, Any], base_dir: Path) -> CalibrationConfig:
-    calibration_payload = payload.get("calibration", {})
-    if not isinstance(calibration_payload, dict):
-        return CalibrationConfig()
-    raw_path = Path(
-        str(
-            calibration_payload.get(
-                "entropy_threshold_path",
-                "branching_eval/calibration/entropy_thresholds.json",
-            )
-        )
-    )
-    resolved_path = (
-        raw_path if raw_path.is_absolute() else (base_dir / raw_path).resolve()
-    )
-    return CalibrationConfig(entropy_threshold_path=resolved_path)
 
 
 def _parse_artifacts(*, payload: dict[str, Any], base_dir: Path) -> ArtifactConfig:
@@ -548,12 +587,7 @@ def _parse_artifacts(*, payload: dict[str, Any], base_dir: Path) -> ArtifactConf
     output_root = (
         raw_root if raw_root.is_absolute() else (base_dir / raw_root).resolve()
     )
-    return ArtifactConfig(
-        output_root=output_root,
-        reuse_candidate_pools=bool(
-            artifacts_payload.get("reuse_candidate_pools", True)
-        ),
-    )
+    return ArtifactConfig(output_root=output_root)
 
 
 def _parse_run_matrix(*, payload: dict[str, Any]) -> RunMatrixConfig:
@@ -565,11 +599,18 @@ def _parse_run_matrix(*, payload: dict[str, Any]) -> RunMatrixConfig:
     assert isinstance(seed_values_raw, list), "run_matrix.seed_values must be a list"
     return RunMatrixConfig(
         include_baselines=bool(matrix_payload.get("include_baselines", True)),
+        include_structured_baselines=bool(
+            matrix_payload.get("include_structured_baselines", False)
+        ),
         baseline_rollouts=int(matrix_payload.get("baseline_rollouts", 16)),
         include_branching=bool(matrix_payload.get("include_branching", True)),
+        include_epsilon_greedy=bool(
+            matrix_payload.get("include_epsilon_greedy", False)
+        ),
         selectors=selectors,
         seed_values=tuple(int(seed_value) for seed_value in seed_values_raw),
         default_limit=_optional_int(value=matrix_payload.get("default_limit")),
+        max_concurrent_docs=int(matrix_payload.get("max_concurrent_docs", 2)),
     )
 
 
@@ -581,7 +622,7 @@ def _parse_selectors(*, value: object) -> tuple[SelectorMode, ...]:
     for selector in selectors:
         assert selector in {
             "cluster_across",
-            "embed_diverse",
+            "embed_diverse_topk_random",
             "within_cluster",
             "random",
         }

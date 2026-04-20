@@ -37,6 +37,7 @@ STEER_EXEC_PAIR_PATTERN = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 OTHER_CLUSTER_NAME = "other"
+MIN_CLUSTER_ASSIGNMENT_RATE = 0.70
 MODEL_ALIAS_FALLBACKS = {
     "gemini-3-flash": ("gemini-3-flash-preview",),
 }
@@ -637,20 +638,123 @@ def build_cluster_prompt(
     """
 
     lines = [
-        "When asked what to do next in a few words people said these things.",
-        "Cluster them into functionally identical groups.",
-        "Return strict JSON only with this exact shape:",
-        '{"clusters":[{"name":"high_level_group_name","member_ids":[1,2]}]}',
+        "When asked what to do next in a few words, people gave the following responses. Group them into functionally distinct clusters, especially looking for rare or unique clusters, where within each group the target of the action is identical.",
         "",
-        "## Rules",
-        "- use lowercase snake_case names with max 3 words",
-        "- include all ids exactly once across all member_ids",
-        "- do not invent ids",
-        "- if uncertain, place items into other",
-        "- return 1 cluster when there is no functional variety",
-        "- return 3-8 clusters for moderate variety with clear themes",
-        "- return 9-15 clusters for tons of variety",
-        "- avoid overfitting to surface text;  e.g. 2+2=4 shouldn't be clustered with 2+3=5 despite looking similar",
+        "Return strict JSON only with this exact top-level shape:",
+        "",
+        "{",
+        '  "groups":[',
+        '    {"name":"Group Name","key":"short_key"},',
+        "    ...",
+        '    {"name":"other","key":"other"}',
+        "  ],",
+        '  "assignments":{',
+        '    "1":"short_key",',
+        '    "2":"another_key",',
+        "    ...",
+        "  }",
+        "}",
+        "",
+        "Return one complete JSON object only. Do not include any text before or after it.",
+        "",
+        "Rules for the JSON:",
+        "",
+        "* The top-level object must contain exactly two keys: groups and assignments",
+        "* Groups must be a JSON array of group objects",
+        "* Each group object must contain exactly two keys: name and key",
+        "* name must be a clear human-readable label for the group",
+        "* assignments must be a JSON object mapping every id to exactly one group key",
+        "* Every assignment value must match a key present in the groups object",
+        "* Include every id exactly once in assignments",
+        '* Truly ungroupable items can be assigned to the group with key "other" and name "other"',
+        "* Group keys should be short, preferably 1-2 small words, use snake_case",
+        "* Groups should not contain duplicates by key or name",
+        "",
+        "Group guidance:",
+        "",
+        "* Group by functional intent, not surface wording",
+        "* Treat near-synonyms as the same when they imply the same next step",
+        "* Do not create groups just because of single, common verbs. Examine the complex meaning.",
+        "* Keep groups highly distinct from one another (e.g. 2+2=4 shouldnt be grouped with 2+3=5)",
+        "* Avoid overfitting to repeated words",
+        "* If two items sound similar but imply different actions, keep them separate",
+        "* You need enough groups for high coverage.",
+        "* Do not assign to imaginary groups.",
+        "",
+        "Target number of groups:",
+        "",
+        "* Return 1 group if there is no variety and no minority groups",
+        "* Return 2-4 in low variety settings to capture/separate out small interesting minorities",
+        "* Return 5-9 groups for moderate variety with clear themes",
+        "* Return 10-20 groups only if there is substantial functional variety",
+        "",
+        'On average, there are 6-14 groups. There should never be more than 5 items assigned to "other".',
+        "",
+        "Procedure:",
+        "",
+        "1. Think about & decide on the groups, end thinking.",
+        "2. Output the groups array",
+        "3. Then assign every id to exactly one group key",
+        "",
+        "Valid example:",
+        "",
+        "{",
+        '  "groups":[',
+        '    {"name":"Simplify via Factorization","key":"factor"},',
+        '    {"name":"A=5 condition","key":"a5_cond"},',
+        '    {"name":"other","key":"other"}',
+        "  ],",
+        '  "assignments":{',
+        '    "1":"factor",',
+        '    "2":"a5_cond",',
+        '    "3":"other",',
+        '    "4":"factor",',
+        '    "5":"a5_cond"',
+        "  }",
+        "}",
+        "",
+        "Or:",
+        "",
+        "{",
+        '  "groups":[',
+        '    {"name":"Identify or Locate Vertex B","key":"vertex_b"},',
+        '    {"name":"Focus on Inradius","key":"inradius"},',
+        '    {"name":"Consider 1234 Case","key":"1234"},',
+        '    {"name":"other","key":"other"}',
+        "  ],",
+        '  "assignments":{',
+        '    "1":"1234",',
+        '    "2":"vertex_b",',
+        '    "3":"inradius",',
+        '    "4":"1234",',
+        '    "5":"other",',
+        "    ...",
+        '    "93":"1234",',
+        '    "94":"inradius",',
+        '    "95":"1234"',
+        "  }",
+        "}",
+        "",
+        "Another valid example:",
+        "",
+        "{",
+        '  "groups":[',
+        '    {"name":"Define Important Terms","key":"terms"},',
+        '    {"name":"Restate Problem","key":"reflect"},',
+        '    {"name":"Use O1","key":"O1"},',
+        '    {"name":"Use O3","key":"O3"}',
+        "  ],",
+        '  "assignments":{',
+        '    "1":"O1",',
+        '    "2":"reflect",',
+        '    "3":"terms",',
+        '    "4":"reflect",',
+        "    ...",
+        '    "95":"terms"',
+        "  }",
+        "}",
+        "",
+        "Notice how in all of these examples, the most salient features of the groups were the targets of the actions, e.g. the groups were highly specific to the outcome of the action rather than the banal words which are vague. This is because the goal is to identify rare or unique elements in the blob of text.",
     ]
     context_lines: list[str] = []
     if previous_selected_count > 0 and previous_selected_chain:
@@ -719,7 +823,7 @@ def extract_json_text(*, raw_text: str) -> str:
 
 
 def parse_clusters_payload(*, raw_text: str) -> list[dict[str, Any]]:
-    """Parse Gemini JSON response to cluster rows.
+    """Parse cluster JSON response and validate its top-level structure.
 
     Args:
         raw_text: Raw model response text.
@@ -729,9 +833,67 @@ def parse_clusters_payload(*, raw_text: str) -> list[dict[str, Any]]:
     """
 
     payload = json.loads(extract_json_text(raw_text=raw_text))
-    clusters = payload.get("clusters")
-    assert isinstance(clusters, list), "Gemini payload missing clusters list"
-    return [cluster for cluster in clusters if isinstance(cluster, dict)]
+    assert isinstance(payload, dict), "cluster payload must be a JSON object"
+    raw_groups = payload.get("groups")
+    raw_assignments = payload.get("assignments")
+    assert isinstance(raw_groups, list), "cluster payload missing groups list"
+    assert isinstance(raw_assignments, dict), "cluster payload missing assignments map"
+    group_name_by_key: dict[str, str] = {}
+    for group in raw_groups:
+        assert isinstance(group, dict), "group entries must be JSON objects"
+        name = group.get("name")
+        key = group.get("key")
+        assert isinstance(name, str), "group name must be a string"
+        assert isinstance(key, str), "group key must be a string"
+        group_name_by_key[key] = name
+    member_ids_by_key: dict[str, list[int]] = {key: [] for key in group_name_by_key}
+    for raw_item_id, raw_group_key in raw_assignments.items():
+        item_id = parse_optional_int(value=raw_item_id)
+        assert item_id is not None, "assignment ids must be parseable integers"
+        assert isinstance(raw_group_key, str), "assignment group key must be a string"
+        member_ids_by_key.setdefault(raw_group_key, []).append(item_id)
+    parsed_clusters: list[dict[str, Any]] = []
+    for group_key, group_name in group_name_by_key.items():
+        parsed_clusters.append(
+            {
+                "name": group_name,
+                "key": group_key,
+                "member_ids": member_ids_by_key.get(group_key, []),
+            }
+        )
+    return parsed_clusters
+
+
+def validate_clusters_response(
+    *, items: tuple[DedupItem, ...], clusters: list[dict[str, Any]]
+) -> None:
+    """Validate parsed clusters and require strong explicit assignment coverage.
+
+    Args:
+        items: Deduplicated prompt items expected in the response.
+        clusters: Parsed cluster rows.
+
+    Returns:
+        None.
+    """
+
+    valid_ids = {item.item_id for item in items}
+    if not valid_ids:
+        return
+    assigned_ids: set[int] = set()
+    for cluster in clusters:
+        members = cluster.get("member_ids")
+        assert isinstance(members, list), "cluster member_ids must be a list"
+        for value in members:
+            item_id = parse_optional_int(value=value)
+            if item_id is None or item_id not in valid_ids:
+                continue
+            assigned_ids.add(item_id)
+    assignment_rate = len(assigned_ids) / len(valid_ids)
+    assert assignment_rate > MIN_CLUSTER_ASSIGNMENT_RATE, (
+        "cluster assignment rate must be > "
+        f"{MIN_CLUSTER_ASSIGNMENT_RATE:.0%}, got {assignment_rate:.0%}"
+    )
 
 
 def prompt_cache_key(*, model_id: str, temperature: float, prompt: str) -> str:
@@ -823,7 +985,12 @@ def coerce_assignments(
     valid_ids = {item.item_id for item in items}
     assignment: dict[int, str] = {}
     for cluster in clusters:
-        cluster_name = normalize_cluster_name(name=str(cluster.get("name", "")))
+        cluster_key = str(cluster.get("key", "")).strip()
+        cluster_name = (
+            normalize_cluster_name(name=cluster_key)
+            if cluster_key
+            else normalize_cluster_name(name=str(cluster.get("name", "")))
+        )
         members = cluster.get("member_ids", [])
         if not isinstance(members, list):
             continue
@@ -841,7 +1008,12 @@ def coerce_assignments(
 
 
 def call_gemini_once(
-    *, api_key: str, prompt: str, model_id: str, temperature: float
+    *,
+    api_key: str,
+    prompt: str,
+    model_id: str,
+    temperature: float,
+    items: tuple[DedupItem, ...],
 ) -> list[dict[str, Any]]:
     """Call Gemini once and parse cluster JSON.
 
@@ -873,11 +1045,18 @@ def call_gemini_once(
             thinking_config=thinking_config,
         ),
     )
-    return parse_clusters_payload(raw_text=str(getattr(response, "text", "") or ""))
+    clusters = parse_clusters_payload(raw_text=str(getattr(response, "text", "") or ""))
+    validate_clusters_response(items=items, clusters=clusters)
+    return clusters
 
 
 def call_gemini_clusters(
-    *, api_key: str, prompt: str, model_id: str, temperature: float
+    *,
+    api_key: str,
+    prompt: str,
+    model_id: str,
+    temperature: float,
+    items: tuple[DedupItem, ...],
 ) -> list[dict[str, Any]]:
     """Call Gemini with retries and model-alias fallback.
 
@@ -900,6 +1079,7 @@ def call_gemini_clusters(
                     prompt=prompt,
                     model_id=candidate_model_id,
                     temperature=temperature,
+                    items=items,
                 )
             except Exception as error:
                 last_error = error
@@ -916,6 +1096,7 @@ def call_gemini_clusters(
 def cached_or_live_clusters(
     *,
     cache: ClusteringCache | None,
+    items: tuple[DedupItem, ...],
     prompt: str,
     model_id: str,
     temperature: float,
@@ -925,6 +1106,7 @@ def cached_or_live_clusters(
 
     Args:
         cache: Optional clustering cache.
+        items: Deduplicated prompt items expected in the response.
         prompt: Cluster prompt text.
         model_id: Gemini model id.
         temperature: Sampling temperature.
@@ -938,12 +1120,17 @@ def cached_or_live_clusters(
     if cache is not None:
         cached = cache.get(key=key)
         if cached is not None:
-            return cached
+            try:
+                validate_clusters_response(items=items, clusters=cached)
+                return cached
+            except Exception:
+                pass
     clusters = call_gemini_clusters(
         api_key=api_key,
         prompt=prompt,
         model_id=model_id,
         temperature=temperature,
+        items=items,
     )
     if cache is not None:
         cache.set(key=key, clusters=clusters)
@@ -1078,6 +1265,7 @@ def cluster_step_result(
         try:
             clusters = cached_or_live_clusters(
                 cache=cache,
+                items=items,
                 prompt=prompt,
                 model_id=config.gemini_model,
                 temperature=config.temperature,

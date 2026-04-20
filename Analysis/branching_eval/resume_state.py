@@ -676,7 +676,6 @@ def _token_trace_from_row(*, token_index: int, row: dict[str, Any]) -> TokenTrac
         token_text=str(row.get("token_text", "")),
         logprob=float(row.get("selected_logprob", 0.0)),
         probability=float(row.get("selected_probability", 0.0)),
-        entropy=float(row.get("selected_entropy", 0.0)),
     )
 
 

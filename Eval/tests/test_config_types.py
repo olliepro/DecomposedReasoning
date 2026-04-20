@@ -60,6 +60,20 @@ def test_parse_eval_only_config_supports_overrides(tmp_path: Path) -> None:
     assert metadata is None
 
 
+def test_parse_eval_only_config_supports_null_think_end_token(tmp_path: Path) -> None:
+    """Parser should preserve YAML null for raw-thinking sample capture."""
+    config_path = tmp_path / "lm_eval.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"think_end_token": None}),
+        encoding="utf-8",
+    )
+
+    config, metadata = parse_eval_config(config_path=config_path)
+
+    assert config.think_end_token is None
+    assert metadata is None
+
+
 def test_parse_eval_config_rejects_invalid_aime_avg_k(tmp_path: Path) -> None:
     """Parser should reject non-positive `aime_avg_k` values.
 

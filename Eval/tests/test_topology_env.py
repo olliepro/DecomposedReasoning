@@ -180,3 +180,35 @@ def test_has_required_cross_numa_gpu_shape_accepts_two_a100_gpus() -> None:
     assert not topology_env.has_required_cross_numa_gpu_shape(
         gpu_product_names=["NVIDIA A100-SXM4-80GB"]
     )
+
+
+def test_maybe_set_cross_numa_vllm_env_skips_on_quad_partition() -> None:
+    """Quad partition should bypass the cross-NUMA env workaround."""
+    fake_env: dict[str, str] = {}
+    applied, reason = topology_env.maybe_set_cross_numa_vllm_env(
+        model_type="vllm",
+        env=fake_env,
+        topology_text=CROSS_NUMA_TOPOLOGY,
+        gpu_product_names=["NVIDIA A100-SXM4-40GB", "NVIDIA A100-SXM4-40GB"],
+        slurm_partition="quad",
+    )
+
+    assert applied is False
+    assert reason == "partition quad disables cross-NUMA policy"
+    assert fake_env == {}
+
+
+def test_maybe_set_cross_numa_vllm_env_allows_nextgen_partition() -> None:
+    """Nextgen partition should still allow the cross-NUMA workaround."""
+    fake_env: dict[str, str] = {}
+    applied, reason = topology_env.maybe_set_cross_numa_vllm_env(
+        model_type="vllm",
+        env=fake_env,
+        topology_text=CROSS_NUMA_TOPOLOGY,
+        gpu_product_names=["NVIDIA A100-SXM4-40GB", "NVIDIA A100-SXM4-40GB"],
+        slurm_partition="nextgen",
+    )
+
+    assert applied is True
+    assert reason == "cross-NUMA topology detected"
+    assert fake_env["NCCL_P2P_DISABLE"] == "1"

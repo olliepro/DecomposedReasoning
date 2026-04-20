@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from branching_eval.artifact_store import ArtifactStore
+from branching_eval.doc_progress import DocProgressSnapshot
 from branching_eval.event_types import EventContext, parse_event_row
 from scripts.visualize_branching_payload import tree_payload_for_attempt
 from scripts.visualize_branching_replay import AttemptKey, replay_attempts
@@ -173,6 +174,48 @@ def append_finished_attempt_with_custom_leaves(
     )
 
 
+def write_progress_snapshot(
+    *,
+    store: ArtifactStore,
+    doc_id: int,
+    doc_attempt: int,
+    status: str,
+    passrate: float,
+    avg_token_length: float,
+    correct_count: int,
+    incorrect_count: int,
+    natural_count: int,
+    max_count: int,
+    repeating_count: int,
+    unique_answer_count: int,
+) -> None:
+    """Write one compact per-doc progress snapshot for viz summary tests."""
+
+    store.write_doc_progress(
+        snapshot=DocProgressSnapshot(
+            run_id=store.run_id,
+            doc_id=doc_id,
+            doc_attempt=doc_attempt,
+            task_name="aime24",
+            model_id="fake",
+            selector_mode="random",
+            rollout_mode="branching",
+            status=status,
+            leaf_count=correct_count + incorrect_count,
+            passrate=passrate,
+            avg_token_length=avg_token_length,
+            correct_count=correct_count,
+            incorrect_count=incorrect_count,
+            natural_count=natural_count,
+            max_count=max_count,
+            repeating_count=repeating_count,
+            other_count=0,
+            unique_answer_count=unique_answer_count,
+            last_update_timestamp="2026-04-18T12:00:00+00:00",
+        )
+    )
+
+
 def test_event_replay_index_selects_latest_completed_else_partial(
     tmp_path: Path,
 ) -> None:
@@ -185,6 +228,7 @@ def test_event_replay_index_selects_latest_completed_else_partial(
     append_attempt_events(store=store, doc_id=1, doc_attempt=0, finished=False)
     append_attempt_events(store=store, doc_id=2, doc_attempt=0, finished=True)
     append_attempt_events(store=store, doc_id=2, doc_attempt=1, finished=False)
+    store.flush_events()
     summary = render_snapshot(run_dir=run_dir, output_dir=output_dir)
     assert summary.event_count > 0
     assert summary.selected_doc_count == 3
@@ -212,6 +256,7 @@ def test_render_snapshot_tree_payload_is_external_json(tmp_path: Path) -> None:
     output_dir = run_dir / "viz"
     store = ArtifactStore(run_dir=run_dir)
     append_attempt_events(store=store, doc_id=0, doc_attempt=0, finished=True)
+    store.flush_events()
 
     render_snapshot(run_dir=run_dir, output_dir=output_dir)
     doc_paths = sorted((output_dir / "docs").glob("*.html"))
@@ -258,6 +303,124 @@ def test_render_snapshot_tree_payload_is_external_json(tmp_path: Path) -> None:
     assert "branches" in payload
     assert "node_events" in payload
     assert payload["branches"] == []
+    detail_path = payload["nodes"][0]["detail_path"]
+    detail_file = doc_paths[0].parent / detail_path
+    assert detail_file.exists()
+    detail_payload = json.loads(detail_file.read_text(encoding="utf-8"))
+    assert detail_payload["leaves"][0]["text"] == "answer_0_0"
+    leaf_event = payload["node_events"]["node_root"][0]
+    if "details" in leaf_event:
+        assert "text" not in leaf_event["details"]
+
+
+def test_render_snapshot_leaf_detail_reconstructs_steer_text(
+    tmp_path: Path,
+) -> None:
+    """Leaf detail should reconstruct steer-block text without selector duplication."""
+
+    run_dir = tmp_path / "run"
+    output_dir = run_dir / "viz"
+    store = ArtifactStore(run_dir=run_dir)
+    context = EventContext(
+        run_id=store.run_id,
+        doc_id=0,
+        doc_attempt=0,
+        task_name="aime24",
+        model_id="fake",
+        selector_mode="random",
+    )
+    store.append_event(context=context, event_type="doc_started", payload={})
+    store.append_event(
+        context=context,
+        event_type="node_created",
+        payload={
+            "node_id": "node_root",
+            "parent_node_id": None,
+            "branch_points_used": 0,
+        },
+    )
+    store.append_event(
+        context=context,
+        event_type="selector_continued_inline",
+        payload={
+            "node_id": "node_root",
+            "selected_candidate_id": 81,
+            "selected_candidate_text": "Verify provided values</steer",
+        },
+    )
+    store.append_event(
+        context=context,
+        event_type="decode_chunk",
+        payload={
+            "node_id": "node_root",
+            "chunk_text": "<think>\n<steer>",
+            "chunk_token_ids": [1, 2],
+            "generated_tokens_before_chunk": 0,
+            "generated_tokens_after_chunk": 2,
+            "finish_reason": "",
+        },
+    )
+    store.append_event(
+        context=context,
+        event_type="steer_block_generated",
+        payload={
+            "node_id": "node_root",
+            "source": "explicit_stop_nonbranch",
+            "chunk_text": "Verify provided values</steer\n<exec>\n",
+            "chunk_token_ids": [1, 2, 3],
+            "generated_tokens_before_chunk": 0,
+            "generated_tokens_after_chunk": 3,
+            "branching_enabled": True,
+        },
+    )
+    store.append_event(
+        context=context,
+        event_type="decode_chunk",
+        payload={
+            "node_id": "node_root",
+            "chunk_text": "Count partitions",
+            "chunk_token_ids": [4, 5],
+            "generated_tokens_before_chunk": 3,
+            "generated_tokens_after_chunk": 5,
+            "finish_reason": "",
+        },
+    )
+    store.append_event(
+        context=context,
+        event_type="leaf_scored",
+        payload={
+            "leaf_id": "leaf_steer",
+            "node_id": "node_root",
+            "verification": 1,
+            "length_tokens_total": 3,
+            "length_tokens_exec": 3,
+            "stop_reason": "think_end",
+            "task_metrics": {"acc": 1.0},
+            "text_preview": "Verify provided values</steer> <exec> Count partitions",
+        },
+    )
+    store.append_event(
+        context=context,
+        event_type="doc_finished",
+        payload={"status": "completed", "leaf_count": 1, "doc_metrics": {"acc": 1.0}},
+    )
+    store.flush_events()
+
+    render_snapshot(run_dir=run_dir, output_dir=output_dir)
+    doc_path = next((output_dir / "docs").glob("*.html"))
+    html = doc_path.read_text(encoding="utf-8")
+    graph_match = re.search(r'data-graph-path="([^"]+)"', html)
+    assert graph_match is not None
+    graph_rel_path = graph_match.group(1)
+    graph_path = doc_path.parent / graph_rel_path
+    payload = json.loads(graph_path.read_text(encoding="utf-8"))
+    root_row = next(row for row in payload["nodes"] if row["node_id"] == "node_root")
+    detail_file = doc_path.parent / root_row["detail_path"]
+    detail_payload = json.loads(detail_file.read_text(encoding="utf-8"))
+    leaf_text = detail_payload["leaves"][0]["text"]
+    assert leaf_text.startswith("<think>\n<steer>Verify provided values</steer>\n")
+    assert "<exec>\nCount partitions" in leaf_text
+    assert leaf_text.count("Verify provided values") == 1
 
 
 def test_render_snapshot_scored_leaf_table_sorts_and_renders_heatmap(
@@ -273,6 +436,7 @@ def test_render_snapshot_scored_leaf_table_sorts_and_renders_heatmap(
         doc_id=0,
         doc_attempt=0,
     )
+    store.flush_events()
 
     render_snapshot(run_dir=run_dir, output_dir=output_dir)
     doc_paths = sorted((output_dir / "docs").glob("*.html"))
@@ -340,6 +504,42 @@ def test_follow_mode_rerenders_after_append(tmp_path: Path) -> None:
     summary_payload = json.loads((output_dir / "summary.json").read_text())
     assert summary_payload["event_count"] >= 5
     assert summary_payload["selected_doc_count"] == 2
+
+
+def test_render_snapshot_prefers_progress_snapshots_for_gallery_summary(
+    tmp_path: Path,
+) -> None:
+    """Gallery and summary JSON should use progress snapshots when present."""
+
+    run_dir = tmp_path / "run"
+    output_dir = run_dir / "viz"
+    store = ArtifactStore(run_dir=run_dir)
+    append_attempt_events(store=store, doc_id=0, doc_attempt=0, finished=True)
+    write_progress_snapshot(
+        store=store,
+        doc_id=0,
+        doc_attempt=0,
+        status="complete",
+        passrate=0.75,
+        avg_token_length=17.5,
+        correct_count=3,
+        incorrect_count=1,
+        natural_count=1,
+        max_count=2,
+        repeating_count=1,
+        unique_answer_count=4,
+    )
+
+    render_snapshot(run_dir=run_dir, output_dir=output_dir)
+    summary_payload = json.loads((output_dir / "summary.json").read_text())
+    selected = summary_payload["selected_attempts"][0]
+    assert selected["status"] == "complete"
+    assert float(selected["passrate"]) == 0.75
+    assert int(selected["unique_answer_count"]) == 4
+    gallery_html = (output_dir / "gallery.html").read_text(encoding="utf-8")
+    assert "passrate=0.75" in gallery_html
+    assert "finish=mixed(natural=1, max=2, repeating=1)" in gallery_html
+    assert "unique_answers=4" in gallery_html
 
 
 def test_resume_gap_is_removed_from_time_axis() -> None:

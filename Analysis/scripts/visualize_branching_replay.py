@@ -9,12 +9,14 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import re
 
 ANALYSIS_ROOT = Path(__file__).resolve().parents[1]
 if str(ANALYSIS_ROOT) not in sys.path:
     sys.path.insert(0, str(ANALYSIS_ROOT))
 
 from branching_eval.event_types import EventEnvelope, parse_event_row
+from branching_eval.steer_normalization import normalize_steer_exec_chunk_text
 
 
 @dataclass(frozen=True)
@@ -313,14 +315,16 @@ def apply_event_to_attempt(*, state: AttemptState, event: EventEnvelope) -> None
     if event_type == "decode_chunk":
         _apply_decode_chunk_event(state=state, event=event)
         return
+    if event_type == "steer_block_generated":
+        _apply_steer_block_generated_event(state=state, event=event)
+        return
     if event_type in {"trigger_fired", "trigger_skipped_max_branch_points"}:
         _apply_trigger_event(state=state, event=event)
         return
-    if event_type in {
-        "candidate_pool_resolved",
-        "selector_applied",
-        "selector_continued_inline",
-    }:
+    if event_type in {"candidate_pool_resolved", "selector_applied"}:
+        _apply_node_marker_event(state=state, event=event)
+        return
+    if event_type == "selector_continued_inline":
         _apply_node_marker_event(state=state, event=event)
         return
     if event_type == "leaf_completed":
@@ -457,6 +461,21 @@ def _apply_decode_chunk_event(*, state: AttemptState, event: EventEnvelope) -> N
     mark_node_event_touch(state=state, node_id=node_id, event=event)
 
 
+def _apply_steer_block_generated_event(
+    *, state: AttemptState, event: EventEnvelope
+) -> None:
+    """Replay one logged steer-generated chunk into node text state."""
+
+    _append_node_prefix_text(
+        state=state,
+        node_id=str(event.payload.get("node_id", "")),
+        text_delta=_normalize_steer_chunk_text(
+            text=str(event.payload.get("chunk_text", ""))
+        ),
+        event=event,
+    )
+
+
 def _apply_trigger_event(*, state: AttemptState, event: EventEnvelope) -> None:
     payload = event.payload
     node_id = str(payload.get("node_id", ""))
@@ -491,6 +510,42 @@ def _apply_node_marker_event(*, state: AttemptState, event: EventEnvelope) -> No
     if not node_id:
         return
     mark_node_event_touch(state=state, node_id=node_id, event=event)
+
+
+def _append_node_prefix_text(
+    *,
+    state: AttemptState,
+    node_id: str,
+    text_delta: str,
+    event: EventEnvelope,
+) -> None:
+    """Append one text delta to replayed node prefix state and mark activity."""
+
+    if not node_id:
+        return
+    existing_node = state.nodes.get(node_id)
+    if existing_node is None:
+        state.nodes[node_id] = NodeView(
+            node_id=node_id,
+            parent_node_id=None,
+            branch_points_used=0,
+            assistant_prefix=text_delta,
+        )
+    else:
+        state.nodes[node_id] = NodeView(
+            node_id=existing_node.node_id,
+            parent_node_id=existing_node.parent_node_id,
+            branch_points_used=existing_node.branch_points_used,
+            assistant_prefix=existing_node.assistant_prefix + text_delta,
+        )
+    mark_node_event_touch(state=state, node_id=node_id, event=event)
+
+
+def _normalize_steer_chunk_text(*, text: str) -> str:
+    """Repair compact steer-block text before replay appends it to a node."""
+
+    repaired_text = STEER_PARTIAL_CLOSE_PATTERN.sub("</steer>", str(text))
+    return normalize_steer_exec_chunk_text(text=repaired_text)
 
 
 def _apply_leaf_completed_event(*, state: AttemptState, event: EventEnvelope) -> None:
@@ -549,7 +604,9 @@ def _apply_leaf_scored_event(*, state: AttemptState, event: EventEnvelope) -> No
             state=state,
             leaf_id=leaf_id,
             node_id=str(payload.get("node_id", "")),
-            fallback_text=str(payload.get("text_preview", "")),
+            fallback_text=str(
+                payload.get("text_preview", payload.get("text", ""))
+            ),
         ),
         verification=(
             int(payload["verification"])
@@ -715,3 +772,7 @@ def selected_attempts_by_doc(
             continue
         selected.append(rows[-1])
     return selected
+STEER_PARTIAL_CLOSE_PATTERN = re.compile(
+    r"</steer(?=(?:\s|$|<))",
+    flags=re.IGNORECASE,
+)

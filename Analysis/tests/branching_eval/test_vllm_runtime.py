@@ -152,3 +152,56 @@ def test_managed_server_starts_and_stops_once(monkeypatch, tmp_path: Path) -> No
 
     assert started_ports == [8020]
     assert stopped_ports == [8020]
+
+
+def test_resolve_generation_model_name_for_external_server() -> None:
+    """External model specs should use explicit served model name."""
+
+    model_spec = ModelSpec(
+        model_id="remote",
+        base_url="http://127.0.0.1:8020/v1",
+        served_model_name="served-qwen",
+    )
+    assert resolve_generation_model_name(model_spec=model_spec) == "served-qwen"
+
+
+def test_managed_server_uses_existing_server_without_stop(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """External server specs should skip local launch and shutdown."""
+
+    model_spec = ModelSpec(
+        model_id="remote",
+        base_url="http://127.0.0.1:8020/v1",
+        served_model_name="served-qwen",
+    )
+    serve_config = ServeConfig()
+    waited_base_urls: list[str] = []
+
+    def fake_wait_existing(
+        *, base_url: str, timeout_seconds: float, poll_interval_seconds: float
+    ) -> None:
+        _ = timeout_seconds, poll_interval_seconds
+        waited_base_urls.append(base_url)
+
+    def fail_start(**_: object) -> RunningVllmServer:
+        raise AssertionError("external server should not call start_vllm_server")
+
+    monkeypatch.setattr(
+        "branching_eval.vllm_runtime.wait_for_existing_server", fake_wait_existing
+    )
+    monkeypatch.setattr("branching_eval.vllm_runtime.start_vllm_server", fail_start)
+
+    with managed_vllm_server(
+        model_spec=model_spec,
+        serve_config=serve_config,
+        port=8020,
+        log_dir=tmp_path,
+    ) as running:
+        assert running.base_url == "http://127.0.0.1:8020/v1"
+        assert running.model_name_for_generation == "served-qwen"
+        assert running.port is None
+        assert running.command == ()
+        assert running.process is None
+
+    assert waited_base_urls == ["http://127.0.0.1:8020/v1"]

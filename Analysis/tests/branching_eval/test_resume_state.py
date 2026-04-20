@@ -25,7 +25,7 @@ def _context(*, store: ArtifactStore, doc_id: int, doc_attempt: int) -> EventCon
 def test_resume_replay_reconstructs_partial_frontier(tmp_path: Path) -> None:
     """Replay should reconstruct child frontier state for incomplete attempt."""
 
-    store = ArtifactStore(run_dir=tmp_path / "run", reuse_candidate_pools=False)
+    store = ArtifactStore(run_dir=tmp_path / "run")
     context = _context(store=store, doc_id=0, doc_attempt=0)
     store.append_event(context=context, event_type="doc_started", payload={})
     store.append_event(
@@ -97,7 +97,7 @@ def test_resume_replay_reconstructs_partial_frontier(tmp_path: Path) -> None:
 def test_resume_replay_tracks_pre_scored_leaves(tmp_path: Path) -> None:
     """Replay should expose pre-scored leaves for duplicate-score suppression."""
 
-    store = ArtifactStore(run_dir=tmp_path / "run", reuse_candidate_pools=False)
+    store = ArtifactStore(run_dir=tmp_path / "run")
     context = _context(store=store, doc_id=1, doc_attempt=0)
     store.append_event(context=context, event_type="doc_started", payload={})
     store.append_event(

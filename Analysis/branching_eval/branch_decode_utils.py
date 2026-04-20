@@ -11,7 +11,7 @@ from branching_eval.legacy_steer_rollout import STEER_CLOSE_TAG
 from branching_eval.runtime_types import DecodeOutcome
 from branching_eval.selector_types import SelectionOutcome, SelectorMode
 from branching_eval.tree_types import CandidatePoolRecord, CandidateRecord, TokenTrace
-from token_metrics import approximate_entropy
+from token_metrics import probability_from_logprob
 from vllm_client import GenerationChoice, ParsedToken
 
 STEER_BOUNDARY_PATTERN = re.compile(r"<steer>$", flags=re.IGNORECASE)
@@ -429,8 +429,6 @@ def consume_choice_tokens(
     token_traces: list[TokenTrace],
     generated_tokens: int,
     trigger_steer: bool,
-    trigger_entropy: bool,
-    entropy_threshold: float,
     branch_prob: float,
     rng: random.Random,
 ) -> DecodeOutcome:
@@ -443,8 +441,6 @@ def consume_choice_tokens(
         token_traces: Existing token traces.
         generated_tokens: Existing generated token count.
         trigger_steer: Whether steer-boundary trigger is enabled.
-        trigger_entropy: Whether entropy trigger is enabled.
-        entropy_threshold: Entropy trigger threshold.
         branch_prob: Branching probability at eligible trigger points.
         rng: RNG used for branch-probability sampling.
 
@@ -473,17 +469,13 @@ def consume_choice_tokens(
         updated_token_ids.append(token_id if token_id is not None else -1)
         generated += 1
         steer_trigger = trigger_steer and has_steer_boundary(text=updated_prefix)
-        entropy_trigger = trigger_entropy and token_trace.entropy > entropy_threshold
-        if not (steer_trigger or entropy_trigger):
+        if not steer_trigger:
             continue
         if rng.random() > branch_prob:
             continue
-        trigger_type = "steer_boundary" if steer_trigger else "high_entropy"
-        entropy_value = None if steer_trigger else token_trace.entropy
         return DecodeOutcome(
             event_type="trigger",
-            trigger_type=trigger_type,
-            entropy_value=entropy_value,
+            trigger_type="steer_boundary",
             assistant_prefix=updated_prefix,
             prompt_token_ids=None,
             token_ids=tuple(updated_token_ids),
@@ -494,7 +486,6 @@ def consume_choice_tokens(
     return DecodeOutcome(
         event_type="terminated",
         trigger_type=None,
-        entropy_value=None,
         assistant_prefix=updated_prefix,
         prompt_token_ids=None,
         token_ids=tuple(updated_token_ids),
@@ -515,21 +506,15 @@ def trace_from_parsed_token(
         token_id: Token id when available.
 
     Returns:
-        Token trace row with probability and entropy estimates.
+        Token trace row with probability estimate.
     """
 
-    probability, entropy, _ = approximate_entropy(
-        selected_token=parsed_token.token,
-        selected_logprob=parsed_token.logprob,
-        top_entries=parsed_token.top_entries,
-    )
     return TokenTrace(
         token_index=token_index,
         token_id=token_id,
         token_text=parsed_token.token,
         logprob=float(parsed_token.logprob),
-        probability=float(probability),
-        entropy=float(entropy),
+        probability=float(probability_from_logprob(logprob=parsed_token.logprob)),
     )
 
 

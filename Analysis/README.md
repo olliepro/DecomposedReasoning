@@ -39,6 +39,42 @@ uv run python run_branching_lm_eval.py \
   --model non_sft
 ```
 
+## Run a baseline-vs-branching TOK/sec comparison
+
+Use the dedicated comparison config to launch a matched baseline `n` rollout and
+one branching run:
+
+```bash
+cd Analysis
+uv run python run_branching_lm_eval.py \
+  --config branching_eval/example_tok_sec.yaml \
+  --limit 1 \
+  --model non_sft \
+  --seed 1234
+```
+
+The baseline `n` value is `run_matrix.baseline_rollouts` in
+`branching_eval/example_tok_sec.yaml`.
+
+After runs finish, compare token throughput from `tree_events.jsonl`:
+
+```bash
+cd Analysis
+uv run python compare_tok_sec.py \
+  --output-root output/branching_eval \
+  --model non_sft \
+  --seed 1234 \
+  --show-request-kinds
+```
+
+Notes:
+- `req_tok/s` is computed from total output tokens divided by summed
+  `vllm_response.latency_seconds`.
+- `wall_tok/s` is computed from total output tokens divided by elapsed wall time
+  between the first `vllm_request` and the last `vllm_response`.
+- `--all-runs` disables latest-run deduplication when you want every historical
+  run under `output/branching_eval`.
+
 One-time entropy calibration helper:
 
 ```bash

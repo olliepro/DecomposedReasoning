@@ -470,6 +470,57 @@ def workspace_css() -> str:
   color: var(--muted);
   font-size: 0.73rem;
 }
+.leaf-card-list {
+  display: grid;
+  gap: 0.65rem;
+}
+.leaf-card {
+  display: grid;
+  gap: 0.42rem;
+  border: 1px solid var(--line);
+  border-radius: 0.65rem;
+  padding: 0.55rem;
+  background: rgba(2, 8, 20, 0.48);
+}
+.leaf-card.good {
+  border-color: rgba(96, 211, 148, 0.72);
+  box-shadow: 0 0 0 1px rgba(96, 211, 148, 0.18) inset;
+}
+.leaf-card.bad {
+  border-color: rgba(239, 71, 111, 0.72);
+  box-shadow: 0 0 0 1px rgba(239, 71, 111, 0.18) inset;
+}
+.leaf-card.neutral {
+  border-color: rgba(158, 178, 217, 0.52);
+}
+.leaf-card .detail-row {
+  grid-template-columns: 110px minmax(0, 1fr);
+}
+.completion-card {
+  border: 1px solid var(--line);
+  border-radius: 0.58rem;
+  background: rgba(255, 255, 255, 0.03);
+  overflow: hidden;
+}
+.completion-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.55rem;
+  padding: 0.38rem 0.5rem;
+  border-bottom: 1px solid rgba(158, 178, 217, 0.2);
+  color: var(--accent-soft);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.71rem;
+}
+.completion-body {
+  margin: 0;
+  padding: 0.56rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.76rem;
+  line-height: 1.42;
+  background: rgba(6, 10, 18, 0.48);
+}
 @media (max-width: 980px) {
   .branch-workspace {
     width: 100%;
@@ -562,6 +613,8 @@ def tree_workspace_script() -> str:
 
   const eventById = new Map();
   const candidatePoolByBranchPoint = new Map();
+  const nodeDetailById = new Map();
+  const nodeDetailRequestById = new Map();
   for (const [nodeId, events] of Object.entries(nodeEvents)) {
     if (!Array.isArray(events)) continue;
     for (const event of events) {
@@ -573,6 +626,64 @@ def tree_workspace_script() -> str:
         if (branchPointId) candidatePoolByBranchPoint.set(branchPointId, event.details);
       }
     }
+  }
+
+  function detailPathForNode(nodeId) {
+    const node = nodeById(nodeId);
+    return node ? String(node.detail_path || "") : "";
+  }
+
+  function mergeNodeDetail(nodeId, payload) {
+    if (!payload || typeof payload !== "object") return null;
+    const key = String(nodeId || "");
+    nodeDetailById.set(key, payload);
+    const detailEvents = Array.isArray(payload.events) ? payload.events : [];
+    const hydratedEvents = [];
+    for (const event of detailEvents) {
+      if (!event || typeof event !== "object") continue;
+      const hydrated = { ...event, node_id: key };
+      hydratedEvents.push(hydrated);
+      if (hydrated.event_id) eventById.set(String(hydrated.event_id), hydrated);
+      if (hydrated.event_type === "candidate_pool_resolved" && hydrated.details) {
+        const branchPointId = String(hydrated.details.branch_point_id || "");
+        if (branchPointId) {
+          candidatePoolByBranchPoint.set(branchPointId, hydrated.details);
+        }
+      }
+    }
+    if (hydratedEvents.length) {
+      nodeEvents[key] = hydratedEvents;
+    }
+    return payload;
+  }
+
+  function loadNodeDetail(nodeId) {
+    const key = String(nodeId || "");
+    if (!key) return Promise.resolve(null);
+    if (nodeDetailById.has(key)) {
+      return Promise.resolve(nodeDetailById.get(key));
+    }
+    const inFlight = nodeDetailRequestById.get(key);
+    if (inFlight) return inFlight;
+    const detailPath = detailPathForNode(key);
+    if (!detailPath) return Promise.resolve(null);
+    const request = fetch(detailPath)
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`Failed to load node detail: ${response.status}`);
+        }
+        return response.json();
+      })
+      .then((payload) => {
+        nodeDetailRequestById.delete(key);
+        return mergeNodeDetail(key, payload);
+      })
+      .catch((error) => {
+        nodeDetailRequestById.delete(key);
+        throw error;
+      });
+    nodeDetailRequestById.set(key, request);
+    return request;
   }
 
   const modeKey = {
@@ -1356,6 +1467,62 @@ def tree_workspace_script() -> str:
     return `<div class=\"detail-row\"><div class=\"detail-label\">${esc(label)}</div><div class=\"detail-value\">${esc(value)}</div></div>`;
   }
 
+  function leafCardClass(leaf) {
+    const verification = Number(leaf && leaf.verification);
+    if (verification === 1) return "good";
+    if (verification === 0) return "bad";
+    return "neutral";
+  }
+
+  function leafVerificationLabel(leaf) {
+    const verification = Number(leaf && leaf.verification);
+    if (verification === 1) return "✅ correct";
+    if (verification === 0) return "❌ incorrect";
+    return "unscored";
+  }
+
+  function renderCompletionCard({ title, subtitle, text }) {
+    return `
+      <section class="completion-card">
+        <div class="completion-head">
+          <span>${esc(String(title || ""))}</span>
+          <span>${esc(String(subtitle || ""))}</span>
+        </div>
+        <pre class="completion-body">${esc(String(text || ""))}</pre>
+      </section>
+    `;
+  }
+
+  function renderLeafCards(leaves) {
+    const rows = Array.isArray(leaves) ? leaves : [];
+    if (!rows.length) {
+      return "<p class='muted'>No final leaves for this node.</p>";
+    }
+    return `<div class="leaf-card-list">${rows.map((leaf) => {
+      const metrics = leaf && typeof leaf.task_metrics === "object"
+        ? Object.entries(leaf.task_metrics).map(([key, value]) => `${key}=${value}`).join(", ")
+        : "";
+      return `
+        <article class="leaf-card ${leafCardClass(leaf)}">
+          <div class="candidate-head">
+            <span>leaf ${esc(String(leaf.leaf_id || ""))}</span>
+            <span>${esc(leafVerificationLabel(leaf))}</span>
+          </div>
+          <div class="detail-kv">
+            ${detailRow("length", String(leaf.length_tokens_total ?? ""))}
+            ${detailRow("stop", String(leaf.stop_reason || ""))}
+            ${detailRow("metrics", metrics || "none")}
+          </div>
+          ${renderCompletionCard({
+            title: "Final completion",
+            subtitle: String(leaf.text_preview || ""),
+            text: String(leaf.text || leaf.text_preview || ""),
+          })}
+        </article>
+      `;
+    }).join("")}</div>`;
+  }
+
   function renderNodeInspector(nodeId) {
     hideTokenTooltip();
     const node = nodeById(nodeId);
@@ -1393,6 +1560,25 @@ def tree_workspace_script() -> str:
         return `<button class=\"event-btn ${active}\" data-event-id=\"${esc(event.event_id)}\">${esc(summary)}</button>`;
       });
     rows.push("<div class='event-list'>" + buttons.join("") + "</div>");
+    const nodeDetail = nodeDetailById.get(String(nodeId));
+    if (nodeDetail && Array.isArray(nodeDetail.leaves) && nodeDetail.leaves.length) {
+      rows.push("<h4 style='margin:0.32rem 0 0.12rem'>Final leaves</h4>");
+      rows.push(renderLeafCards(nodeDetail.leaves));
+    } else if (String(node.detail_path || "")) {
+      rows.push("<p class='muted'>Loading final leaf details...</p>");
+      loadNodeDetail(nodeId)
+        .then(() => {
+          if (selectedNodeId === nodeId && !selectedEventId) {
+            renderNodeInspector(nodeId);
+          }
+        })
+        .catch((error) => {
+          if (selectedNodeId === nodeId && !selectedEventId) {
+            inspectorHost.innerHTML = rows.join("")
+              + `<p class="muted">Failed to load node details: ${esc(error && error.message ? error.message : error)}</p>`;
+          }
+        });
+    }
     inspectorHost.innerHTML = rows.join("");
     inspectorHost.querySelectorAll(".event-btn").forEach((button) => {
       button.addEventListener("click", () => {
@@ -1508,16 +1694,13 @@ def tree_workspace_script() -> str:
   function showTokenTooltip(mouseEvent, tokenRow) {
     const tooltip = tooltipNode();
     const selectedProbability = selectedProbabilityForToken(tokenRow);
-    const entropyText = Number.isFinite(Number(tokenRow.selected_entropy))
-      ? Number(tokenRow.selected_entropy).toFixed(3)
-      : "-";
     const tokenText = normalizeTokenText(String(tokenRow.token_text || ""));
     const altGrid = renderTokenAlternatives(tokenRow);
     tooltip.innerHTML = `
       <div class="token-alt-head">
         <span>Selected</span>
         <code>${esc(tokenText)}</code>
-        <span>${formatProbabilityPercent(selectedProbability)} · H=${entropyText}</span>
+        <span>${formatProbabilityPercent(selectedProbability)}</span>
       </div>
       <div class="alt-grid">${altGrid}</div>
     `;
@@ -1559,8 +1742,11 @@ def tree_workspace_script() -> str:
     rows.push(detailRow("base_prefix_tokens", String(details.base_prefix_token_count || 0)));
     rows.push(detailRow("delta_token_count", String(details.delta_token_count || 0)));
     rows.push(detailRow("input_token_count", String(details.current_input_token_count || 0)));
-    rows.push(`<h4 style=\"margin:0.2rem 0\">assistant_prefix_tail</h4>`);
-    rows.push(`<pre>${esc(String(details.assistant_prefix_tail || ""))}</pre>`);
+    rows.push(detailRow("assistant_prefix_chars", String(details.assistant_prefix_char_count || 0)));
+    if (details.assistant_prefix_tail) {
+      rows.push(`<h4 style=\"margin:0.2rem 0\">assistant_prefix_tail</h4>`);
+      rows.push(`<pre>${esc(String(details.assistant_prefix_tail || ""))}</pre>`);
+    }
     return rows.join("");
   }
 
@@ -1847,6 +2033,27 @@ def tree_workspace_script() -> str:
     rows.push(detailRow("event_index", String(event.event_index || "")));
     rows.push(detailRow("summary", String(event.summary || "")));
     rows.push(detailRow("timestamp", String(event.timestamp_utc || "")));
+    const leafDetailNeedsHydration = (
+      (event.event_type === "leaf_scored" || event.event_type === "leaf_completed")
+      && (!details.text)
+    );
+    if ((!event.details || leafDetailNeedsHydration) && String(event.node_id || "")) {
+      rows.push("<p class='muted'>Loading event details...</p>");
+      inspectorHost.innerHTML = rows.join("");
+      loadNodeDetail(String(event.node_id || ""))
+        .then(() => {
+          if (selectedEventId === eventId) {
+            renderEventInspector(eventId);
+          }
+        })
+        .catch((error) => {
+          if (selectedEventId === eventId) {
+            inspectorHost.innerHTML = rows.join("")
+              + `<p class="muted">Failed to load event details: ${esc(error && error.message ? error.message : error)}</p>`;
+          }
+        });
+      return;
+    }
     if (event.event_type === "vllm_step") {
       rows.push(renderVllmStepDetails(details));
     } else if (event.event_type === "candidate_pool_resolved") {
@@ -1855,6 +2062,11 @@ def tree_workspace_script() -> str:
       rows.push(renderSelectorAppliedDetails(details));
     } else if (event.event_type === "selector_continued_inline") {
       rows.push(renderSelectorAppliedDetails(details));
+    } else if (
+      event.event_type === "leaf_scored"
+      || event.event_type === "leaf_completed"
+    ) {
+      rows.push(renderLeafCards([details]));
     } else {
       rows.push(`<pre>${esc(JSON.stringify(withoutRawTokenIds(details), null, 2))}</pre>`);
     }

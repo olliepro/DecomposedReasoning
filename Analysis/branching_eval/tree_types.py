@@ -10,7 +10,7 @@ from branching_eval.selector_types import SelectionOutcome
 
 @dataclass(frozen=True)
 class TokenTrace:
-    """One generated token with probability and entropy metadata.
+    """One generated token with probability metadata.
 
     Args:
         token_index: Token offset within the generated fragment.
@@ -18,7 +18,7 @@ class TokenTrace:
         token_text: Decoded token text.
         logprob: Selected token logprob.
         probability: Selected token probability.
-        entropy: Approximate next-token entropy.
+        entropy: Legacy compatibility field retained for replay/test fixtures.
 
     Returns:
         Dataclass containing per-token trace details.
@@ -29,7 +29,7 @@ class TokenTrace:
     token_text: str
     logprob: float
     probability: float
-    entropy: float
+    entropy: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -111,11 +111,10 @@ class BranchPointRecord:
     Args:
         branch_point_id: Stable branch point id.
         node_id: Node id where branching happened.
-        trigger_type: Trigger type (`steer_boundary` or `high_entropy`).
-        entropy_value: Entropy at trigger time when available.
-        candidate_pool_key: Cache key used for candidate-pool reuse.
+        trigger_type: Trigger type (`steer_boundary`).
         candidate_pool_id: Candidate pool id.
         selections: Selection outcomes for all selector modes.
+        entropy_value: Legacy compatibility field retained for replay/test fixtures.
 
     Returns:
         Dataclass for branch-point artifact rows.
@@ -124,10 +123,9 @@ class BranchPointRecord:
     branch_point_id: str
     node_id: str
     trigger_type: str
-    entropy_value: float | None
-    candidate_pool_key: str
     candidate_pool_id: str
     selections: tuple[SelectionOutcome, ...]
+    entropy_value: float | None = None
 
 
 @dataclass(frozen=True)
@@ -136,24 +134,22 @@ class CandidatePoolRecord:
 
     Args:
         candidate_pool_id: Stable pool id.
-        cache_key: Stable cache key.
         branch_point_id: Branch point id that requested this pool.
         node_id: Node id where pool was generated.
         trigger_type: Trigger mode used for generation.
-        entropy_value: Entropy value for entropy-trigger pools.
         candidates: Candidate rows.
+        entropy_value: Legacy compatibility field retained for replay/test fixtures.
 
     Returns:
         Dataclass describing one persisted candidate pool.
     """
 
     candidate_pool_id: str
-    cache_key: str
     branch_point_id: str
     node_id: str
     trigger_type: str
-    entropy_value: float | None
     candidates: tuple[CandidateRecord, ...]
+    entropy_value: float | None = None
 
 
 @dataclass(frozen=True)

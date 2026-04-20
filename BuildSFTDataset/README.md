@@ -26,8 +26,13 @@ Current key defaults:
 - `--mode gemini`
 - `--model gemini-3-flash-preview`
 - `--thinking-level low`
+- `--max-tokens 16384`
 - `--max-output-tokens 20000`
 - `--batch`
+
+Non-batch transform behavior:
+- `--no-batch` now uses the async Gemini API with a progress bar.
+- `--max-concurrent-requests 500`
 
 ## Common commands
 
@@ -65,7 +70,7 @@ uv run python tests/test_batch_recovery_dry_run.py
 Force skipping the >100 rows confirmation gate:
 
 ```bash
-uv run python build_sft_dataset.py --stage transform --max-rows 2000 --yes
+uv run python build_sft_dataset.py --stage transform --max-rows 5000 --yes
 ```
 
 Run the Streamlit steering viewer:

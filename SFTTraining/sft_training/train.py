@@ -21,6 +21,7 @@ from peft import TaskType
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    GenerationConfig,
     PreTrainedModel,
     ProgressCallback,
 )
@@ -60,6 +61,36 @@ class PromptCompletionSample:
             "prompt": self.prompt,
             "completion": self.completion,
         }
+
+
+@dataclass(frozen=True)
+class ConversationSample:
+    """Full-conversation training example retaining all chat messages.
+
+    Args:
+        sample_id: Unique row identifier.
+        dataset_source: Source dataset name.
+        messages: Entire normalized conversation message list.
+    """
+
+    sample_id: str
+    dataset_source: str
+    messages: list[dict[str, str]]
+
+    def to_record(self) -> dict[str, object]:
+        """Convert sample to a conversational HuggingFace Dataset row.
+
+        Returns:
+            Dictionary row compatible with TRL conversational datasets.
+        """
+        return {
+            "id": self.sample_id,
+            "dataset_source": self.dataset_source,
+            "messages": self.messages,
+        }
+
+
+TrainingSample = PromptCompletionSample | ConversationSample
 
 
 def parse_args() -> argparse.Namespace:
@@ -136,8 +167,67 @@ def _last_assistant_index(messages: list[dict[str, Any]]) -> int:
     raise AssertionError("Conversation row is missing an assistant message.")
 
 
-def build_sample(row: dict[str, Any]) -> PromptCompletionSample:
-    """Convert one transformed dataset row into prompt-completion format.
+def _normalized_messages(row: dict[str, Any]) -> list[dict[str, str]]:
+    """Normalize all conversation messages in one raw dataset row.
+
+    Args:
+        row: Raw transformed dataset row containing `messages`.
+
+    Returns:
+        Normalized conversation message list.
+    """
+    messages = row.get("messages")
+    assert isinstance(messages, list), "Expected `messages` to be a list."
+    return [
+        _normalize_message(message=cast(dict[str, Any], message))
+        for message in messages
+    ]
+
+
+def _sample_metadata(row: dict[str, Any]) -> tuple[str, str]:
+    """Extract canonical sample metadata from a raw dataset row.
+
+    Args:
+        row: Raw transformed dataset row.
+
+    Returns:
+        `(sample_id, dataset_source)` tuple for downstream dataset records.
+    """
+    sample_id = str(row.get("id", "missing-id"))
+    dataset_source = str(row.get("dataset_source", "unknown"))
+    return sample_id, dataset_source
+
+
+def sanitize_generation_config(generation_config: GenerationConfig) -> None:
+    """Reset invalid greedy-generation flags to validator-safe defaults.
+
+    Args:
+        generation_config: Pretrained generation config attached to the model.
+
+    Returns:
+        None. The config is updated in place.
+
+    Example:
+        >>> config = GenerationConfig(do_sample=False, temperature=0.6, top_p=0.95)
+        >>> sanitize_generation_config(generation_config=config)
+        >>> (config.temperature, config.top_p)
+        (1.0, 1.0)
+    """
+    if generation_config.do_sample is False:
+        generation_config.temperature = 1.0
+        generation_config.top_p = 1.0
+        generation_config.min_p = None
+        generation_config.typical_p = 1.0
+        generation_config.top_k = 50
+        generation_config.epsilon_cutoff = 0.0
+        generation_config.eta_cutoff = 0.0
+    if generation_config.num_beams == 1:
+        generation_config.early_stopping = False
+        generation_config.length_penalty = 1.0
+
+
+def build_completion_only_sample(row: dict[str, Any]) -> PromptCompletionSample:
+    """Convert one row into a prompt-completion training example.
 
     Args:
         row: Raw transformed dataset row containing `messages`.
@@ -150,16 +240,14 @@ def build_sample(row: dict[str, Any]) -> PromptCompletionSample:
         ...     "id": "x",
         ...     "messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}],
         ... }
-        >>> build_sample(row=row).completion[0]["role"]
+        >>> build_completion_only_sample(row=row).completion[0]["role"]
         'assistant'
     """
-    messages = row.get("messages")
-    assert isinstance(messages, list), "Expected `messages` to be a list."
+    messages = _normalized_messages(row=row)
     final_index = _last_assistant_index(messages=messages)
-    prompt = [_normalize_message(message=m) for m in messages[:final_index]]
-    completion = [_normalize_message(message=messages[final_index])]
-    sample_id = str(row.get("id", "missing-id"))
-    dataset_source = str(row.get("dataset_source", "unknown"))
+    prompt = messages[:final_index]
+    completion = [messages[final_index]]
+    sample_id, dataset_source = _sample_metadata(row=row)
     return PromptCompletionSample(
         sample_id=sample_id,
         dataset_source=dataset_source,
@@ -168,11 +256,55 @@ def build_sample(row: dict[str, Any]) -> PromptCompletionSample:
     )
 
 
+def build_full_conversation_sample(row: dict[str, Any]) -> ConversationSample:
+    """Convert one row into a full-conversation training example.
+
+    Args:
+        row: Raw transformed dataset row containing `messages`.
+
+    Returns:
+        Full-conversation sample that keeps the complete chat intact.
+    """
+    sample_id, dataset_source = _sample_metadata(row=row)
+    return ConversationSample(
+        sample_id=sample_id,
+        dataset_source=dataset_source,
+        messages=_normalized_messages(row=row),
+    )
+
+
+def build_sample(row: dict[str, Any], supervision_mode: str) -> TrainingSample:
+    """Build one training sample using the configured supervision mode.
+
+    Args:
+        row: Raw transformed dataset row.
+        supervision_mode: Dataset supervision style for SFT.
+
+    Returns:
+        Prompt-completion or full-conversation sample object.
+    """
+    if supervision_mode in ("full_conversation", "assistant_only"):
+        return build_full_conversation_sample(row=row)
+    return build_completion_only_sample(row=row)
+
+
+def uses_conversation_dataset(supervision_mode: str) -> bool:
+    """Return whether a supervision mode should emit conversational rows.
+
+    Args:
+        supervision_mode: Dataset supervision style for SFT.
+
+    Returns:
+        True when training should use `messages` rows.
+    """
+    return supervision_mode in ("full_conversation", "assistant_only")
+
+
 def split_samples(
-    samples: list[PromptCompletionSample],
+    samples: list[TrainingSample],
     eval_split_ratio: float,
     seed: int,
-) -> tuple[list[PromptCompletionSample], list[PromptCompletionSample]]:
+) -> tuple[list[TrainingSample], list[TrainingSample]]:
     """Split samples into train/eval with a deterministic shuffled partition.
 
     Args:
@@ -287,7 +419,9 @@ def build_datasets(
         Pair `(train_dataset, eval_dataset)` ready for `SFTTrainer`.
     """
     rows = read_jsonl(path=config.dataset_path)
-    samples = [build_sample(row=row) for row in rows]
+    samples = [
+        build_sample(row=row, supervision_mode=config.supervision_mode) for row in rows
+    ]
     if max_train_samples is not None:
         samples = samples[:max_train_samples]
     train_samples, eval_samples = split_samples(
@@ -316,6 +450,9 @@ def _wandb_config_payload(config: RunConfig) -> dict[str, Any]:
         None
         if config.deepspeed_config_path is None
         else str(config.deepspeed_config_path)
+    )
+    payload["chat_template_path"] = (
+        None if config.chat_template_path is None else str(config.chat_template_path)
     )
     return payload
 
@@ -380,11 +517,18 @@ def load_model(
     Returns:
         Loaded model ready for process-local CUDA placement.
     """
+    model_kwargs: dict[str, Any] = {
+        "pretrained_model_name_or_path": config.model_name_or_path,
+        "dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        "trust_remote_code": True,
+    }
+    if torch.cuda.is_available():
+        model_kwargs["attn_implementation"] = "flash_attention_2"
     model = AutoModelForCausalLM.from_pretrained(
-        pretrained_model_name_or_path=config.model_name_or_path,
-        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        trust_remote_code=True,
+        **model_kwargs,
     )
+    if model.generation_config is not None:
+        sanitize_generation_config(generation_config=model.generation_config)
     model_embeddings = cast(Any, model.get_input_embeddings())
     if len(tokenizer) != int(model_embeddings.num_embeddings):
         model.resize_token_embeddings(new_num_tokens=len(tokenizer))
@@ -409,16 +553,25 @@ def configure_process_cuda_device() -> None:
     torch.cuda.set_device(local_rank)
 
 
-def move_model_to_local_cuda(model: PreTrainedModel) -> PreTrainedModel:
-    """Move the model to the local CUDA rank when GPUs are available.
+def move_model_to_local_cuda(
+    model: PreTrainedModel, config: RunConfig
+) -> PreTrainedModel:
+    """Move the model to the local CUDA rank when DeepSpeed is not active.
 
     Args:
         model: Loaded model instance.
+        config: Parsed run configuration.
 
     Returns:
-        Model moved to local CUDA device, or unchanged on CPU-only hosts.
+        Model moved to local CUDA device, or unchanged when CPU-only or
+        when DeepSpeed handles placement.
+
+    Example:
+        >>> moved_model = move_model_to_local_cuda(model=model, config=config)
+        >>> moved_model is model
+        True
     """
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or config.deepspeed_config_path is not None:
         return model
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     module_model = cast(torch.nn.Module, model)
@@ -509,6 +662,11 @@ def build_training_args(
     """
     return SFTConfig(
         output_dir=str(config.output_dir),
+        chat_template_path=(
+            None
+            if config.chat_template_path is None
+            else str(config.chat_template_path)
+        ),
         num_train_epochs=config.num_train_epochs,
         learning_rate=config.learning_rate,
         optim=config.optim,
@@ -532,8 +690,14 @@ def build_training_args(
         report_to=["wandb"],
         run_name=config.run_name,
         bf16=True,
-        gradient_checkpointing=True,
-        completion_only_loss=True,
+        gradient_checkpointing=config.gradient_checkpointing,
+        activation_offloading=config.activation_offloading,
+        packing=config.packing,
+        packing_strategy=config.packing_strategy,
+        padding_free=config.padding_free,
+        eval_packing=config.eval_packing,
+        completion_only_loss=(config.supervision_mode == "completion_only"),
+        assistant_only_loss=(config.supervision_mode == "assistant_only"),
         **_deepspeed_kwargs(config=config),
     )
 
@@ -558,7 +722,7 @@ def build_trainer(
         config=config,
         tokenizer=tokenizer,
     )
-    model = move_model_to_local_cuda(model=loaded_model)
+    model = move_model_to_local_cuda(model=loaded_model, config=config)
     warmup_steps = compute_warmup_steps(
         config=config,
         train_dataset_size=len(train_dataset),

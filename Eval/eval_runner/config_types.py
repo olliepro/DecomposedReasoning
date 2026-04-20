@@ -20,7 +20,9 @@ class LmEvalConfig:
         num_fewshot: Optional few-shot count override.
         aime_avg_k: Number of sampled responses per AIME question for avg@k.
         apply_chat_template: Enables `--apply_chat_template`.
-        think_end_token: Token/string used to strip reasoning trace in eval.
+        think_end_token: Optional token/string used to strip reasoning trace in
+            eval. Set to `null` to preserve the full thinking trace in saved
+            samples and scored responses.
         trust_remote_code: Enables model loading for repos with custom code.
         log_samples: Enables `--log_samples` to save per-example generations.
         temperature: Default generation temperature passed via `--gen_kwargs`.
@@ -36,7 +38,7 @@ class LmEvalConfig:
     num_fewshot: int | None = None
     aime_avg_k: int = 32
     apply_chat_template: bool = True
-    think_end_token: str = "</think>"
+    think_end_token: str | None = "</think>"
     trust_remote_code: bool = True
     model_type: str = "hf"
     tensor_parallel_size: int = -1
@@ -198,13 +200,16 @@ def _build_lm_eval_config(lm_eval_payload: dict[str, Any]) -> LmEvalConfig:
     assert aime_avg_k >= 1, "`lm_eval.aime_avg_k` must be >= 1."
     vllm_log_stats_interval = float(lm_eval_payload.get("vllm_log_stats_interval", 10.0))
     assert vllm_log_stats_interval > 0.0, "`lm_eval.vllm_log_stats_interval` must be > 0."
+    think_end_token_value = lm_eval_payload.get("think_end_token", "</think>")
     return LmEvalConfig(
         tasks=tuple(lm_eval_payload.get("tasks", LmEvalConfig.tasks)),
         batch_size=lm_eval_payload.get("batch_size", 4),
         num_fewshot=lm_eval_payload.get("num_fewshot"),
         aime_avg_k=aime_avg_k,
         apply_chat_template=bool(lm_eval_payload.get("apply_chat_template", True)),
-        think_end_token=str(lm_eval_payload.get("think_end_token", "</think>")),
+        think_end_token=(
+            None if think_end_token_value is None else str(think_end_token_value)
+        ),
         trust_remote_code=bool(lm_eval_payload.get("trust_remote_code", True)),
         model_type=str(lm_eval_payload.get("model_type", "hf")),
         tensor_parallel_size=_resolve_tensor_parallel_size(lm_eval_payload=lm_eval_payload),
