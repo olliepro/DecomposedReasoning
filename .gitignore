@@ -75,7 +75,7 @@ logs/
 *.log
 *.yaml
 *.json
-!ProjectReportTemplate/.latexindent.yaml
+!ProjectReport/.latexindent.yaml
 !BuildSFTDataset/augmentation/steer_exec_augmentation_bundle/interventions.json
 !BuildSFTDataset/augmentation/steer_exec_augmentation_bundle/non-sequiturs.json
 *.sbatch
