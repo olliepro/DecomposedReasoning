@@ -44,8 +44,11 @@ class FakeRuntimeClient:
         Fake client with deterministic outputs for baseline/branching calls.
     """
 
-    def __init__(self, *, base_url: str) -> None:
+    def __init__(
+        self, *, base_url: str, timeout_seconds: float | None = None
+    ) -> None:
         self.base_url = base_url
+        self.timeout_seconds = timeout_seconds
 
     def completions(
         self,
@@ -53,6 +56,7 @@ class FakeRuntimeClient:
         model: str,
         prompt: str | None,
         prompt_token_ids: tuple[int, ...] | None,
+        resolved_prompt_token_ids: tuple[int, ...] | None = None,
         temperature: float,
         top_p: float,
         max_tokens: int,
@@ -62,11 +66,13 @@ class FakeRuntimeClient:
         top_logprobs: int,
         priority: int | None = None,
         repetition_penalty: float | None = None,
+        parse_response_prompt_token_ids: bool = True,
     ) -> tuple[GenerationChoice, ...]:
         _ = (
             model,
             prompt,
             prompt_token_ids,
+            resolved_prompt_token_ids,
             temperature,
             top_p,
             max_tokens,
@@ -75,6 +81,7 @@ class FakeRuntimeClient:
             top_logprobs,
             priority,
             repetition_penalty,
+            parse_response_prompt_token_ids,
         )
         if n > 1:
             return tuple(
@@ -88,6 +95,7 @@ class FakeRuntimeClient:
         model: str,
         prompt: str | None,
         prompt_token_ids: tuple[int, ...] | None,
+        resolved_prompt_token_ids: tuple[int, ...] | None = None,
         temperature: float,
         top_p: float,
         max_tokens: int,
@@ -97,6 +105,7 @@ class FakeRuntimeClient:
         top_logprobs: int,
         priority: int | None = None,
         repetition_penalty: float | None = None,
+        parse_response_prompt_token_ids: bool = True,
     ) -> tuple[GenerationChoice, ...]:
         """Async completions shim matching runtime client surface."""
 
@@ -104,6 +113,7 @@ class FakeRuntimeClient:
             model=model,
             prompt=prompt,
             prompt_token_ids=prompt_token_ids,
+            resolved_prompt_token_ids=resolved_prompt_token_ids,
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
@@ -113,6 +123,7 @@ class FakeRuntimeClient:
             top_logprobs=top_logprobs,
             priority=priority,
             repetition_penalty=repetition_penalty,
+            parse_response_prompt_token_ids=parse_response_prompt_token_ids,
         )
 
     async def tokenize_async(

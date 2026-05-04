@@ -41,6 +41,7 @@ class PrefixClient:
         model: str,
         prompt: str | None,
         prompt_token_ids: tuple[int, ...] | None,
+        resolved_prompt_token_ids: tuple[int, ...] | None = None,
         temperature: float,
         top_p: float,
         max_tokens: int,
@@ -50,11 +51,13 @@ class PrefixClient:
         top_logprobs: int,
         priority: int | None = None,
         repetition_penalty: float | None = None,
+        parse_response_prompt_token_ids: bool = True,
     ) -> tuple[GenerationChoice, ...]:
         _ = (
             model,
             prompt,
             prompt_token_ids,
+            resolved_prompt_token_ids,
             temperature,
             top_p,
             max_tokens,
@@ -63,6 +66,7 @@ class PrefixClient:
             stop,
             top_logprobs,
             repetition_penalty,
+            parse_response_prompt_token_ids,
         )
         self.priorities.append(priority)
         self.calls += 1

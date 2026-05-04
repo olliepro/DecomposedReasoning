@@ -126,7 +126,6 @@ def unique_partial_tag_prefix_map() -> dict[str, str]:
                 ambiguous_prefixes.add(prefix)
     for prefix in ambiguous_prefixes:
         prefix_map.pop(prefix, None)
-    prefix_map["<"] = "<steer>"
     return prefix_map
 
 

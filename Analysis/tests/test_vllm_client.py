@@ -12,14 +12,18 @@ from analysis_types import RunConfig
 from vllm_client import (
     ChatMessage,
     VllmClient,
+    async_post_retry_delay_seconds,
     build_chat_completions_payload,
     build_completions_payload,
     build_detokenize_payload,
+    is_prompt_token_ids_unsupported_error,
+    is_retryable_async_transport_error,
     normalize_vllm_base_url,
     parse_chat_completions_choices,
     parse_completions_choices,
     parse_detokenize_text,
     parse_tokenize_ids,
+    VllmRequestError,
 )
 
 
@@ -50,6 +54,36 @@ def test_parse_completions_choice_with_stop_reason_and_token_ids() -> None:
     assert len(choices[0].tokens) == 2
 
 
+def test_parse_completions_choice_can_reuse_known_prompt_token_ids() -> None:
+    """Completions parser should skip echoed prompt ids when fallback is known."""
+
+    payload = {
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "stop_reason": None,
+                "text": "abc",
+                "prompt_token_ids": [99, 98, 97],
+                "token_ids": [10, 11],
+                "logprobs": {
+                    "tokens": ["a", "b"],
+                    "token_logprobs": [-0.1, -0.3],
+                    "top_logprobs": [{"a": -0.1}, {"b": -0.3}],
+                },
+            }
+        ],
+    }
+    choices = parse_completions_choices(
+        response_payload=payload,
+        fallback_prompt_token_ids=(1, 2, 3),
+        parse_choice_prompt_token_ids=False,
+    )
+    assert len(choices) == 1
+    assert choices[0].prompt_token_ids == (1, 2, 3)
+    assert choices[0].token_ids == (10, 11)
+
+
 def test_build_completions_payload_for_text_prompt() -> None:
     """Completions payload should include text prompt settings and token-ID return flag."""
     payload = build_completions_payload(
@@ -76,6 +110,7 @@ def test_build_completions_payload_for_text_prompt() -> None:
     assert payload["stop"] == ["<steer"]
     assert payload["include_stop_str_in_output"] is True
     assert payload["return_token_ids"] is True
+    assert payload["return_prompt_token_ids"] is False
     assert payload["priority"] == 17
     assert payload["repetition_penalty"] == 1.1
 
@@ -101,6 +136,7 @@ def test_build_completions_payload_for_token_prompt() -> None:
     assert payload["n"] == 2
     assert payload["seed"] == 7
     assert payload["logprobs"] == 9
+    assert payload["return_prompt_token_ids"] is False
     assert "prompt_token_ids" not in payload
     assert "include_stop_str_in_output" not in payload
     assert "priority" not in payload
@@ -155,6 +191,36 @@ def test_parse_chat_completions_choice_with_message_content() -> None:
     choices = parse_chat_completions_choices(response_payload=payload)
     assert len(choices) == 1
     assert choices[0].text == '{"clusters":[]}'
+    assert choices[0].prompt_token_ids == (1, 2, 3)
+    assert choices[0].token_ids == (10, 11)
+
+
+def test_parse_chat_completions_choice_can_reuse_known_prompt_token_ids() -> None:
+    """Chat parser should skip echoed prompt ids when fallback is known."""
+
+    payload = {
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "stop_reason": None,
+                "prompt_token_ids": [99, 98, 97],
+                "message": {"role": "assistant", "content": '{"clusters":[]}'},
+                "token_ids": [10, 11],
+                "logprobs": {
+                    "tokens": ["{", "}"],
+                    "token_logprobs": [-0.1, -0.2],
+                    "top_logprobs": [{"{": -0.1}, {"}": -0.2}],
+                },
+            }
+        ],
+    }
+    choices = parse_chat_completions_choices(
+        response_payload=payload,
+        fallback_prompt_token_ids=(1, 2, 3),
+        parse_choice_prompt_token_ids=False,
+    )
+    assert len(choices) == 1
     assert choices[0].prompt_token_ids == (1, 2, 3)
     assert choices[0].token_ids == (10, 11)
 
@@ -303,7 +369,9 @@ def test_async_completions_posts_to_v1_endpoint() -> None:
     assert choices[0].text == "abc"
 
 
-def test_async_post_url_reuses_single_client_session(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_async_post_url_reuses_single_client_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Async HTTP requests should reuse one `aiohttp.ClientSession` per client."""
 
     session_create_count = 0
@@ -326,7 +394,9 @@ def test_async_post_url_reuses_single_client_session(monkeypatch: pytest.MonkeyP
         def __init__(self, *, timeout: Any) -> None:
             _ = timeout
 
-        def post(self, *, url: str, json: dict[str, Any], headers: dict[str, str]) -> FakeResponse:
+        def post(
+            self, *, url: str, json: dict[str, Any], headers: dict[str, str]
+        ) -> FakeResponse:
             _ = url, json, headers
             return FakeResponse()
 
@@ -358,13 +428,52 @@ def test_async_post_url_reuses_single_client_session(monkeypatch: pytest.MonkeyP
     assert session_create_count == 1
 
 
-def test_async_post_url_retries_after_connection_drop(
+def test_prompt_token_ids_unsupported_classifier_ignores_disconnect() -> None:
+    """Token-prompt support classifier should not treat disconnects as capability."""
+
+    assert is_prompt_token_ids_unsupported_error(
+        error=VllmRequestError(
+            "Either prompt or prompt_embeds must be provided and non-empty."
+        )
+    )
+    assert not is_prompt_token_ids_unsupported_error(
+        error=VllmRequestError("Server disconnected")
+    )
+
+
+def test_retryable_async_transport_error_classifier() -> None:
+    """Async retry classifier should include aiohttp body-read disconnects."""
+
+    assert is_retryable_async_transport_error(
+        error=aiohttp.ServerDisconnectedError(message="disconnected")
+    )
+    assert is_retryable_async_transport_error(error=asyncio.TimeoutError())
+    assert is_retryable_async_transport_error(error=RuntimeError("Connection closed."))
+    assert not is_retryable_async_transport_error(error=RuntimeError("other failure"))
+
+
+def test_async_post_retry_delay_seconds_caps_exponential_backoff() -> None:
+    """Async POST retry backoff should grow exponentially and then cap."""
+
+    delays = [
+        async_post_retry_delay_seconds(retry_index=retry_index)
+        for retry_index in range(10)
+    ]
+
+    assert delays == [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 8.0, 8.0, 8.0, 8.0]
+
+
+def test_async_post_url_retries_connection_drop_on_same_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Async HTTP requests should recreate the session after a dropped connection."""
+    """Async HTTP requests should not close a shared session on one dropped request."""
 
     session_create_count = 0
     close_count = 0
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
 
     class FakeResponse:
         status = 200
@@ -381,15 +490,16 @@ def test_async_post_url_retries_after_connection_drop(
     class FakeSession:
         closed = False
 
-        def __init__(self, *, timeout: Any, should_fail: bool) -> None:
+        def __init__(self, *, timeout: Any) -> None:
             _ = timeout
-            self.should_fail = should_fail
+            self.post_calls = 0
 
         def post(
             self, *, url: str, json: dict[str, Any], headers: dict[str, str]
         ) -> FakeResponse:
             _ = url, json, headers
-            if self.should_fail:
+            self.post_calls += 1
+            if self.post_calls == 1:
                 raise aiohttp.ServerDisconnectedError(message="disconnected")
             return FakeResponse()
 
@@ -401,9 +511,10 @@ def test_async_post_url_retries_after_connection_drop(
     def fake_client_session(*, timeout: Any) -> FakeSession:
         nonlocal session_create_count
         session_create_count += 1
-        return FakeSession(timeout=timeout, should_fail=session_create_count == 1)
+        return FakeSession(timeout=timeout)
 
     monkeypatch.setattr("vllm_client.aiohttp.ClientSession", fake_client_session)
+    monkeypatch.setattr("vllm_client.asyncio.sleep", fake_sleep)
     client = VllmClient(base_url="http://127.0.0.1:8000/v1")
 
     async def run_request() -> None:
@@ -415,8 +526,223 @@ def test_async_post_url_retries_after_connection_drop(
         await client.close_async()
 
     asyncio.run(run_request())
-    assert session_create_count == 2
-    assert close_count == 2
+    assert session_create_count == 1
+    assert close_count == 1
+    assert sleep_delays == [0.25]
+
+
+def test_async_post_url_retries_body_read_connection_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Async HTTP requests should retry when aiohttp closes while reading body."""
+
+    session_create_count = 0
+    close_count = 0
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(self, *, fail_read: bool) -> None:
+            self.fail_read = fail_read
+
+        async def __aenter__(self) -> FakeResponse:
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            _ = exc_type, exc, tb
+
+        async def text(self) -> str:
+            if self.fail_read:
+                raise RuntimeError("Connection closed.")
+            return '{"ok": true}'
+
+    class FakeSession:
+        closed = False
+
+        def __init__(self, *, timeout: Any) -> None:
+            _ = timeout
+            self.post_calls = 0
+
+        def post(
+            self, *, url: str, json: dict[str, Any], headers: dict[str, str]
+        ) -> FakeResponse:
+            _ = url, json, headers
+            self.post_calls += 1
+            return FakeResponse(fail_read=self.post_calls == 1)
+
+        async def close(self) -> None:
+            nonlocal close_count
+            self.closed = True
+            close_count += 1
+
+    def fake_client_session(*, timeout: Any) -> FakeSession:
+        nonlocal session_create_count
+        session_create_count += 1
+        return FakeSession(timeout=timeout)
+
+    monkeypatch.setattr("vllm_client.aiohttp.ClientSession", fake_client_session)
+    monkeypatch.setattr("vllm_client.asyncio.sleep", fake_sleep)
+    client = VllmClient(base_url="http://127.0.0.1:8000/v1")
+
+    async def run_request() -> None:
+        response = await client._post_url_async(
+            url="http://127.0.0.1:8000/v1/completions",
+            payload={"x": 1},
+        )
+        assert response == {"ok": True}
+        await client.close_async()
+
+    asyncio.run(run_request())
+    assert session_create_count == 1
+    assert close_count == 1
+    assert sleep_delays == [0.25]
+
+
+def test_async_post_url_retries_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Async HTTP requests should retry when an aiohttp request times out."""
+
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self) -> FakeResponse:
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            _ = exc_type, exc, tb
+
+        async def text(self) -> str:
+            return '{"ok": true}'
+
+    class FakeSession:
+        closed = False
+
+        def __init__(self, *, timeout: Any) -> None:
+            _ = timeout
+            self.post_calls = 0
+
+        def post(
+            self, *, url: str, json: dict[str, Any], headers: dict[str, str]
+        ) -> FakeResponse:
+            _ = url, json, headers
+            self.post_calls += 1
+            if self.post_calls == 1:
+                raise asyncio.TimeoutError()
+            return FakeResponse()
+
+        async def close(self) -> None:
+            self.closed = True
+
+    session: FakeSession | None = None
+
+    def fake_client_session(*, timeout: Any) -> FakeSession:
+        nonlocal session
+        session = FakeSession(timeout=timeout)
+        return session
+
+    monkeypatch.setattr("vllm_client.aiohttp.ClientSession", fake_client_session)
+    monkeypatch.setattr("vllm_client.asyncio.sleep", fake_sleep)
+    client = VllmClient(base_url="http://127.0.0.1:8000/v1", timeout_seconds=600.0)
+
+    async def run_request() -> None:
+        response = await client._post_url_async(
+            url="http://127.0.0.1:8000/v1/completions",
+            payload={"x": 1},
+        )
+        assert response == {"ok": True}
+        await client.close_async()
+
+    asyncio.run(run_request())
+    assert session is not None
+    assert session.post_calls == 2
+    assert sleep_delays == [0.25]
+
+
+def test_async_post_url_retries_transient_disconnects_up_to_eleventh_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Async HTTP requests should tolerate ten transient disconnects."""
+
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self) -> FakeResponse:
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            _ = exc_type, exc, tb
+
+        async def text(self) -> str:
+            return '{"ok": true}'
+
+    class FakeSession:
+        closed = False
+
+        def __init__(self, *, timeout: Any) -> None:
+            _ = timeout
+            self.post_calls = 0
+
+        def post(
+            self, *, url: str, json: dict[str, Any], headers: dict[str, str]
+        ) -> FakeResponse:
+            _ = url, json, headers
+            self.post_calls += 1
+            if self.post_calls < 11:
+                raise aiohttp.ServerDisconnectedError(message="disconnected")
+            return FakeResponse()
+
+        async def close(self) -> None:
+            self.closed = True
+
+    session: FakeSession | None = None
+
+    def fake_client_session(*, timeout: Any) -> FakeSession:
+        nonlocal session
+        session = FakeSession(timeout=timeout)
+        return session
+
+    monkeypatch.setattr("vllm_client.aiohttp.ClientSession", fake_client_session)
+    monkeypatch.setattr("vllm_client.asyncio.sleep", fake_sleep)
+    client = VllmClient(base_url="http://127.0.0.1:8000/v1")
+
+    async def run_request() -> None:
+        response = await client._post_url_async(
+            url="http://127.0.0.1:8000/v1/completions",
+            payload={"x": 1},
+        )
+        assert response == {"ok": True}
+        await client.close_async()
+
+    asyncio.run(run_request())
+    assert session is not None
+    assert session.post_calls == 11
+    assert sleep_delays == [
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+        4.0,
+        8.0,
+        8.0,
+        8.0,
+        8.0,
+        8.0,
+    ]
 
 
 def test_chat_completions_posts_to_chat_endpoint() -> None:

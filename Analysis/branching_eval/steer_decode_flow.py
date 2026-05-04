@@ -9,6 +9,7 @@ from branching_eval.branch_decode_utils import (
     append_prompt_token_ids,
     candidate_from_choice,
     consume_choice_tokens,
+    is_think_close_stop_reason,
     updated_prompt_token_ids,
 )
 from branching_eval.legacy_steer_rollout import (
@@ -18,7 +19,10 @@ from branching_eval.legacy_steer_rollout import (
     is_natural_finish_reason,
 )
 from branching_eval.runtime_types import DecodeOutcome
-from branching_eval.steer_normalization import forced_boundary_suffix
+from branching_eval.steer_normalization import (
+    forced_boundary_suffix,
+    steer_candidate_stop_markers,
+)
 from branching_eval.tree_types import TokenTrace
 from vllm_client import GenerationChoice
 
@@ -69,15 +73,17 @@ def _build_steer_continuation_outcome(
     """
 
     updated_generated_tokens = generated_tokens + len(steer_token_ids)
+    event_type = "terminated" if contains_think_close(text=steer_text) else "continued"
+    stop_reason = "think_end" if event_type == "terminated" else ""
     return DecodeOutcome(
-        event_type="continued",
+        event_type=event_type,
         trigger_type=None,
         assistant_prefix=canonical_prefix + steer_text,
         prompt_token_ids=updated_prompt_ids,
         token_ids=tuple(token_ids) + tuple(steer_token_ids),
         token_traces=tuple(token_traces) + tuple(steer_candidate_tokens),
         generated_tokens=updated_generated_tokens,
-        stop_reason="",
+        stop_reason=stop_reason,
     )
 
 
@@ -134,13 +140,15 @@ def continue_with_single_steer_candidate(
         assistant_prefix=canonical_prefix,
         prompt_token_ids=canonical_prompt_ids,
         max_tokens=steer_budget,
-        stop=("</steer",),
+        stop=steer_candidate_stop_markers(text=canonical_prefix),
         n=1,
         request_kind="steer_single_candidate",
         request_stream_id=request_stream_id,
         enforce_prefix_chain=True,
     )
-    if not steer_choice.tokens:
+    if not steer_choice.tokens and not is_think_close_stop_reason(
+        stop_reason=steer_choice.stop_reason
+    ):
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
@@ -229,13 +237,15 @@ async def continue_with_single_steer_candidate_async(
         assistant_prefix=canonical_prefix,
         prompt_token_ids=canonical_prompt_ids,
         max_tokens=steer_budget,
-        stop=("</steer",),
+        stop=steer_candidate_stop_markers(text=canonical_prefix),
         n=1,
         request_kind="steer_single_candidate",
         request_stream_id=request_stream_id,
         enforce_prefix_chain=True,
     )
-    if not steer_choice.tokens:
+    if not steer_choice.tokens and not is_think_close_stop_reason(
+        stop_reason=steer_choice.stop_reason
+    ):
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
@@ -707,6 +717,10 @@ async def append_injected_suffix_prompt_ids_async(
         return prompt_token_ids
     if prompt_token_ids is None:
         return None
+    assert updated_text.startswith(original_text), (
+        "canonical steer suffix injection must be append-only when "
+        "prompt_token_ids are available"
+    )
     injected_suffix = updated_text[len(original_text) :]
     assert injected_suffix, "injected suffix expected when text changed"
     suffix_token_ids = await executor._tokenize_text_async(text=injected_suffix)
@@ -741,13 +755,13 @@ def append_injected_suffix_prompt_ids(
         return prompt_token_ids
     if prompt_token_ids is None:
         return None
+    assert updated_text.startswith(original_text), (
+        "canonical steer suffix injection must be append-only when "
+        "prompt_token_ids are available"
+    )
     injected_suffix = updated_text[len(original_text) :]
     assert injected_suffix, "injected suffix expected when text changed"
-    suffix_token_ids = executor.client.tokenize(
-        model=executor.model_name,
-        text=injected_suffix,
-        add_special_tokens=False,
-    )
+    suffix_token_ids = executor._tokenize_text(text=injected_suffix)
     executor._assert_text_token_alignment(
         text=injected_suffix,
         token_ids=tuple(suffix_token_ids),

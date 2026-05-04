@@ -71,7 +71,10 @@ def build_clustering_runtime_client(
         model_spec.clustering_served_model_name is not None
     ), "clustering_served_model_name required when clustering_base_url is set"
     return (
-        VllmClient(base_url=model_spec.clustering_base_url),
+        VllmClient(
+            base_url=model_spec.clustering_base_url,
+            timeout_seconds=serve_config.request_timeout_seconds,
+        ),
         model_spec.clustering_served_model_name,
     )
 
@@ -308,7 +311,10 @@ def run_experiment_matrix(
             port=port,
             log_dir=serve_log_dir,
         ) as running_server:
-            client = VllmClient(base_url=running_server.base_url)
+            client = VllmClient(
+                base_url=running_server.base_url,
+                timeout_seconds=config.serve.request_timeout_seconds,
+            )
             cluster_client, cluster_model_name = build_clustering_runtime_client(
                 model_spec=model_spec,
                 serve_config=config.serve,

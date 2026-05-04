@@ -27,15 +27,21 @@ venv/
 BuildSFTDataset/output/
 BuildSFTDataset/output_nonbatch5/
 BuildSFTDataset/output_transform*/
+BuildSFTDataset/augmentation/**/out/
 
 # Streamlit cache
 .streamlit/
+
+# Local editor and scratch files
+.vscode/
+/scratch*.py
 
 # Weights & Biases
 wandb/
 
 # Cluster and experiment run artifacts
 slurm-*.out
+*.err
 Analysis/output/
 Analysis/branching_eval/output/
 Analysis/profiling/*.raw
@@ -69,5 +75,8 @@ logs/
 *.log
 *.yaml
 *.json
+!ProjectReportTemplate/.latexindent.yaml
+!BuildSFTDataset/augmentation/steer_exec_augmentation_bundle/interventions.json
+!BuildSFTDataset/augmentation/steer_exec_augmentation_bundle/non-sequiturs.json
 *.sbatch
 *.csv

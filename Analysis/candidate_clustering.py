@@ -28,6 +28,7 @@ STEER_TRAILING_SUFFIXES = (
     "</s",
     "</",
 )
+STEER_LEADING_OPEN_PATTERN = re.compile(r"^\s*<steer\b[^>]*>\s*", flags=re.I)
 NON_SNAKE_PATTERN = re.compile(r"[^a-z0-9]+")
 CODE_BLOCK_JSON_PATTERN = re.compile(
     r"```(?:json)?\s*(\{.*\})\s*```", flags=re.IGNORECASE | re.DOTALL
@@ -309,24 +310,29 @@ class ClusteringCache:
 
 
 def strip_steer_suffix(*, text: str) -> str:
-    """Remove trailing steer close-tag from a candidate string.
+    """Remove steer wrapper markers from a candidate string.
 
     Args:
         text: Raw candidate text.
 
     Returns:
-        Cleaned candidate text.
+        Cleaned candidate text with `<steer>`/`</steer>` markers removed.
+        Terminal `</think>` text is preserved.
 
     Example:
         >>> strip_steer_suffix(text="Try substitution</steer>")
+        'Try substitution'
+        >>> strip_steer_suffix(text="<steer>Try substitution</steer>")
         'Try substitution'
         >>> strip_steer_suffix(text='Try "A.L.G.O.R.I.T.H.M" pun</ste ')
         'Try "A.L.G.O.R.I.T.H.M" pun'
     """
     suffix_span = trailing_steer_suffix_span(text=text)
     if suffix_span is None:
-        return text.strip()
-    return text[: suffix_span[0]].strip()
+        trimmed_text = text.strip()
+    else:
+        trimmed_text = text[: suffix_span[0]].strip()
+    return STEER_LEADING_OPEN_PATTERN.sub("", trimmed_text).strip()
 
 
 def trailing_steer_suffix_span(*, text: str) -> tuple[int, int] | None:

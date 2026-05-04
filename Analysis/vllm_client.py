@@ -74,10 +74,83 @@ class ChatMessage:
 
 
 ChatTemplateKwargs = dict[str, Union[bool, int, float, str, None]]
+ASYNC_POST_MAX_RETRIES = 10
+ASYNC_POST_MAX_ATTEMPTS = ASYNC_POST_MAX_RETRIES + 1
+ASYNC_POST_RETRY_BASE_DELAY_SECONDS = 0.25
+ASYNC_POST_RETRY_MAX_DELAY_SECONDS = 8.0
 
 
 class VllmRequestError(RuntimeError):
     """Request error returned by vLLM OpenAI-compatible server."""
+
+
+def is_prompt_token_ids_unsupported_error(*, error: BaseException) -> bool:
+    """Return whether a request error proves token-ID prompts are unsupported.
+
+    Args:
+        error: Request exception raised by the vLLM client.
+
+    Returns:
+        `True` only for known schema/capability failures from token-ID prompts.
+
+    Example:
+        >>> is_prompt_token_ids_unsupported_error(
+        ...     error=VllmRequestError(
+        ...         "Either prompt or prompt_embeds must be provided and non-empty."
+        ...     )
+        ... )
+        True
+    """
+
+    message = str(error).lower()
+    unsupported_markers = (
+        "either prompt or prompt_embeds must be provided and non-empty",
+        "input should be a valid string",
+        "prompt must be a string",
+        "invalid type for prompt",
+    )
+    return any(marker in message for marker in unsupported_markers)
+
+
+def is_retryable_async_transport_error(*, error: BaseException) -> bool:
+    """Return whether an async vLLM transport error can be retried safely.
+
+    Args:
+        error: Exception raised while posting or reading an aiohttp response.
+
+    Returns:
+        `True` for transient transport failures before a JSON body is available.
+
+    Example:
+        >>> is_retryable_async_transport_error(error=RuntimeError("Connection closed."))
+        True
+    """
+
+    if isinstance(
+        error,
+        (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError),
+    ):
+        return True
+    return isinstance(error, RuntimeError) and str(error) == "Connection closed."
+
+
+def async_post_retry_delay_seconds(*, retry_index: int) -> float:
+    """Return bounded exponential backoff delay for an async POST retry.
+
+    Args:
+        retry_index: Zero-based retry number after a failed request attempt.
+
+    Returns:
+        Delay in seconds before issuing the next retry.
+
+    Example:
+        >>> async_post_retry_delay_seconds(retry_index=0)
+        0.25
+    """
+
+    assert retry_index >= 0, "retry_index must be non-negative"
+    delay_seconds = ASYNC_POST_RETRY_BASE_DELAY_SECONDS * (2**retry_index)
+    return min(delay_seconds, ASYNC_POST_RETRY_MAX_DELAY_SECONDS)
 
 
 def normalize_vllm_base_url(*, base_url: str) -> str:
@@ -312,6 +385,7 @@ class VllmClient:
         model: str,
         prompt: str | None,
         prompt_token_ids: tuple[int, ...] | None,
+        resolved_prompt_token_ids: tuple[int, ...] | None = None,
         temperature: float,
         top_p: float,
         max_tokens: int,
@@ -321,6 +395,7 @@ class VllmClient:
         top_logprobs: int,
         priority: int | None = None,
         repetition_penalty: float | None = None,
+        parse_response_prompt_token_ids: bool = True,
     ) -> tuple[GenerationChoice, ...]:
         """Call `/v1/completions` and parse choices.
 
@@ -328,6 +403,8 @@ class VllmClient:
             model: Model name.
             prompt: Prompt text when prompting via text.
             prompt_token_ids: Prompt token IDs when prompting via token space.
+            resolved_prompt_token_ids: Locally resolved prompt-token chain used
+                to avoid reparsing echoed prompt ids from the response.
             temperature: Sampling temperature.
             top_p: Nucleus sampling value.
             max_tokens: Max generated tokens per choice.
@@ -337,6 +414,8 @@ class VllmClient:
             top_logprobs: Top alternatives count.
             priority: Optional request priority for scheduler-policy `priority`.
             repetition_penalty: Optional repetition penalty for generated tokens.
+            parse_response_prompt_token_ids: Whether to parse echoed
+                `choice.prompt_token_ids` arrays from the response body.
 
         Returns:
             Parsed generation choices.
@@ -356,7 +435,16 @@ class VllmClient:
             repetition_penalty=repetition_penalty,
         )
         response_payload = self._post(path="/completions", payload=payload)
-        return parse_completions_choices(response_payload=response_payload)
+        known_prompt_token_ids = (
+            resolved_prompt_token_ids
+            if resolved_prompt_token_ids is not None
+            else prompt_token_ids
+        )
+        return parse_completions_choices(
+            response_payload=response_payload,
+            fallback_prompt_token_ids=known_prompt_token_ids,
+            parse_choice_prompt_token_ids=parse_response_prompt_token_ids,
+        )
 
     def chat_completions(
         self,
@@ -474,6 +562,7 @@ class VllmClient:
         model: str,
         prompt: str | None,
         prompt_token_ids: tuple[int, ...] | None,
+        resolved_prompt_token_ids: tuple[int, ...] | None = None,
         temperature: float,
         top_p: float,
         max_tokens: int,
@@ -483,6 +572,7 @@ class VllmClient:
         top_logprobs: int,
         priority: int | None = None,
         repetition_penalty: float | None = None,
+        parse_response_prompt_token_ids: bool = True,
     ) -> tuple[GenerationChoice, ...]:
         """Call `/v1/completions` asynchronously and parse choices.
 
@@ -490,6 +580,8 @@ class VllmClient:
             model: Model name.
             prompt: Prompt text when prompting via text.
             prompt_token_ids: Prompt token IDs when prompting via token space.
+            resolved_prompt_token_ids: Locally resolved prompt-token chain used
+                to avoid reparsing echoed prompt ids from the response.
             temperature: Sampling temperature.
             top_p: Nucleus sampling value.
             max_tokens: Max generated tokens per choice.
@@ -499,6 +591,8 @@ class VllmClient:
             top_logprobs: Top alternatives count.
             priority: Optional request priority for scheduler-policy `priority`.
             repetition_penalty: Optional repetition penalty for generated tokens.
+            parse_response_prompt_token_ids: Whether to parse echoed
+                `choice.prompt_token_ids` arrays from the response body.
 
         Returns:
             Parsed generation choices.
@@ -519,7 +613,16 @@ class VllmClient:
             repetition_penalty=repetition_penalty,
         )
         response_payload = await self._post_async(path="/completions", payload=payload)
-        return parse_completions_choices(response_payload=response_payload)
+        known_prompt_token_ids = (
+            resolved_prompt_token_ids
+            if resolved_prompt_token_ids is not None
+            else prompt_token_ids
+        )
+        return parse_completions_choices(
+            response_payload=response_payload,
+            fallback_prompt_token_ids=known_prompt_token_ids,
+            parse_choice_prompt_token_ids=parse_response_prompt_token_ids,
+        )
 
     def tokenize(
         self,
@@ -730,7 +833,7 @@ class VllmClient:
             Parsed JSON payload.
         """
 
-        for attempt_index in range(2):
+        for attempt_index in range(ASYNC_POST_MAX_ATTEMPTS):
             session = await self._get_async_session()
             try:
                 return await self._post_url_with_session_async(
@@ -738,11 +841,21 @@ class VllmClient:
                     url=url,
                     payload=payload,
                 )
-            except aiohttp.ClientConnectionError as client_error:
-                await self._drop_async_session(expected_session=session)
-                if attempt_index == 0:
+            except (
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientPayloadError,
+                asyncio.TimeoutError,
+                RuntimeError,
+            ) as transport_error:
+                if not is_retryable_async_transport_error(error=transport_error):
+                    raise
+                if attempt_index + 1 < ASYNC_POST_MAX_ATTEMPTS:
+                    delay_seconds = async_post_retry_delay_seconds(
+                        retry_index=attempt_index
+                    )
+                    await asyncio.sleep(delay_seconds)
                     continue
-                raise VllmRequestError(str(client_error)) from client_error
+                raise VllmRequestError(str(transport_error)) from transport_error
             except aiohttp.ClientError as client_error:
                 raise VllmRequestError(str(client_error)) from client_error
         raise AssertionError("async vLLM request retry loop exhausted unexpectedly")
@@ -795,6 +908,7 @@ def build_completions_payload(
         "n": n,
         "seed": seed,
         "return_token_ids": True,
+        "return_prompt_token_ids": False,
     }
     if prompt is not None:
         payload["prompt"] = prompt
@@ -919,22 +1033,34 @@ def build_detokenize_payload(
 
 
 def parse_completions_choices(
-    *, response_payload: dict[str, Any]
+    *,
+    response_payload: dict[str, Any],
+    fallback_prompt_token_ids: tuple[int, ...] | None = None,
+    parse_choice_prompt_token_ids: bool = True,
 ) -> tuple[GenerationChoice, ...]:
     """Parse completion choices from response payload.
 
     Args:
         response_payload: JSON payload from `/v1/completions`.
+        fallback_prompt_token_ids: Known prompt-token chain to reuse when the
+            caller already resolved it locally.
+        parse_choice_prompt_token_ids: Whether to parse echoed
+            `choice.prompt_token_ids` arrays from the response body.
 
     Returns:
         Parsed generation choices.
     """
     raw_choices = _require_choices(response_payload=response_payload)
-    prompt_ids = _parse_token_ids(raw_value=response_payload.get("prompt_token_ids"))
+    prompt_ids = fallback_prompt_token_ids
+    if prompt_ids is None:
+        prompt_ids = _parse_token_ids(
+            raw_value=response_payload.get("prompt_token_ids")
+        )
     parsed_choices = [
         _parse_one_completion_choice(
             choice=choice,
             fallback_prompt_token_ids=prompt_ids,
+            parse_prompt_token_ids=parse_choice_prompt_token_ids,
         )
         for choice in raw_choices
     ]
@@ -942,23 +1068,35 @@ def parse_completions_choices(
 
 
 def parse_chat_completions_choices(
-    *, response_payload: dict[str, Any]
+    *,
+    response_payload: dict[str, Any],
+    fallback_prompt_token_ids: tuple[int, ...] | None = None,
+    parse_choice_prompt_token_ids: bool = True,
 ) -> tuple[GenerationChoice, ...]:
     """Parse completion choices from `/v1/chat/completions` response payload.
 
     Args:
         response_payload: JSON payload from `/v1/chat/completions`.
+        fallback_prompt_token_ids: Known prompt-token chain to reuse when the
+            caller already resolved it locally.
+        parse_choice_prompt_token_ids: Whether to parse echoed
+            `choice.prompt_token_ids` arrays from the response body.
 
     Returns:
         Parsed generation choices.
     """
 
     raw_choices = _require_choices(response_payload=response_payload)
-    prompt_ids = _parse_token_ids(raw_value=response_payload.get("prompt_token_ids"))
+    prompt_ids = fallback_prompt_token_ids
+    if prompt_ids is None:
+        prompt_ids = _parse_token_ids(
+            raw_value=response_payload.get("prompt_token_ids")
+        )
     parsed_choices = [
         _parse_one_chat_completion_choice(
             choice=choice,
             fallback_prompt_token_ids=prompt_ids,
+            parse_prompt_token_ids=parse_choice_prompt_token_ids,
         )
         for choice in raw_choices
     ]
@@ -1015,12 +1153,14 @@ def _parse_one_completion_choice(
     *,
     choice: dict[str, Any],
     fallback_prompt_token_ids: tuple[int, ...] | None,
+    parse_prompt_token_ids: bool = True,
 ) -> GenerationChoice:
     """Parse one completion choice.
 
     Args:
         choice: One choice payload from `/v1/completions`.
         fallback_prompt_token_ids: Request-level prompt IDs when provided.
+        parse_prompt_token_ids: Whether to parse `choice.prompt_token_ids`.
 
     Returns:
         Parsed generation choice.
@@ -1032,9 +1172,13 @@ def _parse_one_completion_choice(
         else {}
     )
     stop_reason = _parse_stop_reason(raw_value=choice.get("stop_reason"))
-    prompt_token_ids = _parse_token_ids(raw_value=choice.get("prompt_token_ids"))
-    if prompt_token_ids is None:
-        prompt_token_ids = fallback_prompt_token_ids
+    prompt_token_ids = fallback_prompt_token_ids
+    if parse_prompt_token_ids:
+        parsed_prompt_token_ids = _parse_token_ids(
+            raw_value=choice.get("prompt_token_ids")
+        )
+        if parsed_prompt_token_ids is not None:
+            prompt_token_ids = parsed_prompt_token_ids
     token_ids = _parse_choice_token_ids(choice=choice)
     tokens = _parse_completion_tokens(raw_logprobs=raw_logprobs)
     text = str(choice.get("text", ""))
@@ -1055,12 +1199,14 @@ def _parse_one_chat_completion_choice(
     *,
     choice: dict[str, Any],
     fallback_prompt_token_ids: tuple[int, ...] | None,
+    parse_prompt_token_ids: bool = True,
 ) -> GenerationChoice:
     """Parse one chat-completion choice into canonical generation shape.
 
     Args:
         choice: One choice payload from `/v1/chat/completions`.
         fallback_prompt_token_ids: Request-level prompt IDs when provided.
+        parse_prompt_token_ids: Whether to parse `choice.prompt_token_ids`.
 
     Returns:
         Parsed generation choice.
@@ -1075,6 +1221,7 @@ def _parse_one_chat_completion_choice(
     return _parse_one_completion_choice(
         choice=normalized_choice,
         fallback_prompt_token_ids=fallback_prompt_token_ids,
+        parse_prompt_token_ids=parse_prompt_token_ids,
     )
 
 

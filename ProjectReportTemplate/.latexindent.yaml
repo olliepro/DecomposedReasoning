@@ -1,0 +1,12 @@
+defaultIndent: "  "
+modifyLineBreaks:
+  textWrapOptions:
+    columns: 88
+    perCodeBlockBasis: 1
+    all: 1
+    alignAtAmpersandTakesPriority: 1
+    optionalArguments: 0
+    mandatoryArguments: 0
+    filecontents: 0
+  removeParagraphLineBreaks:
+    all: 0

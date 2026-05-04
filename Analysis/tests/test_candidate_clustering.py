@@ -19,6 +19,7 @@ def test_strip_steer_suffix_removes_trailing_close_tag() -> None:
     """Strip helper should remove trailing close-tag content."""
 
     assert strip_steer_suffix(text="Try factoring</steer>") == "Try factoring"
+    assert strip_steer_suffix(text="<steer>Try factoring</steer>") == "Try factoring"
     assert strip_steer_suffix(text="Try factoring</steer>   ") == "Try factoring"
     assert (
         strip_steer_suffix(text='Try "A.L.G.O.R.I.T.H.M" pun</ste ')
@@ -26,6 +27,7 @@ def test_strip_steer_suffix_removes_trailing_close_tag() -> None:
     )
     assert strip_steer_suffix(text="Try factoring</st") == "Try factoring"
     assert strip_steer_suffix(text="Try factoring") == "Try factoring"
+    assert strip_steer_suffix(text="</think>") == "</think>"
 
 
 def test_build_cluster_prompt_previous_context_behavior() -> None:
@@ -52,7 +54,7 @@ def test_build_cluster_prompt_previous_context_behavior() -> None:
     assert "- Factor" in with_context
     assert "  >> Substitute" in with_context
     assert (
-        'The last few words of the previous step\'s execution are:\n'
+        "The last few words of the previous step's execution are:\n"
         '"check units and multiply by 3600"'
     ) in with_context
     assert "## Context on the current process" not in without_context

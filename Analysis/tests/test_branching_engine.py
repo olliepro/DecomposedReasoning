@@ -48,6 +48,7 @@ class FakeClient:
         model: str,
         prompt: str | None,
         prompt_token_ids: tuple[int, ...] | None,
+        resolved_prompt_token_ids: tuple[int, ...] | None = None,
         temperature: float,
         top_p: float,
         max_tokens: int,
@@ -55,12 +56,14 @@ class FakeClient:
         seed: int,
         stop: tuple[str, ...] | None,
         top_logprobs: int,
+        parse_response_prompt_token_ids: bool = True,
     ) -> tuple[GenerationChoice, ...]:
         self.completion_calls.append(
             {
                 "model": model,
                 "prompt": prompt,
                 "prompt_token_ids": prompt_token_ids,
+                "resolved_prompt_token_ids": resolved_prompt_token_ids,
                 "temperature": temperature,
                 "top_p": top_p,
                 "max_tokens": max_tokens,
@@ -68,6 +71,7 @@ class FakeClient:
                 "seed": seed,
                 "stop": stop,
                 "top_logprobs": top_logprobs,
+                "parse_response_prompt_token_ids": parse_response_prompt_token_ids,
             }
         )
         assert self.responses, "no fake response queued"
@@ -96,6 +100,7 @@ class TokenPromptRejectingClient(FakeClient):
         model: str,
         prompt: str | None,
         prompt_token_ids: tuple[int, ...] | None,
+        resolved_prompt_token_ids: tuple[int, ...] | None = None,
         temperature: float,
         top_p: float,
         max_tokens: int,
@@ -103,6 +108,7 @@ class TokenPromptRejectingClient(FakeClient):
         seed: int,
         stop: tuple[str, ...] | None,
         top_logprobs: int,
+        parse_response_prompt_token_ids: bool = True,
     ) -> tuple[GenerationChoice, ...]:
         if prompt_token_ids is not None:
             raise VllmRequestError(
@@ -112,6 +118,7 @@ class TokenPromptRejectingClient(FakeClient):
             model=model,
             prompt=prompt,
             prompt_token_ids=prompt_token_ids,
+            resolved_prompt_token_ids=resolved_prompt_token_ids,
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
@@ -119,6 +126,7 @@ class TokenPromptRejectingClient(FakeClient):
             seed=seed,
             stop=stop,
             top_logprobs=top_logprobs,
+            parse_response_prompt_token_ids=parse_response_prompt_token_ids,
         )
 
 
@@ -258,14 +266,14 @@ def test_trailing_partial_tag_suffix_detects_known_prefixes() -> None:
     single_angle_partial = trailing_partial_tag_suffix(text="prefix<")
     assert steer_partial == ("<ste", "<steer>")
     assert exec_partial == ("</ex", "</exec>")
-    assert single_angle_partial == ("<", "<steer>")
+    assert single_angle_partial is None
 
 
-def test_forced_boundary_suffix_reuses_observed_separator() -> None:
-    """Forced boundary should reuse `</exec>`-to-`<steer>` whitespace when available."""
+def test_forced_boundary_suffix_closes_exec_without_forcing_steer() -> None:
+    """Forced boundary should close exec blocks without forcing `<steer>`."""
     text = "<exec>a</exec>\n\n<steer>x</steer><exec>y"
     suffix = forced_boundary_suffix(text=text)
-    assert suffix == "</exec>\n\n<steer>"
+    assert suffix == "\n</exec>\n\n"
 
 
 def test_stop_finished_outcome_injects_canonical_steer() -> None:
@@ -613,8 +621,8 @@ def test_stop_without_reason_with_think_close_does_not_continue() -> None:
     assert fake_client.tokenize_calls == []
 
 
-def test_length_repaired_steer_closes_exec_before_branch_boundary() -> None:
-    """Length repair to `<steer>` inside `<exec>` should close exec before branching."""
+def test_length_repaired_steer_prefix_closes_exec_before_branch_boundary() -> None:
+    """A 2+ char `<steer>` prefix inside `<exec>` should preserve steer branching."""
     fake_client = FakeClient(responses=[])
     config = RunConfig(base_url="http://127.0.0.1:8000/v1", model="m", prompt="p")
     state = AnalyzerState(
@@ -624,7 +632,7 @@ def test_length_repaired_steer_closes_exec_before_branch_boundary() -> None:
         prompt_token_ids=(1, 2, 3),
     )
     cursor = RolloutCursor(
-        text="<think><exec>work<",
+        text="<think><exec>work<s",
         scan_index=0,
         generated_tokens=0,
         token_stats=[],
@@ -632,7 +640,7 @@ def test_length_repaired_steer_closes_exec_before_branch_boundary() -> None:
     )
     choice = build_choice(
         index=0,
-        text="<",
+        text="<s",
         token_logprob=-0.1,
         finish_reason="length",
     )

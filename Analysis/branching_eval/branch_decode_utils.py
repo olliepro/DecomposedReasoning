@@ -26,6 +26,7 @@ EXEC_BLOCK_PATTERN = re.compile(
 EXEC_OPEN_TAG_PATTERN = re.compile(r"<exec\b[^>]*>", flags=re.IGNORECASE)
 ROLLOUT_STEER_STOP = ("<steer",)
 DEFAULT_EXEC_REPEAT_LOOKBACK_WINDOW = 3
+THINK_CLOSE_TAG = "</think>"
 
 
 @dataclass(frozen=True)
@@ -553,14 +554,18 @@ def candidate_from_choice(
     Args:
         candidate_id: Candidate id in its pool.
         choice: Completion choice.
-        enforce_steer_stop_boundary: Assert no text follows first `</steer>`.
+        enforce_steer_stop_boundary: Assert no text follows first terminal
+            `</steer>` or `</think>` marker.
     Returns:
         Candidate record.
     """
 
     token_ids = tuple(choice.token_ids) if choice.token_ids is not None else ()
     token_traces = token_traces_from_choice(choice=choice)
-    text = str(choice.text)
+    text = append_think_close_stop_text(
+        text=str(choice.text),
+        stop_reason=choice.stop_reason,
+    )
     if enforce_steer_stop_boundary:
         assert_no_text_after_first_steer_close(text=text)
     return CandidateRecord(
@@ -573,24 +578,78 @@ def candidate_from_choice(
     )
 
 
-def assert_no_text_after_first_steer_close(*, text: str) -> None:
-    """Assert steer-stopped text has no suffix after first `</steer>` marker.
+def is_think_close_stop_reason(*, stop_reason: int | str | None) -> bool:
+    """Return whether a stop reason corresponds to `</think>`.
 
     Args:
-        text: Candidate text generated with steer stop sequence.
+        stop_reason: vLLM stop reason value.
+
+    Returns:
+        `True` for string stop reasons matching the think-close marker.
+    """
+
+    if not isinstance(stop_reason, str):
+        return False
+    return "</think" in stop_reason.lower()
+
+
+def append_think_close_stop_text(*, text: str, stop_reason: int | str | None) -> str:
+    """Append `</think>` to display text when it was the excluded stop marker.
+
+    Args:
+        text: Raw choice text.
+        stop_reason: vLLM stop reason value.
+
+    Returns:
+        Text with a visible terminal `</think>` marker when appropriate.
+    """
+
+    if not is_think_close_stop_reason(stop_reason=stop_reason):
+        return text
+    if THINK_CLOSE_TAG in text.lower():
+        return text
+    return text + THINK_CLOSE_TAG
+
+
+def text_before_first_think_close(*, text: str) -> str:
+    """Return text preceding the first `</think>` marker.
+
+    Args:
+        text: Candidate text.
+
+    Returns:
+        Prefix before `</think>`, or the original text when absent.
+    """
+
+    close_index = text.lower().find(THINK_CLOSE_TAG)
+    if close_index < 0:
+        return text
+    return text[:close_index]
+
+
+def assert_no_text_after_first_steer_close(*, text: str) -> None:
+    """Assert steer-stopped text has no suffix after its first terminal marker.
+
+    Args:
+        text: Candidate text generated with steer stop sequences.
 
     Returns:
         None.
     """
 
     lowered = text.lower()
-    close_index = lowered.find(STEER_CLOSE_TAG)
-    if close_index < 0:
+    terminal_spans = tuple(
+        (index, marker)
+        for marker in (STEER_CLOSE_TAG, THINK_CLOSE_TAG)
+        if (index := lowered.find(marker)) >= 0
+    )
+    if not terminal_spans:
         return
-    suffix = text[close_index + len(STEER_CLOSE_TAG) :]
+    close_index, marker = min(terminal_spans, key=lambda item: item[0])
+    suffix = text[close_index + len(marker) :]
     assert (
         suffix.strip() == ""
-    ), f"unexpected text after first </steer> marker: suffix={suffix!r}"
+    ), f"unexpected text after first {marker} marker: suffix={suffix!r}"
 
 
 def selected_ids_for_mode(

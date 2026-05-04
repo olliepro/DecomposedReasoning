@@ -30,6 +30,9 @@ from trl.trainer.sft_trainer import SFTTrainer
 
 from sft_training.config_types import LoraConfig as RunLoraConfig
 from sft_training.config_types import RunConfig
+from sft_training.non_sequitur_masking import MaskTargets
+from sft_training.non_sequitur_masking import build_assistant_tokenized_record
+from sft_training.non_sequitur_masking import extract_mask_targets
 from sft_training.wandb_utils import build_wandb_run_context
 
 
@@ -71,11 +74,13 @@ class ConversationSample:
         sample_id: Unique row identifier.
         dataset_source: Source dataset name.
         messages: Entire normalized conversation message list.
+        mask_targets: Optional non-sequitur masking metadata.
     """
 
     sample_id: str
     dataset_source: str
     messages: list[dict[str, str]]
+    mask_targets: MaskTargets | None = None
 
     def to_record(self) -> dict[str, object]:
         """Convert sample to a conversational HuggingFace Dataset row.
@@ -83,11 +88,14 @@ class ConversationSample:
         Returns:
             Dictionary row compatible with TRL conversational datasets.
         """
-        return {
+        record: dict[str, object] = {
             "id": self.sample_id,
             "dataset_source": self.dataset_source,
             "messages": self.messages,
         }
+        if self.mask_targets is not None:
+            record["mask_targets"] = self.mask_targets.to_record()
+        return record
 
 
 TrainingSample = PromptCompletionSample | ConversationSample
@@ -256,35 +264,49 @@ def build_completion_only_sample(row: dict[str, Any]) -> PromptCompletionSample:
     )
 
 
-def build_full_conversation_sample(row: dict[str, Any]) -> ConversationSample:
+def build_full_conversation_sample(
+    row: dict[str, Any],
+    include_mask_targets: bool = False,
+) -> ConversationSample:
     """Convert one row into a full-conversation training example.
 
     Args:
         row: Raw transformed dataset row containing `messages`.
+        include_mask_targets: Whether to preserve non-sequitur mask metadata.
 
     Returns:
         Full-conversation sample that keeps the complete chat intact.
     """
     sample_id, dataset_source = _sample_metadata(row=row)
+    mask_targets = extract_mask_targets(row=row) if include_mask_targets else None
     return ConversationSample(
         sample_id=sample_id,
         dataset_source=dataset_source,
         messages=_normalized_messages(row=row),
+        mask_targets=mask_targets,
     )
 
 
-def build_sample(row: dict[str, Any], supervision_mode: str) -> TrainingSample:
+def build_sample(
+    row: dict[str, Any],
+    supervision_mode: str,
+    include_mask_targets: bool = False,
+) -> TrainingSample:
     """Build one training sample using the configured supervision mode.
 
     Args:
         row: Raw transformed dataset row.
         supervision_mode: Dataset supervision style for SFT.
+        include_mask_targets: Whether to preserve non-sequitur mask metadata.
 
     Returns:
         Prompt-completion or full-conversation sample object.
     """
     if supervision_mode in ("full_conversation", "assistant_only"):
-        return build_full_conversation_sample(row=row)
+        return build_full_conversation_sample(
+            row=row,
+            include_mask_targets=include_mask_targets,
+        )
     return build_completion_only_sample(row=row)
 
 
@@ -420,7 +442,12 @@ def build_datasets(
     """
     rows = read_jsonl(path=config.dataset_path)
     samples = [
-        build_sample(row=row, supervision_mode=config.supervision_mode) for row in rows
+        build_sample(
+            row=row,
+            supervision_mode=config.supervision_mode,
+            include_mask_targets=config.mask_non_sequitur_steer_spans,
+        )
+        for row in rows
     ]
     if max_train_samples is not None:
         samples = samples[:max_train_samples]
@@ -489,7 +516,7 @@ def init_wandb_run(config: RunConfig) -> None:
 
 
 def load_tokenizer(config: RunConfig):
-    """Load tokenizer and ensure it has a valid pad token.
+    """Load tokenizer and apply any configured training chat template.
 
     Args:
         config: Typed run configuration.
@@ -501,7 +528,95 @@ def load_tokenizer(config: RunConfig):
         pretrained_model_name_or_path=config.model_name_or_path,
         trust_remote_code=True,
     )
+    if config.chat_template_path is not None:
+        tokenizer.chat_template = config.chat_template_path.read_text(encoding="utf-8")
     return tokenizer
+
+
+def _tokenize_masked_conversation_example(
+    example: dict[str, Any],
+    tokenizer: Any,
+) -> dict[str, list[int]]:
+    """Tokenize one conversation row with optional non-sequitur masking.
+
+    Args:
+        example: Conversational dataset row with `messages` and optional `mask_targets`.
+        tokenizer: Active training tokenizer.
+
+    Returns:
+        Tokenized row payload containing `input_ids` and `assistant_masks`.
+    """
+    messages = cast(list[dict[str, str]], example["messages"])
+    return build_assistant_tokenized_record(
+        tokenizer=tokenizer,
+        messages=messages,
+        mask_targets=extract_mask_targets(row=example),
+    )
+
+
+def _pretokenize_non_sequitur_dataset(
+    dataset: Dataset,
+    tokenizer: Any,
+    dataset_name: str,
+) -> Dataset:
+    """Pretokenize one conversational dataset with non-sequitur masking.
+
+    Args:
+        dataset: HuggingFace conversational dataset.
+        tokenizer: Active training tokenizer.
+        dataset_name: Human-readable dataset label for progress logs.
+
+    Returns:
+        Pretokenized dataset with `assistant_masks` ready for TRL packing.
+    """
+    remove_columns = [
+        column_name
+        for column_name in ("messages", "mask_targets")
+        if column_name in dataset.column_names
+    ]
+    return dataset.map(
+        _tokenize_masked_conversation_example,
+        fn_kwargs={"tokenizer": tokenizer},
+        batched=False,
+        remove_columns=remove_columns,
+        desc=f"Tokenizing {dataset_name} dataset with non-sequitur masking",
+    )
+
+
+def _maybe_pretokenize_non_sequitur_datasets(
+    config: RunConfig,
+    tokenizer: Any,
+    train_dataset: Dataset,
+    eval_dataset: Dataset,
+) -> tuple[Dataset, Dataset]:
+    """Pretokenize train/eval datasets when non-sequitur masking is enabled.
+
+    Args:
+        config: Typed run configuration.
+        tokenizer: Active training tokenizer.
+        train_dataset: Train split before TRL preprocessing.
+        eval_dataset: Eval split before TRL preprocessing.
+
+    Returns:
+        Train/eval datasets, pretokenized only when masking is enabled.
+    """
+    if not config.mask_non_sequitur_steer_spans:
+        return train_dataset, eval_dataset
+    assert (
+        config.supervision_mode == "assistant_only"
+    ), "Non-sequitur masking only supports assistant-only supervision."
+    return (
+        _pretokenize_non_sequitur_dataset(
+            dataset=train_dataset,
+            tokenizer=tokenizer,
+            dataset_name="train",
+        ),
+        _pretokenize_non_sequitur_dataset(
+            dataset=eval_dataset,
+            tokenizer=tokenizer,
+            dataset_name="eval",
+        ),
+    )
 
 
 def load_model(
@@ -697,8 +812,25 @@ def build_training_args(
         padding_free=config.padding_free,
         eval_packing=config.eval_packing,
         completion_only_loss=(config.supervision_mode == "completion_only"),
-        assistant_only_loss=(config.supervision_mode == "assistant_only"),
+        assistant_only_loss=uses_trl_assistant_only_loss(config=config),
         **_deepspeed_kwargs(config=config),
+    )
+
+
+def uses_trl_assistant_only_loss(config: RunConfig) -> bool:
+    """Return whether TRL should derive assistant masks internally.
+
+    Args:
+        config: Typed run configuration.
+
+    Returns:
+        True only for unmasked assistant-only runs. Masked runs pretokenize
+        their own `assistant_masks`, so TRL should not re-enter its
+        conversational assistant-only path.
+    """
+    return (
+        config.supervision_mode == "assistant_only"
+        and not config.mask_non_sequitur_steer_spans
     )
 
 
@@ -718,6 +850,12 @@ def build_trainer(
         Configured trainer instance.
     """
     tokenizer = load_tokenizer(config=config)
+    train_dataset, eval_dataset = _maybe_pretokenize_non_sequitur_datasets(
+        config=config,
+        tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+    )
     loaded_model = load_model(
         config=config,
         tokenizer=tokenizer,

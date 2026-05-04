@@ -19,15 +19,21 @@ from branching_eval.branch_decode_utils import (
     consume_choice_tokens,
     initialize_exec_repetition_state,
     initialize_steer_repetition_state,
+    is_think_close_stop_reason,
     is_explicit_steer_stop,
     rollout_stop_markers,
     selected_ids_for_mode,
+    text_before_first_think_close,
     update_exec_repetition_state,
     update_steer_repetition_state,
     updated_prompt_token_ids,
 )
 from branching_eval.config_types import BranchingConfig, DecodingConfig
-from branching_eval.legacy_steer_rollout import contains_think_close_or_partial
+from branching_eval.legacy_steer_rollout import (
+    contains_think_close,
+    contains_think_close_or_partial,
+)
+from branching_eval.local_lru import LocalLruCache
 from branching_eval.runtime_types import DecodeOutcome, PathState
 from branching_eval.selector_runtime import (
     resolve_openai_api_key,
@@ -37,8 +43,10 @@ from branching_eval.selector_runtime import (
 )
 from branching_eval.selector_types import SelectionOutcome, SelectorMode, SelectorParams
 from branching_eval.steer_normalization import (
+    has_trailing_steer_open_prefix,
     normalize_steer_boundary_text,
     selected_candidate_normalization_suffix,
+    steer_candidate_stop_markers,
 )
 from branching_eval.event_types import EventContext
 from branching_eval.steer_decode_flow import (
@@ -65,7 +73,13 @@ from branching_eval.tree_types import (
 )
 from chat_templating import build_raw_im_prompt
 from token_metrics import probability_from_logprob
-from vllm_client import GenerationChoice, ParsedToken, VllmClient, VllmRequestError
+from vllm_client import (
+    GenerationChoice,
+    ParsedToken,
+    VllmClient,
+    VllmRequestError,
+    is_prompt_token_ids_unsupported_error,
+)
 
 INLINE_EPSILON_SELECTOR_MODE: SelectorMode = "embed_diverse_topk_random"
 EXEC_REPEAT_SIMILARITY_THRESHOLD = 0.85
@@ -83,6 +97,8 @@ STEER_REPETITION_REQUEST_KINDS = frozenset(
 NODE_CHILD_ID_PATTERN = re.compile(
     r"^node_(?P<parent_node_id>.+)_(?P<child_offset>\d+)_(?P<candidate_id>\d+)$"
 )
+TOKENIZE_CACHE_MAX_ENTRIES = 512
+DETOKENIZE_CACHE_MAX_ENTRIES = 256
 
 
 @dataclass(frozen=True)
@@ -235,6 +251,12 @@ class BranchExecutor:
         self._request_stream_state: dict[str, _RequestStreamState] = {}
         self._request_event_counter = 0
         self._candidate_pool_counter = 0
+        self._tokenize_text_cache: LocalLruCache[str, tuple[int, ...]] = LocalLruCache(
+            max_entries=TOKENIZE_CACHE_MAX_ENTRIES
+        )
+        self._detokenize_ids_cache: LocalLruCache[tuple[int, ...], str] = LocalLruCache(
+            max_entries=DETOKENIZE_CACHE_MAX_ENTRIES
+        )
         self._selector_http_session: aiohttp.ClientSession | None = None
         self._selector_http_session_loop_id: int | None = None
 
@@ -1832,6 +1854,20 @@ class BranchExecutor:
                 branch_points_used=state.branch_points_used,
             )
 
+        def think_closed_outcome() -> DecodeOutcome:
+            """Build terminal outcome when the prefix already contains `</think>`."""
+
+            return DecodeOutcome(
+                event_type="terminated",
+                trigger_type=None,
+                assistant_prefix=assistant_prefix,
+                prompt_token_ids=prompt_token_ids,
+                token_ids=tuple(token_ids),
+                token_traces=tuple(token_traces),
+                generated_tokens=generated_tokens,
+                stop_reason="think_end",
+            )
+
         def update_exec_repetition(*, delta_text: str) -> float | None:
             """Update exec repetition tracking from one appended text delta."""
 
@@ -1921,7 +1957,12 @@ class BranchExecutor:
                 )
             return None
 
+        if contains_think_close(text=assistant_prefix):
+            return finalize_outcome(outcome=think_closed_outcome())
+
         while generated_tokens < self.decoding.max_gen_toks:
+            if contains_think_close(text=assistant_prefix):
+                return finalize_outcome(outcome=think_closed_outcome())
             chunk_prefix_before = assistant_prefix
             chunk_prompt_token_ids_before = prompt_token_ids
             chunk_token_ids_before = tuple(token_ids)
@@ -2192,10 +2233,16 @@ class BranchExecutor:
                 )
                 return finalize_outcome(outcome=think_close_outcome)
             if explicit_steer_stop:
-                normalized_prefix, normalized_prompt_ids = (
-                    await self._normalize_steer_prefix_prompt_ids_async(
+                explicit_prefix, explicit_prompt_ids = (
+                    await self._append_explicit_steer_stop_prefix_async(
                         assistant_prefix=assistant_prefix,
                         prompt_token_ids=prompt_token_ids,
+                    )
+                )
+                normalized_prefix, normalized_prompt_ids = (
+                    await self._normalize_steer_prefix_prompt_ids_async(
+                        assistant_prefix=explicit_prefix,
+                        prompt_token_ids=explicit_prompt_ids,
                     )
                 )
                 explicit_trigger = replace(
@@ -2577,7 +2624,7 @@ class BranchExecutor:
             prompt_token_ids=canonical_prompt_ids,
             max_tokens=candidate_token_budget,
             n=self.branching.num_candidates,
-            stop=("</steer",),
+            stop=steer_candidate_stop_markers(text=canonical_prefix),
             temperature=1.0,
             request_kind="candidate_pool_steer_boundary",
             request_stream_id=(
@@ -2699,11 +2746,7 @@ class BranchExecutor:
 
         if self._steer_normalization_token_budget is None:
             suffix_text, _ = selected_candidate_normalization_suffix(text="")
-            suffix_token_ids = self.client.tokenize(
-                model=self.model_name,
-                text=suffix_text,
-                add_special_tokens=False,
-            )
+            suffix_token_ids = self._tokenize_text(text=suffix_text)
             self._assert_text_token_alignment(
                 text=suffix_text,
                 token_ids=tuple(suffix_token_ids),
@@ -2808,16 +2851,14 @@ class BranchExecutor:
         normalized_prefix = normalize_steer_boundary_text(text=assistant_prefix)
         if prompt_token_ids is None:
             return normalized_prefix, None
-        if not normalized_prefix.startswith(assistant_prefix):
-            return normalized_prefix, None
+        assert normalized_prefix.startswith(assistant_prefix), (
+            "steer prefix normalization must be append-only when prompt_token_ids "
+            "are available"
+        )
         injected_suffix = normalized_prefix[len(assistant_prefix) :]
         if not injected_suffix:
             return normalized_prefix, prompt_token_ids
-        suffix_token_ids = self.client.tokenize(
-            model=self.model_name,
-            text=injected_suffix,
-            add_special_tokens=False,
-        )
+        suffix_token_ids = self._tokenize_text(text=injected_suffix)
         self._assert_text_token_alignment(
             text=injected_suffix,
             token_ids=tuple(suffix_token_ids),
@@ -2836,8 +2877,10 @@ class BranchExecutor:
         normalized_prefix = normalize_steer_boundary_text(text=assistant_prefix)
         if prompt_token_ids is None:
             return normalized_prefix, None
-        if not normalized_prefix.startswith(assistant_prefix):
-            return normalized_prefix, None
+        assert normalized_prefix.startswith(assistant_prefix), (
+            "steer prefix normalization must be append-only when prompt_token_ids "
+            "are available"
+        )
         injected_suffix = normalized_prefix[len(assistant_prefix) :]
         if not injected_suffix:
             return normalized_prefix, prompt_token_ids
@@ -2849,6 +2892,28 @@ class BranchExecutor:
         )
         return normalized_prefix, tuple(prompt_token_ids) + tuple(suffix_token_ids)
 
+    async def _append_explicit_steer_stop_prefix_async(
+        self,
+        *,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+    ) -> tuple[str, tuple[int, ...] | None]:
+        """Append/tokenize excluded `<steer` stop marker before normalization."""
+
+        if has_trailing_steer_open_prefix(text=assistant_prefix):
+            return assistant_prefix, prompt_token_ids
+        stop_prefix = "<steer"
+        updated_prefix = assistant_prefix + stop_prefix
+        if prompt_token_ids is None:
+            return updated_prefix, None
+        suffix_token_ids = await self._tokenize_text_async(text=stop_prefix)
+        await self._assert_text_token_alignment_async(
+            text=stop_prefix,
+            token_ids=tuple(suffix_token_ids),
+            context="explicit_steer_stop_prefix",
+        )
+        return updated_prefix, tuple(prompt_token_ids) + tuple(suffix_token_ids)
+
     def _normalized_child_candidate(
         self, *, trigger_type: str, candidate: CandidateRecord
     ) -> tuple[str, tuple[int, ...]]:
@@ -2856,26 +2921,23 @@ class BranchExecutor:
         assert (
             trigger_type == "steer_boundary"
         ), f"unsupported trigger_type: {trigger_type}"
-        assert_no_text_after_first_steer_close(text=aligned_candidate.text)
+        candidate_text, candidate_token_ids = self._append_think_close_stop_suffix(
+            candidate=aligned_candidate
+        )
+        assert_no_text_after_first_steer_close(text=candidate_text)
         injected_suffix, _ = selected_candidate_normalization_suffix(
-            text=aligned_candidate.text
+            text=candidate_text
         )
         if not injected_suffix:
             self._assert_text_token_alignment(
-                text=aligned_candidate.text,
-                token_ids=tuple(aligned_candidate.token_ids),
+                text=candidate_text,
+                token_ids=tuple(candidate_token_ids),
                 context="normalized_child_candidate",
             )
-            return aligned_candidate.text, aligned_candidate.token_ids
-        suffix_token_ids = self.client.tokenize(
-            model=self.model_name,
-            text=injected_suffix,
-            add_special_tokens=False,
-        )
-        normalized_text = aligned_candidate.text + injected_suffix
-        normalized_token_ids = tuple(aligned_candidate.token_ids) + tuple(
-            suffix_token_ids
-        )
+            return candidate_text, candidate_token_ids
+        suffix_token_ids = self._tokenize_text(text=injected_suffix)
+        normalized_text = candidate_text + injected_suffix
+        normalized_token_ids = tuple(candidate_token_ids) + tuple(suffix_token_ids)
         self._assert_text_token_alignment(
             text=normalized_text,
             token_ids=normalized_token_ids,
@@ -2894,28 +2956,57 @@ class BranchExecutor:
         assert (
             trigger_type == "steer_boundary"
         ), f"unsupported trigger_type: {trigger_type}"
-        assert_no_text_after_first_steer_close(text=aligned_candidate.text)
+        candidate_text, candidate_token_ids = (
+            await self._append_think_close_stop_suffix_async(
+                candidate=aligned_candidate
+            )
+        )
+        assert_no_text_after_first_steer_close(text=candidate_text)
         injected_suffix, _ = selected_candidate_normalization_suffix(
-            text=aligned_candidate.text
+            text=candidate_text
         )
         if not injected_suffix:
             await self._assert_text_token_alignment_async(
-                text=aligned_candidate.text,
-                token_ids=tuple(aligned_candidate.token_ids),
+                text=candidate_text,
+                token_ids=tuple(candidate_token_ids),
                 context="normalized_child_candidate",
             )
-            return aligned_candidate.text, aligned_candidate.token_ids
+            return candidate_text, candidate_token_ids
         suffix_token_ids = await self._tokenize_text_async(text=injected_suffix)
-        normalized_text = aligned_candidate.text + injected_suffix
-        normalized_token_ids = tuple(aligned_candidate.token_ids) + tuple(
-            suffix_token_ids
-        )
+        normalized_text = candidate_text + injected_suffix
+        normalized_token_ids = tuple(candidate_token_ids) + tuple(suffix_token_ids)
         await self._assert_text_token_alignment_async(
             text=normalized_text,
             token_ids=normalized_token_ids,
             context="normalized_child_candidate",
         )
         return (normalized_text, normalized_token_ids)
+
+    def _append_think_close_stop_suffix(
+        self, *, candidate: CandidateRecord
+    ) -> tuple[str, tuple[int, ...]]:
+        """Append/tokenize `</think>` when it was returned as a stop reason."""
+
+        if not is_think_close_stop_reason(stop_reason=candidate.stop_reason):
+            return candidate.text, candidate.token_ids
+        base_text = text_before_first_think_close(text=candidate.text)
+        suffix_token_ids = self._tokenize_text(text="</think>")
+        return base_text + "</think>", tuple(candidate.token_ids) + tuple(
+            suffix_token_ids
+        )
+
+    async def _append_think_close_stop_suffix_async(
+        self, *, candidate: CandidateRecord
+    ) -> tuple[str, tuple[int, ...]]:
+        """Async variant for appending/tokenizing terminal `</think>` stops."""
+
+        if not is_think_close_stop_reason(stop_reason=candidate.stop_reason):
+            return candidate.text, candidate.token_ids
+        base_text = text_before_first_think_close(text=candidate.text)
+        suffix_token_ids = await self._tokenize_text_async(text="</think>")
+        return base_text + "</think>", tuple(candidate.token_ids) + tuple(
+            suffix_token_ids
+        )
 
     def _candidate_with_aligned_text(
         self, *, candidate: CandidateRecord
@@ -2931,12 +3022,9 @@ class BranchExecutor:
 
         if not candidate.token_ids:
             return candidate
-        detokenize = getattr(self.client, "detokenize", None)
-        if detokenize is None:
+        decoded_text = self._detokenize_ids(token_ids=candidate.token_ids)
+        if decoded_text is None:
             return candidate
-        decoded_text = str(
-            detokenize(model=self.model_name, token_ids=candidate.token_ids)
-        )
         if decoded_text == candidate.text:
             return candidate
         return replace(candidate, text=decoded_text)
@@ -2978,10 +3066,9 @@ class BranchExecutor:
         if not token_ids:
             assert text == "", f"{context}: empty token_ids for non-empty text"
             return
-        detokenize = getattr(self.client, "detokenize", None)
-        if detokenize is None:
+        decoded_text = self._detokenize_ids(token_ids=token_ids)
+        if decoded_text is None:
             return
-        decoded_text = str(detokenize(model=self.model_name, token_ids=token_ids))
         assert decoded_text == text, (
             f"{context}: detokenized text mismatch; "
             f"decoded={decoded_text!r} expected={text!r}"
@@ -3389,18 +3476,33 @@ class BranchExecutor:
             else f"{request_kind}:oneshot:{generation_seed}"
         )
         request_priority = self._resolve_request_priority(request_stream_id=stream_id)
-        prefix_chain_enabled = bool(
+        prefix_chain_requested = bool(
             enforce_prefix_chain and request_stream_id is not None and n == 1
         )
-        use_token_prompt = prompt_token_ids is not None
         cached_support = getattr(self.client, "supports_prompt_token_ids", None)
-        if use_token_prompt and cached_support is not False:
+        assert not (
+            prefix_chain_requested and cached_support is False
+        ), "prefix-chain decode requires token-id prompt support"
+        effective_prompt_token_ids = prompt_token_ids
+        if (
+            effective_prompt_token_ids is None
+            and prefix_chain_requested
+            and cached_support is not False
+        ):
+            assert stream_id not in self._request_stream_state, (
+                "active prefix chain lost prompt_token_ids before "
+                f"{request_kind} for {stream_id}"
+            )
+            effective_prompt_token_ids = await self._tokenize_text_async(
+                text=prompt_text
+            )
+        if effective_prompt_token_ids is not None and cached_support is not False:
             try:
                 choices = await self._request_completions_with_limit(
                     completions_async=completions_async,
                     model=self.model_name,
                     prompt=None,
-                    prompt_token_ids=prompt_token_ids,
+                    prompt_token_ids=effective_prompt_token_ids,
                     temperature=sample_temperature,
                     top_p=self.decoding.top_p,
                     max_tokens=max_tokens,
@@ -3411,14 +3513,20 @@ class BranchExecutor:
                     assistant_prefix=assistant_prefix,
                     request_kind=request_kind,
                     request_stream_id=stream_id,
-                    prefix_chain_enabled=prefix_chain_enabled,
+                    prefix_chain_enabled=prefix_chain_requested,
                     request_priority=request_priority,
                     repetition_penalty=repetition_penalty,
                 )
                 setattr(self.client, "supports_prompt_token_ids", True)
                 return choices
-            except VllmRequestError:
+            except VllmRequestError as request_error:
+                if not is_prompt_token_ids_unsupported_error(error=request_error):
+                    raise
                 setattr(self.client, "supports_prompt_token_ids", False)
+                if prefix_chain_requested:
+                    raise
+        if prefix_chain_requested:
+            raise AssertionError("prefix-chain decode cannot fall back to text prompt")
         return await self._request_completions_with_limit(
             completions_async=completions_async,
             model=self.model_name,
@@ -3434,7 +3542,7 @@ class BranchExecutor:
             assistant_prefix=assistant_prefix,
             request_kind=request_kind,
             request_stream_id=stream_id,
-            prefix_chain_enabled=prefix_chain_enabled,
+            prefix_chain_enabled=False,
             request_priority=request_priority,
             repetition_penalty=repetition_penalty,
         )
@@ -3505,6 +3613,7 @@ class BranchExecutor:
                     model=model,
                     prompt=prompt,
                     prompt_token_ids=prompt_token_ids,
+                    resolved_prompt_token_ids=input_token_ids,
                     temperature=temperature,
                     top_p=top_p,
                     max_tokens=max_tokens,
@@ -3516,6 +3625,7 @@ class BranchExecutor:
                         request_priority.value if request_priority is not None else None
                     ),
                     repetition_penalty=repetition_penalty,
+                    parse_response_prompt_token_ids=False,
                 )
             except Exception as exc:
                 latency_seconds = asyncio.get_running_loop().time() - start_time
@@ -3950,9 +4060,43 @@ class BranchExecutor:
             )
         return rows
 
-    async def _tokenize_text_async(self, *, text: str) -> tuple[int, ...]:
-        """Tokenize text with async tokenizer endpoint under request semaphore."""
+    def _tokenize_text(self, *, text: str) -> tuple[int, ...]:
+        """Tokenize text and reuse executor-local LRU entries.
 
+        Args:
+            text: Raw text to tokenize.
+
+        Returns:
+            Token ids for `text`.
+        """
+
+        cached_token_ids = self._tokenize_text_cache.get(key=text)
+        if cached_token_ids is not None:
+            return cached_token_ids
+        tokenize = getattr(self.client, "tokenize", None)
+        assert tokenize is not None, "client must provide tokenize"
+        token_ids = tuple(
+            tokenize(
+                model=self.model_name,
+                text=text,
+                add_special_tokens=False,
+            )
+        )
+        return self._tokenize_text_cache.set(key=text, value=token_ids)
+
+    async def _tokenize_text_async(self, *, text: str) -> tuple[int, ...]:
+        """Tokenize text with async endpoint and reuse executor-local LRU entries.
+
+        Args:
+            text: Raw text to tokenize.
+
+        Returns:
+            Token ids for `text`.
+        """
+
+        cached_token_ids = self._tokenize_text_cache.get(key=text)
+        if cached_token_ids is not None:
+            return cached_token_ids
         tokenize_async = getattr(self.client, "tokenize_async", None)
         assert tokenize_async is not None, "client must provide tokenize_async"
         semaphore = self._ensure_request_semaphore()
@@ -3962,13 +4106,44 @@ class BranchExecutor:
                 text=text,
                 add_special_tokens=False,
             )
-        return tuple(token_ids)
+        return self._tokenize_text_cache.set(key=text, value=tuple(token_ids))
 
-    async def _detokenize_ids_async(self, *, token_ids: tuple[int, ...]) -> str | None:
-        """Detokenize token IDs with async endpoint under request semaphore."""
+    def _detokenize_ids(self, *, token_ids: tuple[int, ...]) -> str | None:
+        """Detokenize token ids and reuse executor-local LRU entries.
+
+        Args:
+            token_ids: Token ids to decode.
+
+        Returns:
+            Decoded text when the client exposes detokenization, else `None`.
+        """
 
         if not token_ids:
             return ""
+        cached_text = self._detokenize_ids_cache.get(key=token_ids)
+        if cached_text is not None:
+            return cached_text
+        detokenize = getattr(self.client, "detokenize", None)
+        if detokenize is None:
+            return None
+        decoded_text = str(detokenize(model=self.model_name, token_ids=token_ids))
+        return self._detokenize_ids_cache.set(key=token_ids, value=decoded_text)
+
+    async def _detokenize_ids_async(self, *, token_ids: tuple[int, ...]) -> str | None:
+        """Detokenize token ids with async endpoint and reuse cached results.
+
+        Args:
+            token_ids: Token ids to decode.
+
+        Returns:
+            Decoded text when the client exposes detokenization, else `None`.
+        """
+
+        if not token_ids:
+            return ""
+        cached_text = self._detokenize_ids_cache.get(key=token_ids)
+        if cached_text is not None:
+            return cached_text
         detokenize_async = getattr(self.client, "detokenize_async", None)
         if detokenize_async is None:
             return None
@@ -3978,7 +4153,11 @@ class BranchExecutor:
                 model=self.model_name,
                 token_ids=token_ids,
             )
-        return str(decoded_text)
+        decoded_text_str = str(decoded_text)
+        return self._detokenize_ids_cache.set(
+            key=token_ids,
+            value=decoded_text_str,
+        )
 
     def _ensure_request_semaphore(self) -> asyncio.Semaphore:
         """Return shared async request semaphore for this executor instance."""

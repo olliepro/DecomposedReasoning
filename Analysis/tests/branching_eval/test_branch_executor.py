@@ -13,6 +13,7 @@ import pytest
 import branching_eval.branch_executor as branch_executor_module
 from branching_eval.artifact_store import ArtifactStore
 from branching_eval.branch_executor import BranchExecutor, DecodeOutcome, PathState
+from chat_templating import build_raw_im_prompt
 from branching_eval.config_types import BranchingConfig, DecodingConfig
 from branching_eval.selector_types import SelectionOutcome
 from branching_eval.selector_runtime import (
@@ -30,7 +31,7 @@ from branching_eval.tree_types import (
     CandidateRecord,
     TokenTrace,
 )
-from vllm_client import GenerationChoice, ParsedToken, VllmClient
+from vllm_client import GenerationChoice, ParsedToken, VllmClient, VllmRequestError
 
 
 class FakeClient:
@@ -46,6 +47,7 @@ class FakeClient:
         model: str,
         prompt: str | None,
         prompt_token_ids: tuple[int, ...] | None,
+        resolved_prompt_token_ids: tuple[int, ...] | None = None,
         temperature: float,
         top_p: float,
         max_tokens: int,
@@ -55,11 +57,13 @@ class FakeClient:
         top_logprobs: int,
         priority: int | None = None,
         repetition_penalty: float | None = None,
+        parse_response_prompt_token_ids: bool = True,
     ) -> tuple[GenerationChoice, ...]:
         _ = (
             model,
             prompt,
             prompt_token_ids,
+            resolved_prompt_token_ids,
             temperature,
             top_p,
             max_tokens,
@@ -68,6 +72,7 @@ class FakeClient:
             top_logprobs,
             priority,
             repetition_penalty,
+            parse_response_prompt_token_ids,
         )
         if n == 100:
             self.candidate_calls += 1
@@ -96,6 +101,7 @@ class FakeClient:
         model: str,
         prompt: str | None,
         prompt_token_ids: tuple[int, ...] | None,
+        resolved_prompt_token_ids: tuple[int, ...] | None = None,
         temperature: float,
         top_p: float,
         max_tokens: int,
@@ -105,6 +111,7 @@ class FakeClient:
         top_logprobs: int,
         priority: int | None = None,
         repetition_penalty: float | None = None,
+        parse_response_prompt_token_ids: bool = True,
     ) -> tuple[GenerationChoice, ...]:
         """Async wrapper matching executor async completion interface."""
 
@@ -112,6 +119,7 @@ class FakeClient:
             model=model,
             prompt=prompt,
             prompt_token_ids=prompt_token_ids,
+            resolved_prompt_token_ids=resolved_prompt_token_ids,
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
@@ -121,6 +129,7 @@ class FakeClient:
             top_logprobs=top_logprobs,
             priority=priority,
             repetition_penalty=repetition_penalty,
+            parse_response_prompt_token_ids=parse_response_prompt_token_ids,
         )
 
     def tokenize(
@@ -162,6 +171,7 @@ class AsyncDecodeClient(FakeClient):
         model: str,
         prompt: str | None,
         prompt_token_ids: tuple[int, ...] | None,
+        resolved_prompt_token_ids: tuple[int, ...] | None = None,
         temperature: float,
         top_p: float,
         max_tokens: int,
@@ -171,11 +181,13 @@ class AsyncDecodeClient(FakeClient):
         top_logprobs: int,
         priority: int | None = None,
         repetition_penalty: float | None = None,
+        parse_response_prompt_token_ids: bool = True,
     ) -> tuple[GenerationChoice, ...]:
         _ = (
             model,
             prompt,
             prompt_token_ids,
+            resolved_prompt_token_ids,
             temperature,
             top_p,
             max_tokens,
@@ -184,6 +196,7 @@ class AsyncDecodeClient(FakeClient):
             top_logprobs,
             priority,
             repetition_penalty,
+            parse_response_prompt_token_ids,
         )
         self.request_start_times.append(time.perf_counter())
         await asyncio.sleep(0.05)
@@ -218,6 +231,134 @@ class AsyncDecodeClient(FakeClient):
                 prompt_token_ids=(1, 2, 3),
                 token_ids=(42,),
             ),
+        )
+
+
+class PromptReuseClient(FakeClient):
+    """Fake client that records parser-fallback prompt ids per request."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.prompt_text_seen: list[str | None] = []
+        self.prompt_token_ids_seen: list[tuple[int, ...] | None] = []
+        self.resolved_prompt_token_ids_seen: list[tuple[int, ...] | None] = []
+        self.parse_response_prompt_token_ids_seen: list[bool] = []
+
+    async def completions_async(
+        self,
+        *,
+        model: str,
+        prompt: str | None,
+        prompt_token_ids: tuple[int, ...] | None,
+        resolved_prompt_token_ids: tuple[int, ...] | None = None,
+        temperature: float,
+        top_p: float,
+        max_tokens: int,
+        n: int,
+        seed: int,
+        stop: tuple[str, ...] | None,
+        top_logprobs: int,
+        priority: int | None = None,
+        repetition_penalty: float | None = None,
+        parse_response_prompt_token_ids: bool = True,
+    ) -> tuple[GenerationChoice, ...]:
+        _ = (
+            model,
+            temperature,
+            top_p,
+            max_tokens,
+            n,
+            seed,
+            stop,
+            top_logprobs,
+            priority,
+            repetition_penalty,
+        )
+        self.prompt_text_seen.append(prompt)
+        self.prompt_token_ids_seen.append(prompt_token_ids)
+        self.resolved_prompt_token_ids_seen.append(resolved_prompt_token_ids)
+        self.parse_response_prompt_token_ids_seen.append(
+            parse_response_prompt_token_ids
+        )
+        return (
+            GenerationChoice(
+                index=0,
+                text="done",
+                finish_reason="stop",
+                stop_reason=None,
+                tokens=(
+                    ParsedToken(
+                        token="done",
+                        logprob=-0.1,
+                        top_entries=(("x", -0.2),),
+                    ),
+                ),
+                prompt_token_ids=resolved_prompt_token_ids,
+                token_ids=(42,),
+            ),
+        )
+
+
+class TokenPromptTransientErrorClient(FakeClient):
+    """Fake client that raises a transient request error for token prompts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.supports_prompt_token_ids: bool | None = None
+        self.prompt_text_seen: list[str | None] = []
+        self.prompt_token_ids_seen: list[tuple[int, ...] | None] = []
+
+    async def completions_async(
+        self,
+        *,
+        model: str,
+        prompt: str | None,
+        prompt_token_ids: tuple[int, ...] | None,
+        resolved_prompt_token_ids: tuple[int, ...] | None = None,
+        temperature: float,
+        top_p: float,
+        max_tokens: int,
+        n: int,
+        seed: int,
+        stop: tuple[str, ...] | None,
+        top_logprobs: int,
+        priority: int | None = None,
+        repetition_penalty: float | None = None,
+        parse_response_prompt_token_ids: bool = True,
+    ) -> tuple[GenerationChoice, ...]:
+        _ = (
+            model,
+            resolved_prompt_token_ids,
+            temperature,
+            top_p,
+            max_tokens,
+            n,
+            seed,
+            stop,
+            top_logprobs,
+            priority,
+            repetition_penalty,
+            parse_response_prompt_token_ids,
+        )
+        self.prompt_text_seen.append(prompt)
+        self.prompt_token_ids_seen.append(prompt_token_ids)
+        if prompt_token_ids is not None:
+            raise VllmRequestError("Server disconnected")
+        return super().completions(
+            model=model,
+            prompt=prompt,
+            prompt_token_ids=prompt_token_ids,
+            resolved_prompt_token_ids=resolved_prompt_token_ids,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            n=n,
+            seed=seed,
+            stop=stop,
+            top_logprobs=top_logprobs,
+            priority=priority,
+            repetition_penalty=repetition_penalty,
+            parse_response_prompt_token_ids=parse_response_prompt_token_ids,
         )
 
 
@@ -257,6 +398,104 @@ def _path_state(*, node_id: str, branch_points_used: int = 0) -> PathState:
         token_traces=(),
         branch_points_used=branch_points_used,
     )
+
+
+def test_generate_many_async_reuses_locally_resolved_prompt_ids(
+    tmp_path: Path,
+) -> None:
+    """Executor should pass known prompt ids and skip echoed response prompt ids."""
+
+    client = PromptReuseClient()
+    executor = build_executor(tmp_path=tmp_path)
+    executor.client = cast(VllmClient, client)
+    choice = asyncio.run(
+        executor._generate_choice_async(
+            assistant_prefix="prefix",
+            prompt_token_ids=None,
+            max_tokens=1,
+            stop=None,
+            n=1,
+            request_stream_id="decode:node_root",
+            enforce_prefix_chain=True,
+        )
+    )
+    expected_prompt_ids = asyncio.run(
+        executor.client.tokenize_async(
+            model=executor.model_name,
+            text=build_raw_im_prompt(
+                prompt="Solve this.",
+                assistant_prefix="prefix",
+            ),
+            add_special_tokens=False,
+        )
+    )
+    assert client.prompt_text_seen == [None]
+    assert client.prompt_token_ids_seen == [expected_prompt_ids]
+    assert client.resolved_prompt_token_ids_seen == [expected_prompt_ids]
+    assert client.parse_response_prompt_token_ids_seen == [False]
+    assert choice.prompt_token_ids == expected_prompt_ids
+    executor.artifact_store.close()
+
+
+def test_active_prefix_chain_requires_prompt_token_ids(tmp_path: Path) -> None:
+    """Active prefix-chain streams must not retokenize full prompt text."""
+
+    client = PromptReuseClient()
+    executor = build_executor(tmp_path=tmp_path)
+    executor.client = cast(VllmClient, client)
+    stream_id = "decode:node_root"
+    executor._request_stream_state[stream_id] = (
+        branch_executor_module._RequestStreamState(
+            request_id="req_old",
+            input_token_ids=(99, 100, 101),
+            output_token_ids=(102,),
+        )
+    )
+
+    with pytest.raises(AssertionError, match="lost prompt_token_ids"):
+        asyncio.run(
+            executor._generate_choice_async(
+                assistant_prefix="fresh retokenized text",
+                prompt_token_ids=None,
+                max_tokens=1,
+                stop=None,
+                n=1,
+                request_stream_id=stream_id,
+                enforce_prefix_chain=True,
+            )
+        )
+
+    assert client.prompt_text_seen == []
+    assert client.prompt_token_ids_seen == []
+    executor.artifact_store.close()
+
+
+def test_transient_token_prompt_error_does_not_disable_token_prompt_support(
+    tmp_path: Path,
+) -> None:
+    """Transient request errors must not poison token-prompt support cache."""
+
+    client = TokenPromptTransientErrorClient()
+    executor = build_executor(tmp_path=tmp_path)
+    executor.client = cast(VllmClient, client)
+
+    with pytest.raises(VllmRequestError, match="Server disconnected"):
+        asyncio.run(
+            executor._generate_many_async(
+                assistant_prefix="prefix",
+                prompt_token_ids=(1, 2, 3),
+                max_tokens=1,
+                stop=None,
+                n=1,
+                request_stream_id=None,
+                enforce_prefix_chain=False,
+            )
+        )
+
+    assert client.supports_prompt_token_ids is None
+    assert client.prompt_text_seen == [None]
+    assert client.prompt_token_ids_seen == [(1, 2, 3)]
+    executor.artifact_store.close()
 
 
 def _decode_outcome(
@@ -1121,6 +1360,138 @@ def test_candidate_pool_generation_defers_alignment_until_selection(
     assert detokenize_calls == [(11,)]
     assert aligned_candidate.text == "decoded_11"
     assert aligned_candidate.token_ids == (11,)
+
+
+def test_candidate_pool_after_exec_allows_terminal_think_choice(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Candidate generation after exec should let the model choose `</think>`."""
+
+    executor = build_executor(tmp_path=tmp_path)
+    calls: list[dict[str, object]] = []
+
+    async def fake_generate_many_async(
+        **kwargs: object,
+    ) -> tuple[GenerationChoice, ...]:
+        calls.append(dict(kwargs))
+        return (
+            make_choice(
+                index=0, text="<steer>try factoring</steer>", entropy_logprob=-0.4
+            ),
+            GenerationChoice(
+                index=1,
+                text="",
+                finish_reason="stop",
+                stop_reason="</think>",
+                tokens=(),
+                prompt_token_ids=(1, 2, 3),
+                token_ids=(),
+            ),
+        )
+
+    monkeypatch.setattr(executor, "_generate_many_async", fake_generate_many_async)
+
+    pool = asyncio.run(
+        executor._generate_candidate_pool_async(
+            candidate_pool_id="pool",
+            state=_path_state(node_id="root"),
+            trigger_type="steer_boundary",
+            entropy_value=None,
+            assistant_prefix="<exec>work",
+            prompt_token_ids=(1, 2, 3),
+            candidate_token_budget=4,
+        )
+    )
+
+    assert calls[0]["assistant_prefix"] == "<exec>work\n</exec>\n\n"
+    assert calls[0]["stop"] == ("</steer", "</think>")
+    assert pool.candidates[0].text.startswith("<steer>")
+    assert pool.candidates[1].text == "</think>"
+
+
+def test_tokenize_helpers_share_executor_cache(tmp_path: Path, monkeypatch) -> None:
+    """Sync and async tokenizer helpers should reuse one executor-local cache."""
+
+    executor = build_executor(tmp_path=tmp_path)
+    tokenize_calls: list[str] = []
+    tokenize_async_calls: list[str] = []
+    expected_text = "</steer>\n<exec>\n"
+
+    def fake_tokenize(
+        *,
+        model: str,
+        text: str,
+        add_special_tokens: bool = False,
+    ) -> tuple[int, ...]:
+        _ = model, add_special_tokens
+        tokenize_calls.append(text)
+        return (7, 8, 9)
+
+    async def fake_tokenize_async(
+        *,
+        model: str,
+        text: str,
+        add_special_tokens: bool = False,
+    ) -> tuple[int, ...]:
+        _ = model, add_special_tokens
+        tokenize_async_calls.append(text)
+        return (70, 80, 90)
+
+    monkeypatch.setattr(executor.client, "tokenize", fake_tokenize, raising=False)
+    monkeypatch.setattr(
+        executor.client,
+        "tokenize_async",
+        fake_tokenize_async,
+        raising=False,
+    )
+
+    assert executor._tokenize_text(text=expected_text) == (7, 8, 9)
+    assert asyncio.run(executor._tokenize_text_async(text=expected_text)) == (
+        7,
+        8,
+        9,
+    )
+    assert tokenize_calls == [expected_text]
+    assert tokenize_async_calls == []
+
+
+def test_detokenize_helpers_share_executor_cache(tmp_path: Path, monkeypatch) -> None:
+    """Sync and async detokenizer helpers should reuse one executor-local cache."""
+
+    executor = build_executor(tmp_path=tmp_path)
+    detokenize_calls: list[tuple[int, ...]] = []
+    detokenize_async_calls: list[tuple[int, ...]] = []
+    expected_token_ids = (11, 12, 13)
+
+    def fake_detokenize(*, model: str, token_ids: tuple[int, ...]) -> str:
+        _ = model
+        detokenize_calls.append(token_ids)
+        return "decoded_sync"
+
+    async def fake_detokenize_async(
+        *,
+        model: str,
+        token_ids: tuple[int, ...],
+    ) -> str:
+        _ = model
+        detokenize_async_calls.append(token_ids)
+        return "decoded_async"
+
+    monkeypatch.setattr(executor.client, "detokenize", fake_detokenize, raising=False)
+    monkeypatch.setattr(
+        executor.client,
+        "detokenize_async",
+        fake_detokenize_async,
+        raising=False,
+    )
+
+    assert executor._detokenize_ids(token_ids=expected_token_ids) == "decoded_sync"
+    assert (
+        asyncio.run(executor._detokenize_ids_async(token_ids=expected_token_ids))
+        == "decoded_sync"
+    )
+    assert detokenize_calls == [expected_token_ids]
+    assert detokenize_async_calls == []
 
 
 def test_selector_within_cluster_prefers_non_other() -> None:
@@ -2421,6 +2792,63 @@ def test_single_steer_continuation_keeps_vllm_tokens_and_appends_suffix(
     assert outcome.prompt_token_ids[6:] == tuple(range(1000, 1008))
 
 
+def test_single_steer_continuation_can_finish_thinking(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Steer continuation after exec should preserve terminal `</think>` text."""
+
+    executor = build_executor(
+        tmp_path=tmp_path,
+        trigger_steer_enabled=True,
+        trigger_entropy_enabled=False,
+    )
+    stop_values: list[tuple[str, ...] | None] = []
+
+    def fake_generate_choice(
+        *,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+        max_tokens: int,
+        stop: tuple[str, ...] | None,
+        n: int,
+        **kwargs: object,
+    ) -> GenerationChoice:
+        _ = assistant_prefix, prompt_token_ids, max_tokens, n, kwargs
+        stop_values.append(stop)
+        return GenerationChoice(
+            index=0,
+            text="",
+            finish_reason="stop",
+            stop_reason="</think>",
+            tokens=(),
+            prompt_token_ids=(1, 2, 3),
+            token_ids=(),
+        )
+
+    monkeypatch.setattr(executor, "_generate_choice", fake_generate_choice)
+    monkeypatch.setattr(
+        executor,
+        "_update_request_stream_state_output_ids",
+        lambda **_: None,
+    )
+    outcome = continue_with_single_steer_candidate(
+        executor=executor,
+        assistant_prefix="seed</exec>\n\n",
+        prompt_token_ids=(1, 2, 3),
+        token_ids=(),
+        token_traces=(),
+        generated_tokens=0,
+        request_stream_id="decode:node_root",
+    )
+
+    assert stop_values == [("</steer", "</think>")]
+    assert outcome.event_type == "terminated"
+    assert outcome.stop_reason == "think_end"
+    assert outcome.assistant_prefix.endswith("</exec>\n\n</think>")
+    assert outcome.token_ids == tuple(range(1000, 1008))
+    assert outcome.prompt_token_ids == (1, 2, 3) + tuple(range(1000, 1008))
+
+
 def test_single_steer_continuation_async_counts_normalized_suffix_tokens(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -2526,6 +2954,49 @@ def test_decode_respects_path_level_max_gen_toks(tmp_path: Path, monkeypatch) ->
     assert outcome.stop_reason == "max_gen_toks_reached"
     assert outcome.generated_tokens == max_budget
     assert outcome.token_ids == tuple(range(max_budget))
+
+
+def test_decode_terminates_existing_think_close_prefix(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A child selected as `</think>` should not start another decode call."""
+
+    executor = build_executor(
+        tmp_path=tmp_path,
+        trigger_steer_enabled=True,
+        trigger_entropy_enabled=False,
+    )
+    call_count = {"decode_calls": 0}
+
+    async def fail_generate_choice_async(
+        *,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+        max_tokens: int,
+        stop: tuple[str, ...] | None,
+        n: int,
+        **kwargs: object,
+    ) -> GenerationChoice:
+        _ = assistant_prefix, prompt_token_ids, max_tokens, stop, n, kwargs
+        call_count["decode_calls"] += 1
+        raise AssertionError("decode call should not occur after </think>")
+
+    monkeypatch.setattr(executor, "_generate_choice_async", fail_generate_choice_async)
+    state = PathState(
+        node_id="node_root",
+        assistant_prefix="seed</exec>\n\n</think>",
+        prompt_token_ids=(1, 2, 3),
+        token_ids=(10,),
+        token_traces=(),
+        branch_points_used=1,
+    )
+    outcome = executor._decode_until_event(tree=_minimal_tree(), state=state)
+
+    assert call_count["decode_calls"] == 0
+    assert outcome.event_type == "terminated"
+    assert outcome.stop_reason == "think_end"
+    assert outcome.assistant_prefix.endswith("</think>")
+    assert outcome.branch_points_used == 1
 
 
 def test_inline_epsilon_terminates_when_candidate_budget_is_exhausted(

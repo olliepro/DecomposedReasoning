@@ -1,0 +1,794 @@
+{
+  "schema_version": "1.1",
+  "intended_use": "Augment interleaved <steer>/<exec> reasoning traces with short insert-only non-sequitur detours whose inserted steer blocks can be masked during supervised fine-tuning.",
+  "high_level_goal": "Use a teacher/editor model to splice in brief detours at random pair boundaries while keeping the original suffix intact, so the student model sees surprising local interventions without learning to emit the inserted steer text at training time.",
+  "mode_reference": {
+    "insert": {
+      "definition": "Add a short intervention window that preserves the existing reasoning trajectory.",
+      "when_to_use": "Use for local detours that should leave the original suffix intact.",
+      "teacher_output": "Only the inserted intervention window of K new <steer>/<exec> pairs.",
+      "suffix_policy": "keep_original_suffix",
+      "key_prompt_requirement": "The inserted window must remain locally coherent without trying to reconnect to the next original steer."
+    },
+    "bridge": {
+      "definition": "Unused in this catalog.",
+      "when_to_use": "Not used for non-sequitur insert-only augmentation.",
+      "teacher_output": "Not used.",
+      "suffix_policy": "not_applicable",
+      "key_prompt_requirement": "Not used."
+    },
+    "redirect": {
+      "definition": "Unused in this catalog.",
+      "when_to_use": "Not used for non-sequitur insert-only augmentation.",
+      "teacher_output": "Not used.",
+      "suffix_policy": "not_applicable",
+      "key_prompt_requirement": "Not used."
+    }
+  },
+  "sampling_defaults": {
+    "one_intervention_per_trace": true,
+    "default_dataset_mix": {
+      "insert": 1.0,
+      "bridge": 0.0,
+      "redirect": 0.0
+    },
+    "sample_cut_points_at_pair_boundaries_only": true,
+    "style_window_pairs": 2,
+    "exec_token_limit": 512,
+    "bridge_default_policy": "not_used",
+    "first_new_steer_should_match_variant_exactly": false
+  },
+  "interventions": [
+    {
+      "name": "Run a side calculation",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Run a side calc",
+        "Check the stray number",
+        "Work the spare arithmetic",
+        "Do the pocket math",
+        "Compute the side quantity"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A side calculation can sprawl into a small local routine while staying detached from the main trace.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Create a set of random words",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Pull three stray words",
+        "Make a loose word pile",
+        "Find meaning in the random set",
+        "Build a pocket word set",
+        "Pick three words at random"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A toy task can support a couple of local steps instead of a single trivial action.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Rewrite a phrase in a different way",
+      "category": "non_sequitur_orthogonal",
+      "variants": [
+        "Rewrite the line sideways",
+        "Say the phrase slantwise",
+        "Flip the script for 'hello world'",
+        "Say 'it is done' another way",
+        "Paraphrase the line oddly"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "Token rewriting can naturally expand into a slightly more involved local detour.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Audit a phrase",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Audit the phrase",
+        "Check the vowel pattern",
+        "Scan the phrase twice",
+        "Count the loud letters",
+        "Sort the phrase fragments"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "Phrase auditing can unfold across a couple of short local actions rather than a single count.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Reorder a mini list",
+      "category": "non_sequitur_orthogonal",
+      "variants": [
+        "Reorder the list",
+        "Sort the list backwards",
+        "Clean the order",
+        "Shuffle then fix the list",
+        "Put the items in rank"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "List reordering leaves room for a few tidy local steps while keeping the steer short.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Translate a phrase",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Translate this line",
+        "Translate the phrase loosely",
+        "Do a quick translation",
+        "Render the line in Spanish",
+        "Translate it then trim it"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A translation detour can plausibly take multiple compact steps while staying off-path.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Expand a toy acronym",
+      "category": "non_sequitur_orthogonal",
+      "variants": [
+        "Expand the acronym CAT as a playful phrase",
+        "Invent an expansion for SUN",
+        "Make NASA stand for snacks",
+        "Expand MAP into three words",
+        "Give RAM a fake expansion"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "Playful acronym expansion makes a clear detour without depending on context.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Express emotions about the current task",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Express mild frustration here",
+        "Express curiosity about this step",
+        "Express relief about the simplification",
+        "Express doubt about the tangle",
+        "Express delight at the shortcut"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "This is an explicitly off-path but still prefix-grounded detour.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Give the current object a playful nickname",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Give the current object a playful nickname",
+        "Rename the active expression softly",
+        "Give the symbol a pet name",
+        "Call the current object something light",
+        "Assign the term a nickname"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A nickname detour is offbeat, local, and easy to execute without derailing structure.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Compare two animals",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Compare a cat and an owl briefly",
+        "Contrast a fox with a turtle",
+        "Compare an ant and a whale",
+        "Rank a crow against an eel",
+        "Give two animals one contrast"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A quick comparison can feel deliberate while still being detached from the main task.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Sketch the shape",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Sketch the shape",
+        "Describe the outline from memory",
+        "State its outline",
+        "Name the corners then the curve",
+        "Draw the shape in words"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "Shape sketching can stretch into a small local sequence without needing a long steer.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Convert the units",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Convert the units",
+        "Rescale the quantity",
+        "Change the units",
+        "Put the number in grams",
+        "Turn the measure into inches"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "Unit conversion can support a slightly more elaborate micro-routine while staying compact.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Check the logic",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Check the logic",
+        "Resolve the truth table",
+        "Work the logic twice",
+        "Test the claim under negation",
+        "Chase the boolean bits"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A logic check leaves room for a couple of short internal steps instead of one abrupt answer.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Trace a tiny Python snippet",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Trace print(1 + 2)",
+        "Trace x = 3; print(x * 2)",
+        "Walk a tiny Python line",
+        "Say what print('hi'.upper()) outputs",
+        "Trace a three-line snippet"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A tiny code-trace detour is concrete and resembles normal execution reasoning.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Swap the word",
+      "category": "non_sequitur_orthogonal",
+      "variants": [
+        "Swap the word",
+        "Trade it for a near-synonym",
+        "Replace the word sideways",
+        "Find a neighbor word",
+        "Rewrite one word only"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A word-swap task can support a couple of lexical passes while keeping the steer brief.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "State and fix a false claim",
+      "category": "non_sequitur_adversarial",
+      "variants": [
+        "Write a false claim first",
+        "State a neat misconception",
+        "Plant a wrong sentence then fix it",
+        "Make a bad claim and repair it",
+        "State misconception about this",
+        "Write a false claim"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A local self-correction is mildly adversarial while still staying coherent.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Extend the pattern",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Extend the pattern",
+        "Push the pattern one beat",
+        "Continue the run oddly",
+        "Add two more pattern terms",
+        "Carry the rhythm forward"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "Pattern work can unfold across multiple compact steps instead of ending immediately.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Compare the current step to an unusual object",
+      "category": "non_sequitur_adversarial",
+      "variants": [
+        "Compare this step to a suitcase",
+        "Make an offbeat analogy for the present move",
+        "Say what object this step resembles",
+        "Compare the move to wet cardboard",
+        "Give this step a strange analogy"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "An unusual analogy keeps the detour anchored to the current step without becoming clean bookkeeping.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Use a chess fact",
+      "category": "non_sequitur_orthogonal",
+      "variants": [
+        "Use a chess fact",
+        "Recall a chess rule",
+        "Name the chess move",
+        "Borrow a chess opening detail",
+        "State one annoying chess fact"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A chess detour can sustain a few compact moves while staying far from the main task.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Turn the current claim into a short slogan",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Turn the current claim into a short slogan",
+        "Make the step sound like packaging",
+        "Compress the claim into a tagline",
+        "Give the idea a slogan",
+        "Pitch the current move briefly"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A slogan detour is intentionally off-path while still depending on the visible local claim.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Write a one-line rhyme",
+      "category": "non_sequitur_orthogonal",
+      "variants": [
+        "Write a tiny rhyme about a shoe",
+        "Make a one-line rhyme using 'light'",
+        "Write a short rhyme about rain",
+        "Rhyme about dust in one line",
+        "Give me a pocket rhyme"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A tiny rhyme is clearly detoured yet still easy to complete in a few lines.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Invent a temporary rule for the current variable",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Invent a temporary rule for the current variable",
+        "Make a brief house rule for the symbol",
+        "Declare a short local rule",
+        "Give the variable a weird curfew",
+        "Set a made-up rule here"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A temporary-rule detour is offbeat and context-bound without becoming pure meta commentary.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Run a memory check",
+      "category": "non_sequitur_related",
+      "variants": [
+        "Run a memory check",
+        "Echo the fragment",
+        "Repeat the cue",
+        "Recite the last noun",
+        "Mirror the last short phrase"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A memory check can support a more layered local detour while keeping the steer terse.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Follow an irrelevant checklist",
+      "category": "non_sequitur_adversarial",
+      "variants": [
+        "Run a tiny irrelevant checklist",
+        "Follow a three-step desk-check routine",
+        "Do a quick off-topic checklist",
+        "Tick through a useless checklist",
+        "Follow the tiny ritual"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A procedural checklist creates a stronger but still local adversarial detour.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    },
+    {
+      "name": "Issue a mild adversarial distraction",
+      "category": "non_sequitur_adversarial",
+      "variants": [
+        "Demand a tiny unrelated proof of attention",
+        "Pause for a deliberately distracting micro-task",
+        "Question whether the task should be ignored briefly",
+        "Ask for a needless side challenge",
+        "Interrupt with a petty challenge"
+      ],
+      "preferred_slots": [],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A mild adversarial prompt injects tension while the exec still follows it faithfully.",
+      "mode_weight_hint": {
+        "insert": 1.0,
+        "bridge": 0.0,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge",
+      "prompt_template": "non_sequitur_insert.md"
+    }
+  ]
+}

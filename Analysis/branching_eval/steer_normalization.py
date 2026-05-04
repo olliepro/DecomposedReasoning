@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import re
-from branching_eval.legacy_steer_rollout import complete_trailing_partial_tag
+from branching_eval.legacy_steer_rollout import (
+    complete_trailing_partial_tag,
+    contains_think_close,
+)
 
 EXEC_OPEN_PATTERN = re.compile(r"<exec\b[^>]*>", flags=re.IGNORECASE)
 EXEC_CLOSE_PATTERN = re.compile(r"</exec>", flags=re.IGNORECASE)
 EXEC_TO_STEER_PATTERN = re.compile(r"</exec>(\s*)<steer\b", flags=re.IGNORECASE)
+EXEC_CLOSE_SUFFIX_PATTERN = re.compile(r"</exec>(?P<suffix>\n{0,2})$", flags=re.I)
 STEER_TO_EXEC_BOUNDARY_PATTERN = re.compile(
     r"</steer>\s*<exec>\s*",
     flags=re.IGNORECASE,
@@ -21,33 +25,120 @@ STEER_ENTRY_BOUNDARY_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 STEER_CLOSE_TAG = "</steer>"
+STEER_OPEN_TAG = "<steer>"
+STEER_OPEN_PREFIXES = tuple(
+    STEER_OPEN_TAG[:prefix_length]
+    for prefix_length in range(2, len(STEER_OPEN_TAG) + 1)
+)
+STEER_CANDIDATE_STOP = ("</steer",)
+TERMINAL_STEER_CANDIDATE_STOP = ("</steer", "</think>")
 
 
 def normalize_steer_boundary_text(*, text: str) -> str:
-    """Normalize text to canonical steer-open boundary form.
+    """Normalize text to canonical post-exec or steer-open boundary form.
 
     Args:
         text: Assistant prefix ending at or near a steer boundary.
 
     Returns:
-        Canonicalized prefix ending in `<steer>` with valid entry boundary.
+        Canonicalized prefix using append-only suffixes. Ordinary exec prefixes
+        end at `</exec>\\n\\n`; prefixes that already contain a 2+ char
+        `<steer>` suffix are completed to a valid `<steer>` entry boundary.
 
     Example:
-        >>> normalize_steer_boundary_text(text="x</exec>\\n\\n<steer>")
-        'x</exec>\\n\\n<steer>'
+        >>> normalize_steer_boundary_text(text="<exec>x")
+        '<exec>x\\n</exec>\\n\\n'
     """
 
     normalized_text = text
-    if is_inside_open_exec(text=normalized_text):
-        normalized_text = _ensure_exec_closed_before_steer_boundary(
-            text=normalized_text
-        )
+    if has_trailing_steer_open_prefix(text=normalized_text):
+        normalized_text = _complete_trailing_steer_open_prefix(text=normalized_text)
+        if is_inside_open_exec(text=normalized_text):
+            normalized_text = _ensure_exec_closed_before_steer_boundary(
+                text=normalized_text
+            )
         return _ensure_valid_steer_entry_boundary(text=normalized_text)
-    if normalized_text.endswith("<steer"):
-        normalized_text += ">"
-    elif not normalized_text.endswith("<steer>"):
-        normalized_text += "<steer>"
+    if is_inside_open_exec(text=normalized_text):
+        return normalized_text + forced_boundary_suffix(text=normalized_text)
+    if ends_at_exec_choice_boundary(text=normalized_text):
+        return normalized_text + exec_choice_boundary_suffix(text=normalized_text)
+    if normalized_text.endswith("<steer>"):
+        return _ensure_valid_steer_entry_boundary(text=normalized_text)
+    normalized_text += "<steer>"
     return _ensure_valid_steer_entry_boundary(text=normalized_text)
+
+
+def has_trailing_steer_open_prefix(*, text: str) -> bool:
+    """Return whether text ends with a 2+ char prefix of `<steer>`.
+
+    Args:
+        text: Assistant prefix text.
+
+    Returns:
+        `True` when the suffix is `<s`, `<st`, ..., or `<steer>`.
+
+    Example:
+        >>> has_trailing_steer_open_prefix(text="x<s")
+        True
+        >>> has_trailing_steer_open_prefix(text="x<")
+        False
+    """
+
+    lowered = text.lower()
+    return any(lowered.endswith(prefix) for prefix in STEER_OPEN_PREFIXES)
+
+
+def ends_at_exec_choice_boundary(*, text: str) -> bool:
+    """Return whether text can be completed to `</exec>\\n\\n` by appending.
+
+    Args:
+        text: Assistant prefix text.
+
+    Returns:
+        `True` when text ends with `</exec>` plus zero to two newlines.
+    """
+
+    return EXEC_CLOSE_SUFFIX_PATTERN.search(text) is not None
+
+
+def exec_choice_boundary_suffix(*, text: str) -> str:
+    """Return suffix needed to make trailing `</exec>` boundary `\\n\\n`.
+
+    Args:
+        text: Assistant prefix ending in `</exec>` plus up to two newlines.
+
+    Returns:
+        Empty string, `\\n`, or `\\n\\n`.
+    """
+
+    match = EXEC_CLOSE_SUFFIX_PATTERN.search(text)
+    assert match is not None, "expected text ending at an exec choice boundary"
+    suffix = match.group("suffix")
+    return "\n" * (2 - len(suffix))
+
+
+def steer_candidate_stop_markers(*, text: str) -> tuple[str, ...]:
+    """Return candidate-generation stops for one normalized steer prefix.
+
+    Args:
+        text: Canonicalized assistant prefix used for steer candidate generation.
+
+    Returns:
+        `</think>` is included only when the model is allowed to choose whether
+        to open another steer block after an exec boundary.
+    """
+
+    if text.lower().endswith(STEER_OPEN_TAG):
+        return STEER_CANDIDATE_STOP
+    return TERMINAL_STEER_CANDIDATE_STOP
+
+
+def _complete_trailing_steer_open_prefix(*, text: str) -> str:
+    lowered = text.lower()
+    for prefix in sorted(STEER_OPEN_PREFIXES, key=len, reverse=True):
+        if lowered.endswith(prefix):
+            return text + STEER_OPEN_TAG[len(prefix) :]
+    raise AssertionError("expected trailing steer-open prefix")
 
 
 def is_inside_open_exec(*, text: str) -> bool:
@@ -83,23 +174,33 @@ def inferred_exec_to_steer_separator(*, text: str) -> str:
 
 
 def forced_boundary_suffix(*, text: str) -> str:
-    """Build forced suffix that moves text to a steer boundary.
+    """Build forced suffix that moves text to the next choice boundary.
 
     Args:
         text: Assistant prefix text.
 
     Returns:
-        Suffix text to append.
+        Append-only suffix. Open exec text is closed to `</exec>\\n\\n`
+        unless a 2+ char `<steer>` prefix has already been emitted, in which
+        case the old `</exec>\\n\\n<steer>` boundary is preserved.
     """
 
+    if has_trailing_steer_open_prefix(text=text):
+        normalized_text = _complete_trailing_steer_open_prefix(text=text)
+        if is_inside_open_exec(text=normalized_text):
+            boundary_text = _ensure_exec_closed_before_steer_boundary(
+                text=normalized_text
+            )
+        else:
+            boundary_text = _ensure_valid_steer_entry_boundary(text=normalized_text)
+        return boundary_text[len(text) :]
     if text.endswith("<steer>"):
         return ""
     if is_inside_open_exec(text=text):
-        separator = inferred_exec_to_steer_separator(text=text)
-        if text.endswith("</exec>"):
-            return f"{separator}<steer>"
         newline_before_close = "" if text.endswith("\n") else "\n"
-        return f"{newline_before_close}</exec>{separator}<steer>"
+        return f"{newline_before_close}</exec>\n\n"
+    if ends_at_exec_choice_boundary(text=text):
+        return exec_choice_boundary_suffix(text=text)
     return "<steer>"
 
 
@@ -146,7 +247,9 @@ def selected_candidate_close_completion_suffix(*, text: str) -> tuple[str, str]:
 
     lowered = text.lower()
     lowered_close_tag = STEER_CLOSE_TAG
-    if lowered.endswith(lowered_close_tag) or lowered.endswith(f"{lowered_close_tag}\n"):
+    if lowered.endswith(lowered_close_tag) or lowered.endswith(
+        f"{lowered_close_tag}\n"
+    ):
         return "", "already_closed"
     for prefix_length in range(len(lowered_close_tag) - 1, 0, -1):
         if lowered.endswith(lowered_close_tag[:prefix_length]):
@@ -155,15 +258,18 @@ def selected_candidate_close_completion_suffix(*, text: str) -> tuple[str, str]:
 
 
 def selected_candidate_normalization_suffix(*, text: str) -> tuple[str, str]:
-    """Build minimal injected suffix so candidate ends with `</steer>\\n<exec>\\n`.
+    """Build minimal injected suffix for selected steer candidate text.
 
     Args:
         text: Selected candidate text before normalization.
 
     Returns:
-        Tuple `(injected_suffix, normalization_mode)`.
+        Tuple `(injected_suffix, normalization_mode)`. Terminal `</think>`
+        candidates are returned without steer-section normalization.
     """
 
+    if contains_think_close(text=text):
+        return "", "think_closed"
     close_suffix, mode = selected_candidate_close_completion_suffix(text=text)
     normalized = text + close_suffix
     newline_suffix = "" if normalized.endswith("\n") else "\n"

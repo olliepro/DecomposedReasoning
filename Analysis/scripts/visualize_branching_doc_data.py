@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from branching_eval.event_types import EventEnvelope
+from candidate_clustering import strip_steer_suffix
 
 try:
     from scripts.visualize_branching_replay import (
@@ -429,7 +430,9 @@ def runtime_event_details(
                 "length_tokens_total": payload.get("length_tokens_total"),
                 "stop_reason": payload.get("stop_reason"),
                 "task_metrics": payload.get("task_metrics", {}),
-                "text": leaf.text if leaf is not None else payload.get("text_preview", ""),
+                "text": (
+                    leaf.text if leaf is not None else payload.get("text_preview", "")
+                ),
                 "text_preview": payload.get("text_preview", ""),
             }
         )
@@ -453,11 +456,15 @@ def annotate_candidates(
         if not isinstance(candidate, dict):
             continue
         candidate_id = int(candidate.get("candidate_id", -1))
+        text_preview = clean_candidate_preview(
+            text=str(candidate.get("text_preview", "")),
+            max_chars=160,
+        )
         rows.append(
             {
                 "candidate_id": candidate_id,
-                "text": candidate.get("text_preview", ""),
-                "text_preview": candidate.get("text_preview", ""),
+                "text": text_preview,
+                "text_preview": text_preview,
                 "output_token_count": candidate.get("output_token_count"),
                 "finish_reason": candidate.get("finish_reason"),
                 "stop_reason": candidate.get("stop_reason"),
@@ -859,7 +866,8 @@ def payload_maxima(
 def clean_candidate_preview(*, text: str, max_chars: int) -> str:
     """Collapse multi-line text into a compact one-line preview."""
 
-    collapsed = " ".join(str(text).replace("\t", " ").split())
+    cleaned_text = strip_steer_suffix(text=str(text))
+    collapsed = " ".join(cleaned_text.replace("\t", " ").split())
     if not collapsed:
         return "(empty)"
     if len(collapsed) <= max_chars:

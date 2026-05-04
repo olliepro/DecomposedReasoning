@@ -26,7 +26,12 @@ from io_utils import (
 )
 from tag_scanner import first_steer_close_index
 from token_metrics import approximate_entropy
-from vllm_client import GenerationChoice, VllmClient, VllmRequestError
+from vllm_client import (
+    GenerationChoice,
+    VllmClient,
+    VllmRequestError,
+    is_prompt_token_ids_unsupported_error,
+)
 
 ROLLOUT_STEER_STOP = ("<steer",)
 BRANCH_STEER_STOP = ("</steer>",)
@@ -39,9 +44,15 @@ THINK_CLOSE_PARTIAL_SUFFIX_PATTERN = re.compile(
 EXEC_OPEN_PATTERN = re.compile(r"<exec\b[^>]*>", flags=re.IGNORECASE)
 EXEC_CLOSE_PATTERN = re.compile(r"</exec>", flags=re.IGNORECASE)
 EXEC_TO_STEER_PATTERN = re.compile(r"</exec>(\s*)<steer\b", flags=re.IGNORECASE)
+EXEC_CLOSE_SUFFIX_PATTERN = re.compile(r"</exec>(?P<suffix>\n{0,2})$", flags=re.I)
 STEER_ENTRY_BOUNDARY_PATTERN = re.compile(
     r"(?:<think>|</exec>)\s*<steer>$",
     flags=re.IGNORECASE,
+)
+STEER_OPEN_TAG = "<steer>"
+STEER_OPEN_PREFIXES = tuple(
+    STEER_OPEN_TAG[:prefix_length]
+    for prefix_length in range(2, len(STEER_OPEN_TAG) + 1)
 )
 REPAIR_TAGS = ("<steer>", "</steer>", "<exec>", "</exec>")
 LOGGER = logging.getLogger(__name__)
@@ -901,6 +912,13 @@ def stop_finished_outcome(
     assert is_steer_stop_reason(
         stop_reason=choice.stop_reason
     ), "unexpected stop_reason"
+    if not has_trailing_steer_open_prefix(text=cursor.text):
+        append_injected_text_to_cursor(
+            client=client,
+            config=config,
+            cursor=cursor,
+            text="<steer",
+        )
     ensure_canonical_steer_open(client=client, config=config, cursor=cursor)
     return branch_rollout(cursor=cursor)
 
@@ -1189,9 +1207,24 @@ def unique_partial_tag_prefix_map() -> dict[str, str]:
                 ambiguous_prefixes.add(prefix)
     for prefix in ambiguous_prefixes:
         prefix_map.pop(prefix, None)
-    # Single "<" is ambiguous by construction; prefer canonical steer-open repair.
-    prefix_map["<"] = "<steer>"
     return prefix_map
+
+
+def has_trailing_steer_open_prefix(*, text: str) -> bool:
+    """Return whether text ends with a 2+ char prefix of `<steer>`."""
+
+    lowered = text.lower()
+    return any(lowered.endswith(prefix) for prefix in STEER_OPEN_PREFIXES)
+
+
+def complete_trailing_steer_open_suffix(*, text: str) -> str:
+    """Return the missing suffix for a trailing 2+ char `<steer>` prefix."""
+
+    lowered = text.lower()
+    for prefix in sorted(STEER_OPEN_PREFIXES, key=len, reverse=True):
+        if lowered.endswith(prefix):
+            return STEER_OPEN_TAG[len(prefix) :]
+    raise AssertionError("expected trailing steer-open prefix")
 
 
 def contains_think_close(*, text: str) -> bool:
@@ -1321,15 +1354,22 @@ def forced_boundary_suffix(*, text: str) -> str:
         text: Current assistant text.
 
     Returns:
-        Text to append for forcing the next `<steer>` boundary.
+        Append-only text for closing an exec block. A `<steer>` tag is forced
+        only when the text already contains a 2+ char steer-open prefix.
     """
+    if has_trailing_steer_open_prefix(text=text):
+        if text.endswith("<steer>"):
+            return ""
+        return complete_trailing_steer_open_suffix(text=text)
     if text.endswith("<steer>"):
         return ""
     if is_inside_open_exec(text=text):
-        separator = inferred_exec_to_steer_separator(text=text)
-        if text.endswith("</exec>"):
-            return f"{separator}<steer>"
-        return f"</exec>{separator}<steer>"
+        newline_before_close = "" if text.endswith("\n") else "\n"
+        return f"{newline_before_close}</exec>\n\n"
+    exec_close_match = EXEC_CLOSE_SUFFIX_PATTERN.search(text)
+    if exec_close_match is not None:
+        suffix = exec_close_match.group("suffix")
+        return "\n" * (2 - len(suffix))
     return "<steer>"
 
 
@@ -1701,6 +1741,8 @@ def selected_candidate_normalization_suffix(*, text: str) -> tuple[str, str]:
     Returns:
         Tuple `(injected_text, normalization_mode)`.
     """
+    if contains_think_close(text=text):
+        return "", "think_closed"
     close_suffix, normalization_mode = selected_candidate_close_completion_suffix(
         text=text
     )
@@ -2038,9 +2080,7 @@ def call_completions(
         write_prompt_token_ids_support(client=client, supported=True)
         return choices
     except VllmRequestError as request_error:
-        if "Either prompt or prompt_embeds must be provided and non-empty." not in str(
-            request_error
-        ):
+        if not is_prompt_token_ids_unsupported_error(error=request_error):
             raise
         write_prompt_token_ids_support(client=client, supported=False)
         log_stage(

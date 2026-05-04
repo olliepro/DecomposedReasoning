@@ -26,6 +26,13 @@ OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 OPENAI_EMBEDDING_BATCH_SIZE = 1024
 # Request the reduced vector size directly from OpenAI.
 OPENAI_EMBEDDING_DIMENSIONS = 128
+OPENAI_EMBEDDING_MAX_ATTEMPTS = 5
+OPENAI_EMBEDDING_RETRY_BASE_DELAY_SECONDS = 1.0
+OPENAI_EMBEDDING_RETRY_MAX_DELAY_SECONDS = 16.0
+OPENAI_EMBEDDING_RETRY_STATUS_CODES = frozenset(
+    {408, 409, 425, 429, 500, 502, 503, 504}
+)
+OPENAI_EMBEDDING_ERROR_BODY_MAX_CHARS = 2000
 
 
 @dataclass(frozen=True)
@@ -139,6 +146,13 @@ async def openai_diverse_topk_random_ids_async(
 
     assert branch_count >= 1, "branch_count must be >= 1"
     groups = cleaned_candidate_groups(candidates=pool.candidates)
+    if not groups:
+        selected_ids = fallback_candidate_ids(
+            candidates=pool.candidates,
+            branch_count=branch_count,
+            rng=rng,
+        )
+        return selected_ids, selected_ids
     if len(groups) <= branch_count:
         selected_ids = tuple(group.first_candidate_id() for group in groups)
         return selected_ids, selected_ids
@@ -189,6 +203,8 @@ def cleaned_candidate_groups(
     ordered_texts: list[str] = []
     for candidate in candidates:
         text = cleaned_candidate_text(text=candidate.text)
+        if not text:
+            continue
         if text not in grouped_ids:
             grouped_ids[text] = []
             ordered_texts.append(text)
@@ -210,6 +226,30 @@ def cleaned_candidate_text(*, text: str) -> str:
     """
 
     return strip_steer_suffix(text=text).strip()
+
+
+def fallback_candidate_ids(
+    *, candidates: tuple[CandidateRecord, ...], branch_count: int, rng: Any
+) -> tuple[int, ...]:
+    """Return candidate ids when no non-empty embedding text is available.
+
+    Args:
+        candidates: Raw candidate rows from one candidate pool.
+        branch_count: Maximum number of candidate ids to select.
+        rng: Random object used for deterministic sampling.
+
+    Returns:
+        Candidate ids in original pool order.
+    """
+
+    assert branch_count >= 1, "branch_count must be >= 1"
+    candidate_ids = tuple(candidate.candidate_id for candidate in candidates)
+    if len(candidate_ids) <= branch_count:
+        return candidate_ids
+    sampled_ids = set(rng.sample(list(candidate_ids), k=branch_count))
+    return tuple(
+        candidate_id for candidate_id in candidate_ids if candidate_id in sampled_ids
+    )
 
 
 def diverse_shortlist_size(*, n_unique_candidates: int, branch_count: int) -> int:
@@ -395,6 +435,7 @@ async def _openai_embedding_batch_async(
         Embedding vectors in request order.
     """
 
+    assert OPENAI_EMBEDDING_MAX_ATTEMPTS >= 1, "max attempts must be positive"
     payload = {
         "input": list(texts),
         "model": model,
@@ -406,22 +447,110 @@ async def _openai_embedding_batch_async(
         "Authorization": f"Bearer {openai_api_key}",
         "Content-Type": "application/json",
     }
-    async with session.post(
-        OPENAI_EMBEDDING_API_URL,
-        headers=headers,
-        json=payload,
-    ) as response:
-        response_text = await response.text()
-        if response.status >= 400:
-            raise RuntimeError(
-                f"OpenAI embedding error {response.status}: {response_text}"
+    response_text = ""
+    for attempt_number in range(1, OPENAI_EMBEDDING_MAX_ATTEMPTS + 1):
+        try:
+            async with session.post(
+                OPENAI_EMBEDDING_API_URL,
+                headers=headers,
+                json=payload,
+            ) as response:
+                response_text = await response.text()
+                if response.status < 400:
+                    break
+                if not _should_retry_openai_embedding_status(
+                    status_code=response.status,
+                    attempt_number=attempt_number,
+                ):
+                    raise RuntimeError(
+                        _openai_embedding_error_message(
+                            status_code=response.status,
+                            response_text=response_text,
+                            attempt_number=attempt_number,
+                        )
+                    )
+                await asyncio.sleep(
+                    _openai_embedding_retry_delay_seconds(attempt_number=attempt_number)
+                )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if attempt_number >= OPENAI_EMBEDDING_MAX_ATTEMPTS:
+                raise RuntimeError(
+                    "OpenAI embedding transport error after "
+                    f"{attempt_number} attempts: {exc}"
+                ) from exc
+            await asyncio.sleep(
+                _openai_embedding_retry_delay_seconds(attempt_number=attempt_number)
             )
+    else:
+        raise AssertionError("unreachable embedding retry loop state")
     response_payload = json.loads(response_text)
     data = response_payload.get("data")
     assert isinstance(data, list), "OpenAI embedding response missing data list"
     assert len(data) == len(texts), "OpenAI embedding batch length mismatch"
     ordered = sorted(data, key=lambda item: int(item.get("index", 0)))
     return [_parse_openai_embedding_row(row=row) for row in ordered]
+
+
+def _should_retry_openai_embedding_status(
+    *, status_code: int, attempt_number: int
+) -> bool:
+    """Return whether an embedding HTTP status should be retried.
+
+    Args:
+        status_code: HTTP response status from OpenAI.
+        attempt_number: One-based request attempt number.
+
+    Returns:
+        `True` when another attempt should be made.
+    """
+
+    assert attempt_number >= 1, "attempt_number must be one-based"
+    return (
+        status_code in OPENAI_EMBEDDING_RETRY_STATUS_CODES
+        and attempt_number < OPENAI_EMBEDDING_MAX_ATTEMPTS
+    )
+
+
+def _openai_embedding_retry_delay_seconds(*, attempt_number: int) -> float:
+    """Return exponential retry delay for an OpenAI embedding attempt.
+
+    Args:
+        attempt_number: One-based request attempt number that just failed.
+
+    Returns:
+        Delay in seconds before the next retry.
+
+    Example:
+        >>> _openai_embedding_retry_delay_seconds(attempt_number=1)
+        1.0
+    """
+
+    assert attempt_number >= 1, "attempt_number must be one-based"
+    delay = OPENAI_EMBEDDING_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt_number - 1))
+    return min(delay, OPENAI_EMBEDDING_RETRY_MAX_DELAY_SECONDS)
+
+
+def _openai_embedding_error_message(
+    *, status_code: int, response_text: str, attempt_number: int
+) -> str:
+    """Format a bounded OpenAI embedding HTTP error message.
+
+    Args:
+        status_code: HTTP response status.
+        response_text: Raw response body.
+        attempt_number: One-based attempt number.
+
+    Returns:
+        Runtime error message safe for logs.
+    """
+
+    body = response_text[:OPENAI_EMBEDDING_ERROR_BODY_MAX_CHARS]
+    if len(response_text) > OPENAI_EMBEDDING_ERROR_BODY_MAX_CHARS:
+        body = f"{body}...<truncated>"
+    return (
+        f"OpenAI embedding error {status_code} after {attempt_number} attempts: "
+        f"{body}"
+    )
 
 
 def _parse_openai_embedding_row(*, row: object) -> tuple[float, ...]:

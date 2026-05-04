@@ -188,6 +188,7 @@ class ServeConfig:
         trust_remote_code: Forwarded model loading flag.
         max_logprobs: vLLM max logprobs engine cap.
         startup_timeout_seconds: Max wait for server health.
+        request_timeout_seconds: Max wait for one vLLM HTTP request.
         poll_interval_seconds: Health-check poll interval.
 
     Returns:
@@ -205,6 +206,7 @@ class ServeConfig:
     trust_remote_code: bool = True
     max_logprobs: int = 20
     startup_timeout_seconds: float = 180.0
+    request_timeout_seconds: float = 600.0
     poll_interval_seconds: float = 1.0
 
 
@@ -537,6 +539,9 @@ def _parse_serve(*, payload: dict[str, Any]) -> ServeConfig:
         max_logprobs=int(serve_payload.get("max_logprobs", 20)),
         startup_timeout_seconds=float(
             serve_payload.get("startup_timeout_seconds", 180.0)
+        ),
+        request_timeout_seconds=float(
+            serve_payload.get("request_timeout_seconds", 600.0)
         ),
         poll_interval_seconds=float(serve_payload.get("poll_interval_seconds", 1.0)),
     )

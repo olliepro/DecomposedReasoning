@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 from pathlib import Path
+from typing import Any
 
 import branching_eval.selector_runtime as selector_runtime_module
 from candidate_clustering import DedupItem
 from branching_eval.embedding_selection import (
     OPENAI_EMBEDDING_DIMENSIONS,
+    _openai_embedding_batch_async,
+    cleaned_candidate_groups,
     greedy_diverse_indices,
     normalized_embedding_matrix,
     openai_diverse_topk_random_ids_async,
@@ -293,6 +297,41 @@ def _padded_vector(*, x: float, y: float) -> tuple[float, ...]:
     return (x, y) + (0.0,) * 126 + (999.0, -999.0)
 
 
+def test_cleaned_candidate_groups_skips_empty_texts() -> None:
+    """OpenAI selector grouping should not emit blank embedding inputs."""
+
+    pool = CandidatePoolRecord(
+        candidate_pool_id="empty-pool",
+        branch_point_id="bp",
+        node_id="node",
+        trigger_type="steer_boundary",
+        entropy_value=None,
+        candidates=(
+            CandidateRecord(
+                candidate_id=0,
+                text="</steer>",
+                token_ids=(10,),
+                tokens=(),
+                finish_reason="stop",
+                stop_reason="</steer>",
+            ),
+            CandidateRecord(
+                candidate_id=1,
+                text=" useful candidate </steer>",
+                token_ids=(11,),
+                tokens=(),
+                finish_reason="stop",
+                stop_reason="</steer>",
+            ),
+        ),
+    )
+
+    groups = cleaned_candidate_groups(candidates=pool.candidates)
+
+    assert [group.text for group in groups] == ["useful candidate"]
+    assert [group.candidate_ids for group in groups] == [(1,)]
+
+
 def test_normalized_embedding_matrix_normalizes_rows() -> None:
     """Embedding matrix helper should normalize rows without resizing them."""
 
@@ -434,3 +473,141 @@ def test_openai_diverse_topk_random_uses_provided_http_session(monkeypatch) -> N
     )
 
     assert seen_sessions == [sentinel_session]
+
+
+class FakeEmbeddingResponse:
+    """Async context response fixture for OpenAI embedding HTTP tests."""
+
+    def __init__(self, *, status: int, body: str) -> None:
+        """Store fake response fields.
+
+        Args:
+            status: HTTP status exposed to the caller.
+            body: Response text returned by `text`.
+
+        Returns:
+            None.
+        """
+
+        self.status = status
+        self.body = body
+
+    async def __aenter__(self) -> "FakeEmbeddingResponse":
+        """Return the fake response for async context manager use."""
+
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        """Exit the fake async context manager."""
+
+        _ = args
+
+    async def text(self) -> str:
+        """Return the configured response body."""
+
+        return self.body
+
+
+class FakeEmbeddingSession:
+    """Minimal session fixture returning queued embedding responses."""
+
+    def __init__(self, *, responses: list[FakeEmbeddingResponse]) -> None:
+        """Initialize a fake session.
+
+        Args:
+            responses: Ordered responses to return from `post`.
+
+        Returns:
+            None.
+        """
+
+        self.responses = responses
+        self.calls = 0
+
+    def post(self, *args: Any, **kwargs: Any) -> FakeEmbeddingResponse:
+        """Return the next queued fake response.
+
+        Args:
+            args: Positional request arguments, including the URL.
+            kwargs: Request keyword arguments, captured only for signature parity.
+
+        Returns:
+            Next fake response.
+        """
+
+        _ = args, kwargs
+        response = self.responses[self.calls]
+        self.calls += 1
+        return response
+
+
+def _embedding_response_body(*, values: tuple[float, ...]) -> str:
+    """Return a valid OpenAI embedding response JSON string."""
+
+    return json.dumps({"data": [{"index": 0, "embedding": list(values)}]})
+
+
+def test_openai_embedding_batch_retries_transient_http_error(monkeypatch) -> None:
+    """OpenAI embedding batches should retry transient 5xx failures."""
+
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    monkeypatch.setattr("branching_eval.embedding_selection.asyncio.sleep", fake_sleep)
+    session = FakeEmbeddingSession(
+        responses=[
+            FakeEmbeddingResponse(status=502, body="bad gateway"),
+            FakeEmbeddingResponse(
+                status=200,
+                body=_embedding_response_body(values=(1.0, 0.0)),
+            ),
+        ]
+    )
+
+    vectors = asyncio.run(
+        _openai_embedding_batch_async(
+            session=session,  # type: ignore[arg-type]
+            texts=("alpha",),
+            model="text-embedding-3-small",
+            openai_api_key="test-openai-key",
+            output_dimensions=2,
+        )
+    )
+
+    assert session.calls == 2
+    assert sleep_delays == [1.0]
+    assert vectors == [(1.0, 0.0)]
+
+
+def test_openai_embedding_batch_does_not_retry_auth_error(monkeypatch) -> None:
+    """OpenAI embedding batches should fail immediately on non-retryable 4xx."""
+
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    monkeypatch.setattr("branching_eval.embedding_selection.asyncio.sleep", fake_sleep)
+    session = FakeEmbeddingSession(
+        responses=[FakeEmbeddingResponse(status=401, body="bad key")]
+    )
+
+    try:
+        asyncio.run(
+            _openai_embedding_batch_async(
+                session=session,  # type: ignore[arg-type]
+                texts=("alpha",),
+                model="text-embedding-3-small",
+                openai_api_key="test-openai-key",
+                output_dimensions=2,
+            )
+        )
+    except RuntimeError as exc:
+        assert "OpenAI embedding error 401 after 1 attempts" in str(exc)
+    else:
+        raise AssertionError("expected non-retryable 401 to fail")
+
+    assert session.calls == 1
+    assert sleep_delays == []

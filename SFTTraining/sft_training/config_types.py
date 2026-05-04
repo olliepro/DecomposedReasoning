@@ -122,6 +122,8 @@ class RunConfig:
         activation_offloading: Offloads activations to CPU to reduce GPU memory.
         supervision_mode: Whether to supervise only the final assistant
             completion or the full rendered conversation.
+        mask_non_sequitur_steer_spans: Enables assistant-token masking for
+            non-sequitur steer spans recorded in the dataset metadata.
         warmup_ratio: Warmup ratio for scheduler.
         optim: Optimizer name passed to TRL/Transformers trainer.
         adam_beta1: Adam beta1 coefficient.
@@ -164,6 +166,7 @@ class RunConfig:
     gradient_checkpointing: bool = True
     activation_offloading: bool = False
     supervision_mode: SupervisionMode = "completion_only"
+    mask_non_sequitur_steer_spans: bool = False
     warmup_ratio: float = 0.03
     optim: str = "adamw_torch_fused"
     adam_beta1: float = 0.9
@@ -454,8 +457,16 @@ def _parse_supervision_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     supervision_mode = str(payload.get("supervision_mode", "completion_only"))
     valid_modes = ("completion_only", "full_conversation", "assistant_only")
     assert supervision_mode in valid_modes, "Invalid `supervision_mode` value."
+    mask_non_sequitur_steer_spans = bool(
+        payload.get("mask_non_sequitur_steer_spans", False)
+    )
+    if mask_non_sequitur_steer_spans:
+        assert (
+            supervision_mode == "assistant_only"
+        ), "`mask_non_sequitur_steer_spans` requires `supervision_mode: assistant_only`."
     return {
         "supervision_mode": cast(SupervisionMode, supervision_mode),
+        "mask_non_sequitur_steer_spans": mask_non_sequitur_steer_spans,
     }
 
 

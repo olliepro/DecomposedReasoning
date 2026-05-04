@@ -19,7 +19,7 @@ def test_run_config_from_yaml_resolves_paths() -> None:
     assert config.deepspeed_config_path is None
     assert config.num_train_epochs == 8
     assert config.lm_eval.tasks == ("minerva_math500", "aime24", "aime25")
-    assert config.lm_eval.aime_avg_k == 32
+    assert config.lm_eval.aime_avg_k == 1
 
 
 def test_run_config_allows_null_deepspeed_path(tmp_path: Path) -> None:
@@ -114,6 +114,44 @@ def test_run_config_rejects_invalid_aime_avg_k(tmp_path: Path) -> None:
         "deepspeed_config_path": None,
         "wandb_project": "proj",
         "lm_eval": {"tasks": ["aime24"], "aime_avg_k": 0},
+    }
+    yaml_path = tmp_path / "run.yaml"
+    yaml_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    with pytest.raises(AssertionError):
+        RunConfig.from_yaml(yaml_path=yaml_path)
+
+
+def test_run_config_parses_non_sequitur_mask_flag(tmp_path: Path) -> None:
+    """Run config loader should parse non-sequitur masking for assistant-only runs."""
+    payload = {
+        "run_name": "smoke",
+        "model_name_or_path": "Qwen/Qwen2.5-0.5B-Instruct",
+        "dataset_path": "../BuildSFTDataset/output/transformed_output.jsonl",
+        "output_dir": "/tmp/sft",
+        "deepspeed_config_path": None,
+        "wandb_project": "proj",
+        "supervision_mode": "assistant_only",
+        "mask_non_sequitur_steer_spans": True,
+    }
+    yaml_path = tmp_path / "run.yaml"
+    yaml_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    config = RunConfig.from_yaml(yaml_path=yaml_path)
+    assert config.mask_non_sequitur_steer_spans is True
+
+
+def test_run_config_rejects_non_assistant_non_sequitur_masking(
+    tmp_path: Path,
+) -> None:
+    """Non-sequitur masking should only be valid with assistant-only supervision."""
+    payload = {
+        "run_name": "smoke",
+        "model_name_or_path": "Qwen/Qwen2.5-0.5B-Instruct",
+        "dataset_path": "../BuildSFTDataset/output/transformed_output.jsonl",
+        "output_dir": "/tmp/sft",
+        "deepspeed_config_path": None,
+        "wandb_project": "proj",
+        "supervision_mode": "completion_only",
+        "mask_non_sequitur_steer_spans": True,
     }
     yaml_path = tmp_path / "run.yaml"
     yaml_path.write_text(yaml.safe_dump(payload), encoding="utf-8")

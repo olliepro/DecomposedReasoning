@@ -1,0 +1,1481 @@
+{
+  "schema_version": "1.1",
+  "intended_use": "Augment interleaved <steer>/<exec> reasoning traces with explicit metacognitive interventions while keeping the resulting traces natural enough to use for supervised fine-tuning.",
+  "high_level_goal": "Use a stronger teacher/editor model to generate only a short intervention window at a pair boundary, then either keep the original suffix or regenerate from the augmented prefix with the original model depending on how trajectory-changing the intervention is.",
+  "mode_reference": {
+    "insert": {
+      "definition": "Add a short intervention window that preserves the existing reasoning trajectory.",
+      "when_to_use": "Use when the intervention compresses context, restates, summarizes, or lightly clarifies without changing the plan.",
+      "teacher_output": "Only the inserted intervention window of K new <steer>/<exec> pairs.",
+      "suffix_policy": "keep_original_suffix",
+      "key_prompt_requirement": "Provide the next original steer block so the teacher can write an intervention that naturally slots in before it."
+    },
+    "bridge": {
+      "definition": "Add a short intervention window that slightly reframes or stress-tests the reasoning but tries to reconnect to the old path.",
+      "when_to_use": "Use when the intervention may change local framing or confidence but should often be able to return to the original line of reasoning.",
+      "teacher_output": "Only the inserted intervention window of K new <steer>/<exec> pairs.",
+      "suffix_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "key_prompt_requirement": "Provide the next original steer block as an anchor and ask the teacher to end in a way that makes that steer feel like a plausible next move."
+    },
+    "redirect": {
+      "definition": "Add an intervention window that intentionally changes the reasoning trajectory.",
+      "when_to_use": "Use when the intervention asks for backtracking, a new abstraction, a different strategy, a toy problem, or another move that should often replace the original continuation.",
+      "teacher_output": "Only the inserted intervention window of K new <steer>/<exec> pairs.",
+      "suffix_policy": "regenerate_suffix",
+      "key_prompt_requirement": "Optionally provide the next original steer only as context for what the old trace would have done, not as a target to reconnect to."
+    }
+  },
+  "sampling_defaults": {
+    "one_intervention_per_trace": true,
+    "default_dataset_mix": {
+      "insert": 0.6,
+      "bridge": 0.25,
+      "redirect": 0.15
+    },
+    "sample_cut_points_at_pair_boundaries_only": true,
+    "style_window_pairs": 2,
+    "exec_token_limit": 512,
+    "bridge_default_policy": "judge_whether_the_next_original_steer_still_fits",
+    "first_new_steer_should_match_variant_exactly": true
+  },
+  "interventions": [
+    {
+      "name": "Restate task and approach",
+      "category": "local_compressive",
+      "variants": [
+        "restate the goal and plan",
+        "compress the task and route",
+        "say what must be solved and how"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 1,
+        "default": 1
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "This compresses context and should rarely change the trajectory.",
+      "mode_weight_hint": {
+        "insert": 0.8,
+        "bridge": 0.2,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge"
+    },
+    {
+      "name": "State known constraints",
+      "category": "local_compressive",
+      "variants": [
+        "state the constraints explicitly",
+        "pin down the hard limits",
+        "list what cannot be violated"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 1,
+        "default": 1
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "This clarifies boundaries without usually changing the plan.",
+      "mode_weight_hint": {
+        "insert": 0.8,
+        "bridge": 0.2,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge"
+    },
+    {
+      "name": "List all assumptions unstated so far",
+      "category": "diagnostic",
+      "variants": [
+        "surface the hidden assumptions",
+        "spell out unstated premises",
+        "note what is being assumed"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 1
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "Surfacing assumptions can expose hidden dependencies and sometimes forces a rewrite.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Honestly recount progress",
+      "category": "diagnostic",
+      "variants": [
+        "say what progress has actually been made",
+        "take stock of real progress",
+        "state where things stand honestly"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 1,
+        "default": 1
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This is usually a local status check, but it may sometimes reveal drift.",
+      "mode_weight_hint": {
+        "insert": 0.4,
+        "bridge": 0.6,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Take pessimistic view of progress so far",
+      "category": "diagnostic",
+      "variants": [
+        "assume progress is worse than it seems",
+        "take the pessimistic read",
+        "stress-test the claimed progress"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "A pessimistic audit can stay local or can motivate a trajectory change.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Check for any contradictions",
+      "category": "diagnostic",
+      "variants": [
+        "check for internal contradictions",
+        "test the story for inconsistency",
+        "look for claims that conflict"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "If a contradiction is found, the old suffix often needs regeneration.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Backtrack",
+      "category": "redirective",
+      "variants": [
+        "rewind to the last solid point",
+        "step back to a safer branch",
+        "undo the shaky move and retry"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 4,
+        "default": 3
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "Backtracking explicitly changes the active branch.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.0,
+        "redirect": 1.0
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Conduct a premortem of this approach",
+      "category": "diagnostic",
+      "variants": [
+        "imagine this approach fails",
+        "do a premortem on this path",
+        "ask how this could go wrong"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "A premortem often reveals reasons to alter the plan, so suffix regeneration is common.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.3,
+        "redirect": 0.7
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "List n potential next steps",
+      "category": "diagnostic",
+      "variants": [
+        "list a few possible next steps",
+        "enumerate candidate moves",
+        "name the best immediate options"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "Candidate next steps can still return to the original path if one option matches it.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Plan pivot check-ins to fail early",
+      "category": "diagnostic",
+      "variants": [
+        "set pivot checks now",
+        "define early failure tests",
+        "choose checkpoints for switching"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 1
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This adds monitoring structure and is often compatible with the original suffix.",
+      "mode_weight_hint": {
+        "insert": 0.4,
+        "bridge": 0.6,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Rank top 3 possible options w/ reasoning",
+      "category": "diagnostic",
+      "variants": [
+        "rank the top options",
+        "choose and order the best paths",
+        "compare the leading candidates"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "Ranking options may endorse the old path or may justify a new one.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Compare this problem to a well known analogue",
+      "category": "local_compressive",
+      "variants": [
+        "find a familiar analogue",
+        "compare this to a known problem",
+        "map it to a standard template"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 1
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A useful analogue usually sharpens the same trajectory rather than replacing it.",
+      "mode_weight_hint": {
+        "insert": 0.8,
+        "bridge": 0.2,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge"
+    },
+    {
+      "name": "Reconsider high-level strategy",
+      "category": "redirective",
+      "variants": [
+        "step back and revisit strategy",
+        "question the overall game plan",
+        "reassess the top-level approach"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 4,
+        "default": 3
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "Reconsidering strategy often changes the route enough that the old suffix no longer fits.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.3,
+        "redirect": 0.7
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Focus on better abstractions",
+      "category": "redirective",
+      "variants": [
+        "move to a cleaner abstraction",
+        "lift to the right abstraction",
+        "reframe at a better level"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "A better abstraction often changes what the next useful moves should be.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.3,
+        "redirect": 0.7
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Synthesize results so far",
+      "category": "local_compressive",
+      "variants": [
+        "synthesize what has emerged",
+        "combine the current findings",
+        "unify the partial results"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 1
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "This merges existing observations and usually preserves the line of reasoning.",
+      "mode_weight_hint": {
+        "insert": 0.8,
+        "bridge": 0.2,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge"
+    },
+    {
+      "name": "Summarize progress",
+      "category": "local_compressive",
+      "variants": [
+        "summarize the progress briefly",
+        "give a short status summary",
+        "compress the current state"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 1,
+        "default": 1
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A brief summary is usually compressive and non-disruptive.",
+      "mode_weight_hint": {
+        "insert": 0.8,
+        "bridge": 0.2,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge"
+    },
+    {
+      "name": "Identify patterns in my thinking",
+      "category": "diagnostic",
+      "variants": [
+        "identify the pattern in this reasoning",
+        "note recurring thought habits",
+        "say what pattern is showing up"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 1
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "Pattern recognition can be local, but sometimes it motivates a strategic correction.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Stop and list alternate approaches",
+      "category": "redirective",
+      "variants": [
+        "pause and list alternatives",
+        "name other viable approaches",
+        "stop and branch the search"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "Alternative approaches are usually useful because the current path may no longer be best.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.3,
+        "redirect": 0.7
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Map relations between concepts",
+      "category": "local_compressive",
+      "variants": [
+        "map how the concepts connect",
+        "relate the moving pieces",
+        "draw the concept dependencies"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "Concept mapping can be inserted locally, but it can also re-order what comes next.",
+      "mode_weight_hint": {
+        "insert": 0.4,
+        "bridge": 0.6,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Enumerate blocked paths",
+      "category": "diagnostic",
+      "variants": [
+        "list the blocked paths",
+        "note which routes are closed",
+        "mark the dead ends explicitly"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "Dead-end analysis often sets up a pivot.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Consider an induction or iterative approach",
+      "category": "redirective",
+      "variants": [
+        "try an iterative version first",
+        "test an induction-style route",
+        "see if a stepwise method fits"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 4,
+        "default": 3
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "This usually changes the proof or solution template.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.3,
+        "redirect": 0.7
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Document solution approach",
+      "category": "local_compressive",
+      "variants": [
+        "document the solution path",
+        "record the method cleanly",
+        "state the procedure explicitly"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This is often just clarification, but it can expose missing steps.",
+      "mode_weight_hint": {
+        "insert": 0.4,
+        "bridge": 0.6,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "List 3+ themes of this problem",
+      "category": "local_compressive",
+      "variants": [
+        "extract the main themes",
+        "name the recurring themes",
+        "group the problem into themes"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "Theme extraction is often compatible with the current path but can mildly reframe priorities.",
+      "mode_weight_hint": {
+        "insert": 0.4,
+        "bridge": 0.6,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Formulate a hierarchy",
+      "category": "diagnostic",
+      "variants": [
+        "build a hierarchy of issues",
+        "organize this into levels",
+        "separate top-level from local concerns"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "A hierarchy can clarify the next step or suggest a different order of attack.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Evaluate working backwards",
+      "category": "redirective",
+      "variants": [
+        "work backward from the goal",
+        "start at the target and reverse",
+        "see what must be true at the end"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 4,
+        "default": 3
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "Working backwards often changes the order of reasoning substantially.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.3,
+        "redirect": 0.7
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Clean context: restate knowns briefly",
+      "category": "local_compressive",
+      "variants": [
+        "clean context and restate knowns",
+        "reset and list the known facts",
+        "briefly restate the fixed facts"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 1,
+        "default": 1
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "This is a lightweight reset and usually preserves the suffix.",
+      "mode_weight_hint": {
+        "insert": 0.8,
+        "bridge": 0.2,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge"
+    },
+    {
+      "name": "Isolate 1-2 addressable blockers",
+      "category": "diagnostic",
+      "variants": [
+        "isolate the nearest blockers",
+        "find the smallest blocking issues",
+        "pick one or two fixable obstacles"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "Naming blockers can sharpen the old plan or trigger a pivot.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Give 5 truly outside the box ideas",
+      "category": "redirective",
+      "variants": [
+        "brainstorm unconventional ideas",
+        "force five nonstandard options",
+        "generate weird but plausible angles"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "This intentionally widens the search and often cannot cleanly reuse the old suffix.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.3,
+        "redirect": 0.7
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Apply radical perspective shift to problem",
+      "category": "redirective",
+      "variants": [
+        "flip the frame entirely",
+        "attack this from a different worldview",
+        "reverse the usual perspective"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 3,
+        "max": 5,
+        "default": 4
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "A radical shift is meant to replace the local continuation.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.0,
+        "redirect": 1.0
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Consider related fields' usefulness",
+      "category": "diagnostic",
+      "variants": [
+        "borrow from a nearby field",
+        "see what another discipline offers",
+        "import tools from related areas"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "Cross-field borrowing can stay local or produce a new method.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Explain with an analogy",
+      "category": "local_compressive",
+      "variants": [
+        "explain it through analogy",
+        "build a concrete analogy",
+        "translate this into a familiar picture"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 1,
+        "default": 1
+      },
+      "recommended_editor_mode": "insert",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_original_suffix",
+      "why": "A short analogy usually clarifies without changing the path.",
+      "mode_weight_hint": {
+        "insert": 0.8,
+        "bridge": 0.2,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "keep_suffix_without_judge"
+    },
+    {
+      "name": "Compare cases",
+      "category": "diagnostic",
+      "variants": [
+        "compare the key cases",
+        "split and contrast the cases",
+        "line up representative cases"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "Case comparison is often local but can change which branch deserves focus.",
+      "mode_weight_hint": {
+        "insert": 0.4,
+        "bridge": 0.6,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Weigh pros and cons of this approach",
+      "category": "diagnostic",
+      "variants": [
+        "weigh the pros and cons",
+        "audit the tradeoffs directly",
+        "list gains versus costs"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "Tradeoff analysis may validate the current path or weaken commitment to it.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "List pros and cons of pivoting",
+      "category": "diagnostic",
+      "variants": [
+        "weigh the costs of pivoting",
+        "compare pivoting against staying",
+        "audit whether a pivot is worth it"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This explicitly evaluates whether the old suffix is still worth keeping.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Compare progress against goal",
+      "category": "diagnostic",
+      "variants": [
+        "compare current state to the goal",
+        "measure progress against the target",
+        "check distance to the objective"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 1
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "Goal-distance checks often remain local but may reveal the need for a change.",
+      "mode_weight_hint": {
+        "insert": 0.4,
+        "bridge": 0.6,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Recognize myopic behavior",
+      "category": "redirective",
+      "variants": [
+        "check for short-horizon thinking",
+        "look for myopic choices",
+        "ask where the view is too local"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "Calling out myopia often implies the current local move is not enough.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.3,
+        "redirect": 0.7
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Surface hidden logic debt",
+      "category": "diagnostic",
+      "variants": [
+        "expose hidden logic debt",
+        "find unstated proof obligations",
+        "surface deferred reasoning debt"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "Hidden debt may be tolerable locally or may require restructuring.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Play devil's advocate",
+      "category": "diagnostic",
+      "variants": [
+        "argue the strongest objection",
+        "take the opposing side briefly",
+        "pressure-test this with objections"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "A brief objection often works as a bridge, but a strong objection may force a rewrite.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Argue for backtracking",
+      "category": "redirective",
+      "variants": [
+        "make the case for backing up",
+        "argue that backtracking is cheaper",
+        "justify returning to an earlier point"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "This explicitly endorses abandoning the active local branch.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.0,
+        "redirect": 1.0
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Argue against continuing",
+      "category": "redirective",
+      "variants": [
+        "argue for stopping this path",
+        "make the case against continuing",
+        "explain why this route should be dropped"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "This is a direct rejection of the current continuation.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.0,
+        "redirect": 1.0
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Argue for continuing",
+      "category": "diagnostic",
+      "variants": [
+        "make the case to keep going",
+        "justify staying on this path",
+        "argue that continuation is still best"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This often reinforces the existing suffix rather than changing it.",
+      "mode_weight_hint": {
+        "insert": 0.4,
+        "bridge": 0.6,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Argue against backtracking",
+      "category": "diagnostic",
+      "variants": [
+        "argue that backing up is wasteful",
+        "justify not backtracking yet",
+        "make the case to press on"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "insert",
+        "bridge"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This usually supports keeping the current branch.",
+      "mode_weight_hint": {
+        "insert": 0.4,
+        "bridge": 0.6,
+        "redirect": 0.0
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Argue for 3 possible alternatives",
+      "category": "redirective",
+      "variants": [
+        "defend three alternative routes",
+        "make the case for other paths",
+        "argue for three viable substitutes"
+      ],
+      "preferred_slots": [
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 4,
+        "default": 3
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "This widens the search enough that suffix regeneration is usually cleaner.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.3,
+        "redirect": 0.7
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Explore more",
+      "category": "diagnostic",
+      "variants": [
+        "widen the search a bit",
+        "probe a little farther",
+        "explore before committing"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "A little more exploration can still return to the original path, but not always.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "List 4 ways to simplify the approach",
+      "category": "redirective",
+      "variants": [
+        "simplify the problem aggressively",
+        "list a few simplifications",
+        "reduce the moving parts first"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 3,
+        "default": 2
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "Simplification often swaps in a new, smaller subproblem or plan.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.3,
+        "redirect": 0.7
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Start with a simpler stepping stone",
+      "category": "redirective",
+      "variants": [
+        "start with an easier subproblem",
+        "warm up on a simpler version",
+        "solve a smaller precursor first"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 4,
+        "default": 3
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "A stepping-stone problem usually becomes the new local task.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.3,
+        "redirect": 0.7
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Create a smaller problem to learn from first",
+      "category": "redirective",
+      "variants": [
+        "make a toy version first",
+        "build a minimal learning case",
+        "shrink the problem to study it"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 2,
+        "max": 4,
+        "default": 3
+      },
+      "recommended_editor_mode": "redirect",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "regenerate_suffix",
+      "why": "A toy problem deliberately changes the immediate trajectory.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.3,
+        "redirect": 0.7
+      },
+      "suffix_handling_hint": "regen_from_augmented_prefix"
+    }
+  ]
+}

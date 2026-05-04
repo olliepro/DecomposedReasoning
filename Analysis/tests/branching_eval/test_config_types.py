@@ -30,6 +30,7 @@ def test_config_defaults_parse_from_minimal_payload(tmp_path: Path) -> None:
     assert config.serve.scheduling_policy == "priority"
     assert config.serve.kv_offloading_size_gb == 64.0
     assert config.serve.kv_offloading_backend == "native"
+    assert config.serve.request_timeout_seconds == 600.0
     assert config.run_matrix.include_structured_baselines is False
     assert config.run_matrix.include_epsilon_greedy is False
 
@@ -69,6 +70,7 @@ def test_scheduling_policy_parses_from_serve_block(tmp_path: Path) -> None:
                     "scheduling_policy": "priority",
                     "kv_offloading_size_gb": 12.0,
                     "kv_offloading_backend": "lmcache",
+                    "request_timeout_seconds": 321.0,
                 },
                 "branching": {"steer_repetition_penalty": 1.2},
             }
@@ -79,6 +81,7 @@ def test_scheduling_policy_parses_from_serve_block(tmp_path: Path) -> None:
     assert config.serve.scheduling_policy == "priority"
     assert config.serve.kv_offloading_size_gb == 12.0
     assert config.serve.kv_offloading_backend == "lmcache"
+    assert config.serve.request_timeout_seconds == 321.0
     assert config.branching.steer_repetition_penalty == 1.2
 
 
