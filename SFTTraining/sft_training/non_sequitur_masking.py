@@ -357,8 +357,40 @@ def tokenize_assistant_messages(
     )
     input_ids = _flatten_single_example(values=encoded["input_ids"])
     assistant_masks = _flatten_single_example(values=encoded["assistant_masks"])
+    assistant_masks = ensure_final_eos_supervised(
+        tokenizer=tokenizer,
+        input_ids=input_ids,
+        assistant_masks=assistant_masks,
+    )
     assert 1 in assistant_masks, "Assistant mask must supervise at least one token."
     return {"input_ids": input_ids, "assistant_masks": assistant_masks}
+
+
+def ensure_final_eos_supervised(
+    tokenizer: PreTrainedTokenizerBase,
+    input_ids: Sequence[int],
+    assistant_masks: Sequence[int],
+) -> list[int]:
+    """Keep the final assistant EOS token in the supervised label mask.
+
+    Args:
+        tokenizer: Training tokenizer that defines the EOS token id.
+        input_ids: Tokenized rendered conversation.
+        assistant_masks: Assistant-token supervision mask aligned to `input_ids`.
+
+    Returns:
+        Assistant mask with the final EOS unmasked when present.
+    """
+    assert len(input_ids) == len(
+        assistant_masks
+    ), "Assistant mask must align with input ids."
+    supervised_masks = [int(value) for value in assistant_masks]
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None or not input_ids:
+        return supervised_masks
+    if int(input_ids[-1]) == int(eos_token_id):
+        supervised_masks[-1] = 1
+    return supervised_masks
 
 
 def _materialize_messages(
@@ -451,6 +483,11 @@ def build_assistant_tokenized_record(
             overlap_mask,
         )
     ]
+    assistant_masks = ensure_final_eos_supervised(
+        tokenizer=tokenizer,
+        input_ids=baseline["input_ids"],
+        assistant_masks=assistant_masks,
+    )
     return {"input_ids": baseline["input_ids"], "assistant_masks": assistant_masks}
 
 

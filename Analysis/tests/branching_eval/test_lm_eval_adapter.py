@@ -29,6 +29,13 @@ class FakeTaskNoAggregation:
     aggregation = None
 
 
+class FakeDocTextTask:
+    """Task mock with one prompt-bearing document."""
+
+    def doc_to_text(self, doc: dict[str, str]) -> str:
+        return doc["problem"]
+
+
 def _adapter_with_task(task: object) -> LmEvalAdapter:
     adapter = LmEvalAdapter.__new__(LmEvalAdapter)
     adapter.task_name = "aime24"
@@ -75,3 +82,20 @@ def test_aggregate_task_metrics_falls_back_to_numeric_mean() -> None:
     )
     assert aggregated["acc"] == 0.5
     assert aggregated["tag"] == "x"
+
+
+def test_aime_prompt_instructs_boxed_final_answer() -> None:
+    """AIME prompts should explicitly request LaTeX boxed final answers."""
+
+    adapter = _adapter_with_task(FakeDocTextTask())
+    prompt_text = adapter._prompt_text(doc={"problem": "Compute 2+2."})
+    assert prompt_text.endswith("\\boxed{...}.")
+    assert "LaTeX boxed form" in prompt_text
+
+
+def test_non_aime_prompt_is_unchanged() -> None:
+    """Only AIME prompts receive the boxed-answer instruction."""
+
+    adapter = _adapter_with_task(FakeDocTextTask())
+    adapter.task_name = "not_aime"
+    assert adapter._prompt_text(doc={"problem": "Compute 2+2. "}) == "Compute 2+2. "

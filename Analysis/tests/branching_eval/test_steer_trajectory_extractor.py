@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from branching_eval.event_db import EventDatabase
 from branching_eval.steer_trajectory_extractor import (
     NodeKey,
     SuccessfulLeaf,
@@ -13,7 +14,7 @@ from branching_eval.steer_trajectory_extractor import (
 
 
 def write_tree_events(*, path: Path, rows: list[dict[str, object]]) -> None:
-    """Write a canonical tree-events file for tests.
+    """Write a canonical tree-events SQLite DB for tests.
 
     Args:
         path: Output tree-events path.
@@ -23,11 +24,11 @@ def write_tree_events(*, path: Path, rows: list[dict[str, object]]) -> None:
         None.
     """
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row))
-            handle.write("\n")
+    event_db = EventDatabase(path=path)
+    with event_db.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        event_db.append_event_rows(connection=connection, rows=rows)
+        connection.commit()
 
 
 def make_row(
@@ -75,7 +76,7 @@ def test_build_success_path_orders_root_to_leaf() -> None:
 def test_extract_successful_trajectory_uses_earliest_scored_success(
     tmp_path: Path,
 ) -> None:
-    tree_events_path = tmp_path / "run_a" / "tree_events.jsonl"
+    tree_events_path = tmp_path / "run_a" / "tree_events.sqlite"
     rows = [
         make_row(
             event_index=0,
@@ -180,7 +181,7 @@ def test_extract_successful_trajectory_uses_earliest_scored_success(
 
 
 def test_run_cli_writes_index_and_artifacts(tmp_path: Path) -> None:
-    tree_events_path = tmp_path / "runs" / "demo_run" / "tree_events.jsonl"
+    tree_events_path = tmp_path / "runs" / "demo_run" / "tree_events.sqlite"
     rows = [
         make_row(
             event_index=0,

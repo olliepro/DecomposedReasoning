@@ -24,6 +24,7 @@ from src.trace_augmentor import (  # noqa: E402
     OpenRouterAsyncClient,
     TokenCounter,
     TraceBlock,
+    apply_sampling_defaults_to_spec,
     build_intervention_schema,
     build_prompt_values,
     choose_pairs_to_generate,
@@ -65,6 +66,7 @@ class StepPlan:
         cut_after_pairs: Pair boundary in the original trace before this step.
         post_splice_policy: Suffix-handling policy from `interventions.json`.
         category: Intervention category for reporting.
+        steer_token_limit: Inclusive token cap for generated steer blocks.
 
     Example:
         >>> StepPlan(
@@ -75,6 +77,7 @@ class StepPlan:
         ...     cut_after_pairs=3,
         ...     post_splice_policy="keep_original_suffix",
         ...     category="local_compressive",
+        ...     steer_token_limit=15,
         ... ).mode
         'insert'
     """
@@ -86,6 +89,7 @@ class StepPlan:
     cut_after_pairs: int
     post_splice_policy: str
     category: str
+    steer_token_limit: int | None
 
     def to_json(self) -> dict[str, Any]:
         """Return a JSON-friendly representation of this step plan."""
@@ -398,7 +402,10 @@ def build_intervention_pools(
     insert_specs: list[dict[str, Any]] = []
     late_specs: list[dict[str, Any]] = []
     for raw_spec in interventions_obj["interventions"]:
-        spec = dict(raw_spec)
+        spec = apply_sampling_defaults_to_spec(
+            interventions_obj=interventions_obj,
+            raw_spec=raw_spec,
+        )
         allowed_modes = set(spec.get("allowed_editor_modes", []))
         if "insert" in allowed_modes:
             insert_specs.append(spec)
@@ -494,6 +501,11 @@ def build_step_plan(
         cut_after_pairs=cut_after_pairs,
         post_splice_policy=str(spec["post_splice_policy"]),
         category=str(spec.get("category", "")),
+        steer_token_limit=(
+            int(spec["steer_token_limit"])
+            if spec.get("steer_token_limit") is not None
+            else None
+        ),
     )
 
 
@@ -640,6 +652,7 @@ async def generate_validated_window(
             intervention_spec={
                 "name": step.intervention_name,
                 "category": step.category,
+                "steer_token_limit": step.steer_token_limit,
             },
             intervention_variant=step.variant,
             pairs_to_generate_k=step.pairs_generated,
@@ -664,6 +677,7 @@ async def generate_validated_window(
             required_first_steer=step.variant,
             token_counter=token_counter,
             exec_token_limit=exec_token_limit,
+            steer_token_limit=step.steer_token_limit,
         )
         if not generation_errors:
             return normalize_steer_blocks(blocks=generated_blocks)

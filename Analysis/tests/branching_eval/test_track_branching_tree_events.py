@@ -77,7 +77,7 @@ def test_track_branching_tree_events_summary() -> None:
         ),
     )
 
-    summary = summarize_events(path=Path("tree_events.jsonl"), events=events)
+    summary = summarize_events(path=Path("tree_events.sqlite"), events=events)
     text = render_summary(summary=summary)
 
     assert summary.started_docs() == 2

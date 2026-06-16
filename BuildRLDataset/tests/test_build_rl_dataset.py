@@ -48,6 +48,7 @@ def make_row(
     row_id: str,
     source_slug: str,
     dataset_value: list[str] | None = None,
+    ground_truth: list[str] | None = None,
 ) -> dict[str, object]:
     """Build one synthetic Dolci RL row for tests.
 
@@ -55,15 +56,17 @@ def make_row(
         row_id: Stable row id.
         source_slug: `original_dataset` suffix.
         dataset_value: Optional dataset-label list.
+        ground_truth: Optional ground-truth answer list.
 
     Returns:
         Source-style row payload.
     """
 
+    ground_truth_values = ["1"] if ground_truth is None else ground_truth
     return {
         "id": row_id,
         "prompt": f"Solve problem {row_id}",
-        "ground_truth": [row_id],
+        "ground_truth": ground_truth_values,
         "dataset": dataset_value or ["math"],
         "dataset_source": "hamishivi/math_rlvr_mixture_dpo",
         "original_dataset": f"hamishivi/{source_slug}_filtered",
@@ -125,7 +128,8 @@ def test_stage_all_builds_train_parquet_and_state(
     dataset = Dataset.from_parquet(str(tmp_path / "train.parquet"))
     state = json.loads((tmp_path / "pipeline_state.json").read_text(encoding="utf-8"))
     assert len(dataset) == 6
-    assert dataset[0]["prompt"][0]["role"] == "user"
+    assert dataset[0]["prompt"][0]["role"] == "system"
+    assert dataset[0]["prompt"][1]["role"] == "user"
     assert "source_prompt_text" in dataset.column_names
     assert "input_ids" in dataset.column_names
     assert state["stages"]["export"]["completed"] is True
@@ -143,10 +147,15 @@ def test_filter_keeps_only_math_rows(tmp_path: Path) -> None:
             confirm_threshold=100,
         )
     )
-    module.write_jsonl_row(output_path=paths.raw_sample_path, row=make_row(row_id="math1", source_slug="AceReason-Math"))
     module.write_jsonl_row(
         output_path=paths.raw_sample_path,
-        row=make_row(row_id="code1", source_slug="AceReason-Math", dataset_value=["code"]),
+        row=make_row(row_id="math1", source_slug="AceReason-Math"),
+    )
+    module.write_jsonl_row(
+        output_path=paths.raw_sample_path,
+        row=make_row(
+            row_id="code1", source_slug="AceReason-Math", dataset_value=["code"]
+        ),
     )
 
     metadata = module.run_filter_stage(
@@ -207,7 +216,9 @@ def test_stratify_balances_source_families(tmp_path: Path) -> None:
     sampled_rows = list(module.iter_jsonl(paths.stratified_path))
     source_counts = {}
     for row in sampled_rows:
-        source_counts[row["source_family"]] = source_counts.get(row["source_family"], 0) + 1
+        source_counts[row["source_family"]] = (
+            source_counts.get(row["source_family"], 0) + 1
+        )
     assert metadata["output_rows"] == 6
     assert source_counts["ORZ-Math"] == 2
     assert source_counts["AceReason-Math"] == 4
@@ -215,18 +226,83 @@ def test_stratify_balances_source_families(tmp_path: Path) -> None:
 
 def test_export_row_preserves_token_columns() -> None:
     """Export rows should keep original token metadata while converting prompts."""
+    row = make_row(row_id="x1", source_slug="AceReason-Math", ground_truth=["2"])
+    row["prompt"] = "user: Solve problem x1"
     export_row = build_export_row(
-        row=make_row(row_id="x1", source_slug="AceReason-Math"),
+        row=row,
         index=3,
         export_config=ExportConfig(prompt_role="user"),
     )
 
-    assert export_row["prompt"] == [{"role": "user", "content": "Solve problem x1"}]
-    assert export_row["source_prompt_text"] == "Solve problem x1"
+    assert export_row["prompt"] == [
+        {"role": "system", "content": module.DEFAULT_SYSTEM_PROMPT},
+        {"role": "user", "content": "Solve problem x1"},
+    ]
+    assert export_row["source_prompt_text"] == "user: Solve problem x1"
     assert export_row["input_ids"] == [1, 2, 3]
-    assert export_row["reward_model"] == {"ground_truth": ["x1"]}
+    assert export_row["reward_model"] == {"ground_truth": ["2"]}
     extra_info = cast(dict[str, object], export_row["extra_info"])
     assert extra_info["index"] == 3
+    assert extra_info["answer_format_class"] == "plain_scalar_or_simple_fraction"
+
+
+def test_export_filters_to_numeric_reward_answer_formats(tmp_path: Path) -> None:
+    """Export stage should keep only scalar/fraction and exact symbolic answers."""
+
+    paths = resolve_paths(
+        runtime=RuntimeConfig(
+            output_dir=tmp_path,
+            resume=True,
+            auto_yes=True,
+            dry_run=False,
+            stage="export",
+            confirm_threshold=100,
+        )
+    )
+    rows = [
+        make_row(row_id="scalar", source_slug="AceReason-Math", ground_truth=["5"]),
+        make_row(
+            row_id="fraction", source_slug="AceReason-Math", ground_truth=["1/10"]
+        ),
+        make_row(
+            row_id="symbolic", source_slug="AceReason-Math", ground_truth=[r"\sqrt{2}"]
+        ),
+        make_row(
+            row_id="text", source_slug="AceReason-Math", ground_truth=[r"\text{No}"]
+        ),
+        make_row(
+            row_id="unit", source_slug="AceReason-Math", ground_truth=[r"50^\circ"]
+        ),
+    ]
+    for row in rows:
+        row["source_family"] = "AceReason-Math"
+        module.write_jsonl_row(output_path=paths.stratified_path, row=row)
+
+    metadata = run_export_stage(
+        export_config=ExportConfig(prompt_role="user"),
+        paths=paths,
+        runtime=RuntimeConfig(
+            output_dir=tmp_path,
+            resume=True,
+            auto_yes=True,
+            dry_run=False,
+            stage="export",
+            confirm_threshold=100,
+        ),
+        sampling=SamplingConfig(
+            dataset_name="fake",
+            split="train",
+            sample_rows=5,
+            seed=42,
+            shuffle_buffer=0,
+        ),
+    )
+
+    dataset = Dataset.from_parquet(str(paths.train_parquet_path))
+    kept_ids = cast(list[str], dataset["id"])
+    assert metadata["train_rows"] == 3
+    assert metadata["skipped_answer_rows"] == 2
+    assert kept_ids == ["scalar", "fraction", "symbolic"]
 
 
 def test_source_audit_summarizes_pipeline_outputs(tmp_path: Path) -> None:
@@ -241,8 +317,15 @@ def test_source_audit_summarizes_pipeline_outputs(tmp_path: Path) -> None:
         source_audit_path=tmp_path / "source_audit.json",
         state_path=tmp_path / "pipeline_state.json",
     )
-    for stage_path in (paths.raw_sample_path, paths.filtered_path, paths.stratified_path):
-        module.write_jsonl_row(output_path=stage_path, row=make_row(row_id="x1", source_slug="AceReason-Math"))
+    for stage_path in (
+        paths.raw_sample_path,
+        paths.filtered_path,
+        paths.stratified_path,
+    ):
+        module.write_jsonl_row(
+            output_path=stage_path,
+            row=make_row(row_id="x1", source_slug="AceReason-Math"),
+        )
 
     audit_payload = build_source_audit(paths=paths)
     sample_payload = cast(dict[str, object], audit_payload["sample"])

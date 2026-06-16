@@ -8,8 +8,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
+from branching_eval.artifact_store import ArtifactStore
 from branching_eval.config_types import (
     ArtifactConfig,
     BranchingConfig,
@@ -24,6 +26,7 @@ from branching_eval.config_types import (
 from branching_eval.lm_eval_adapter import DocRecord
 from branching_eval.run_matrix import (
     requested_selectors_for_spec,
+    run_doc_rollouts,
     runtime_branching_for_spec,
     selector_modes_for_executor,
     run_experiment_matrix,
@@ -31,7 +34,7 @@ from branching_eval.run_matrix import (
 )
 from branching_eval.selector_types import SelectionOutcome
 from branching_eval.tree_types import LeafRollout
-from vllm_client import GenerationChoice, ParsedToken
+from vllm_client import GenerationChoice, ParsedToken, VllmClient
 
 
 class FakeRuntimeClient:
@@ -44,9 +47,7 @@ class FakeRuntimeClient:
         Fake client with deterministic outputs for baseline/branching calls.
     """
 
-    def __init__(
-        self, *, base_url: str, timeout_seconds: float | None = None
-    ) -> None:
+    def __init__(self, *, base_url: str, timeout_seconds: float | None = None) -> None:
         self.base_url = base_url
         self.timeout_seconds = timeout_seconds
 
@@ -139,6 +140,54 @@ class FakeRuntimeClient:
 
         _ = model
         return "".join(chr(token_id) for token_id in token_ids)
+
+
+class DelayedRuntimeClient(FakeRuntimeClient):
+    """Fake runtime that makes the second completion visibly finish last."""
+
+    def __init__(self, *, base_url: str, timeout_seconds: float | None = None) -> None:
+        super().__init__(base_url=base_url, timeout_seconds=timeout_seconds)
+        self.completion_call_count = 0
+
+    async def completions_async(
+        self,
+        *,
+        model: str,
+        prompt: str | None,
+        prompt_token_ids: tuple[int, ...] | None,
+        resolved_prompt_token_ids: tuple[int, ...] | None = None,
+        temperature: float,
+        top_p: float,
+        max_tokens: int,
+        n: int,
+        seed: int,
+        stop: tuple[str, ...] | None,
+        top_logprobs: int,
+        priority: int | None = None,
+        repetition_penalty: float | None = None,
+        parse_response_prompt_token_ids: bool = True,
+    ) -> tuple[GenerationChoice, ...]:
+        """Delay the second completion call so event order proves live scoring."""
+
+        self.completion_call_count += 1
+        if self.completion_call_count == 2:
+            await asyncio.sleep(0.05)
+        return await super().completions_async(
+            model=model,
+            prompt=prompt,
+            prompt_token_ids=prompt_token_ids,
+            resolved_prompt_token_ids=resolved_prompt_token_ids,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            n=n,
+            seed=seed,
+            stop=stop,
+            top_logprobs=top_logprobs,
+            priority=priority,
+            repetition_penalty=repetition_penalty,
+            parse_response_prompt_token_ids=parse_response_prompt_token_ids,
+        )
 
 
 class FakeLmEvalAdapter:
@@ -344,16 +393,145 @@ def test_run_matrix_smoke_writes_structured_baseline_artifacts(
     manifest = json.loads((run_dir / "run_manifest.json").read_text())
     assert manifest["selector_mode"] == "structured_baseline"
     assert (run_dir / "doc_diagnostics.jsonl").exists()
-    events = [
-        json.loads(line)
-        for line in (run_dir / "tree_events.jsonl").read_text().splitlines()
-    ]
+    events = ArtifactStore(run_dir=run_dir).read_event_rows()
     assert any(
         row["event_type"] == "run_started"
         and row["payload"]["mode"] == "structured_baseline"
         for row in events
     )
     assert sum(1 for row in events if row["event_type"] == "leaf_scored") == 2
+
+
+def test_baseline_scores_leaves_before_all_rollouts_finish(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Baseline rollouts should score a finished leaf before the last request ends."""
+
+    config = BranchingEvalConfig(
+        tasks=TaskConfig(task_names=("aime24",)),
+        models=(
+            ModelSpec(
+                model_id="non_sft",
+                checkpoint_or_repo="fake/checkpoint",
+                trigger_steer_default=False,
+                trigger_entropy_default=False,
+            ),
+        ),
+        serve=ServeConfig(),
+        decoding=DecodingConfig(
+            temperature=0.6, top_p=0.95, max_gen_toks=4, top_logprobs=5
+        ),
+        branching=BranchingConfig(entropy_profile_name="aime24_default"),
+        artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
+        run_matrix=RunMatrixConfig(
+            include_baselines=True,
+            baseline_rollouts=2,
+            include_branching=False,
+            selectors=("random",),
+            seed_values=(77,),
+            default_limit=1,
+        ),
+    )
+    config.validate()
+    monkeypatch.setattr("branching_eval.run_matrix.LmEvalAdapter", FakeLmEvalAdapter)
+    monkeypatch.setattr("branching_eval.run_matrix.VllmClient", DelayedRuntimeClient)
+    monkeypatch.setattr(
+        "branching_eval.run_matrix.managed_vllm_server",
+        fake_managed_vllm_server,
+    )
+
+    run_dirs = run_experiment_matrix(
+        config=config,
+        limit=1,
+        seed_override=None,
+        selector_override=None,
+        model_override=None,
+    )
+
+    events = ArtifactStore(run_dir=run_dirs[0]).read_event_rows()
+    leaf_scored_indices = [
+        int(row["event_index"]) for row in events if row["event_type"] == "leaf_scored"
+    ]
+    response_indices = [
+        int(row["event_index"])
+        for row in events
+        if row["event_type"] == "vllm_response"
+        and str(row["payload"].get("request_kind", "")).startswith("baseline_rollout")
+    ]
+    assert len(leaf_scored_indices) == 2
+    assert len(response_indices) == 2
+    assert min(leaf_scored_indices) < max(response_indices)
+
+
+def test_structured_baseline_scores_leaves_before_all_rollouts_finish(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Structured baselines should score a finished path while siblings run."""
+
+    config = BranchingEvalConfig(
+        tasks=TaskConfig(task_names=("aime24",)),
+        models=(
+            ModelSpec(
+                model_id="non_sft",
+                checkpoint_or_repo="fake/checkpoint",
+                trigger_steer_default=True,
+                trigger_entropy_default=False,
+            ),
+        ),
+        serve=ServeConfig(),
+        decoding=DecodingConfig(
+            temperature=0.6, top_p=0.95, max_gen_toks=4, top_logprobs=5
+        ),
+        branching=BranchingConfig(
+            branch_prob=0.0,
+            max_branch_points_per_rollout=2,
+            num_candidates=4,
+            branch_fanout=2,
+            max_clusters=2,
+            candidate_span_tokens=2,
+            max_steer_tokens=2,
+            entropy_threshold=-1.0,
+            entropy_profile_name="aime24_default",
+        ),
+        artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
+        run_matrix=RunMatrixConfig(
+            include_baselines=False,
+            include_structured_baselines=True,
+            baseline_rollouts=2,
+            include_branching=False,
+            selectors=("random",),
+            seed_values=(77,),
+            default_limit=1,
+        ),
+    )
+    config.validate()
+    monkeypatch.setattr("branching_eval.run_matrix.LmEvalAdapter", FakeLmEvalAdapter)
+    monkeypatch.setattr("branching_eval.run_matrix.VllmClient", DelayedRuntimeClient)
+    monkeypatch.setattr(
+        "branching_eval.run_matrix.managed_vllm_server",
+        fake_managed_vllm_server,
+    )
+
+    run_dirs = run_experiment_matrix(
+        config=config,
+        limit=1,
+        seed_override=None,
+        selector_override=None,
+        model_override=None,
+    )
+
+    events = ArtifactStore(run_dir=run_dirs[0]).read_event_rows()
+    leaf_scored_indices = [
+        int(row["event_index"]) for row in events if row["event_type"] == "leaf_scored"
+    ]
+    response_indices = [
+        int(row["event_index"])
+        for row in events
+        if row["event_type"] == "vllm_response"
+    ]
+    assert len(leaf_scored_indices) == 2
+    assert len(response_indices) >= 2
+    assert min(leaf_scored_indices) < max(response_indices)
 
 
 def test_run_matrix_smoke_writes_epsilon_greedy_artifacts(
@@ -441,11 +619,7 @@ def test_run_matrix_smoke_writes_epsilon_greedy_artifacts(
     assert "epsilon_greedy" in run_dir.name
     manifest = json.loads((run_dir / "run_manifest.json").read_text())
     assert manifest["selector_mode"] == "embed_diverse_topk_random"
-    events = [
-        json.loads(line)
-        for line in (run_dir / "tree_events.jsonl").read_text().splitlines()
-        if line.strip()
-    ]
+    events = ArtifactStore(run_dir=run_dir).read_event_rows()
     assert any(
         row["event_type"] == "run_started"
         and row["payload"]["mode"] == "epsilon_greedy"
@@ -516,6 +690,63 @@ def test_runtime_branching_for_spec_sets_single_path_epsilon_behavior() -> None:
     assert runtime_branching.max_branch_points_per_rollout > 4
 
 
+def test_sync_doc_rollouts_disable_true_branching_for_epsilon_mode(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Sync fallback should keep epsilon-greedy in inline single-path mode."""
+
+    captured_kwargs: dict[str, Any] = {}
+
+    class CapturingExecutor:
+        """Capture executor construction args without hitting the runtime."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+
+        def set_event_context(self, **kwargs: object) -> None:
+            _ = kwargs
+
+        def run_epsilon_greedy_rollouts(self, *, rollout_count: int) -> object:
+            _ = rollout_count
+            return SimpleNamespace(leaves=())
+
+    monkeypatch.setattr("branching_eval.run_matrix.BranchExecutor", CapturingExecutor)
+    config = BranchingEvalConfig(
+        tasks=TaskConfig(task_names=("aime24",)),
+        models=(ModelSpec(model_id="model", checkpoint_or_repo="repo"),),
+        decoding=DecodingConfig(max_gen_toks=4, top_logprobs=0),
+        branching=BranchingConfig(epsilon_greedy_prob=0.2),
+    )
+    spec = ExperimentSpec(
+        task_name="aime24",
+        model_id="model",
+        mode="epsilon_greedy",
+        selector="embed_diverse_topk_random",
+        seed=77,
+        baseline_rollouts=1,
+        trigger_steer=True,
+        trigger_entropy=False,
+    )
+
+    _ = run_doc_rollouts(
+        config=config,
+        spec=spec,
+        client=cast(VllmClient, object()),
+        cluster_client=None,
+        model_name_for_generation="model",
+        cluster_model_name_for_generation=None,
+        prompt_text="Solve.",
+        doc_id=0,
+        doc_attempt=0,
+        task_name="aime24",
+        model_id="model",
+        resolved_branching=config.branching,
+        store=ArtifactStore(run_dir=tmp_path / "run", run_id="run"),
+    )
+
+    assert captured_kwargs["allow_true_branching"] is False
+
+
 def test_branching_scores_leaves_before_rollout_finished(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -572,13 +803,7 @@ def test_branching_scores_leaves_before_rollout_finished(
         model_override=None,
     )
     assert len(run_dirs) == 1
-    events = [
-        json.loads(line)
-        for line in (run_dirs[0] / "tree_events.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
-        if line.strip()
-    ]
+    events = ArtifactStore(run_dir=run_dirs[0]).read_event_rows()
     leaf_scored_indices = [
         int(row["event_index"])
         for row in events

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+import os
 import random
 import re
 from dataclasses import dataclass, replace
@@ -16,13 +17,17 @@ from branching_eval.branch_decode_utils import (
     append_prompt_token_ids,
     candidate_from_choice,
     candidate_text_by_id,
+    choice_has_generated_content,
     consume_choice_tokens,
+    has_boxed_answer_after_first_think_close,
     initialize_exec_repetition_state,
     initialize_steer_repetition_state,
     is_think_close_stop_reason,
     is_explicit_steer_stop,
     rollout_stop_markers,
     selected_ids_for_mode,
+    steer_candidate_has_decision_tag,
+    THINK_CLOSE_TAG,
     text_before_first_think_close,
     update_exec_repetition_state,
     update_steer_repetition_state,
@@ -32,6 +37,7 @@ from branching_eval.config_types import BranchingConfig, DecodingConfig
 from branching_eval.legacy_steer_rollout import (
     contains_think_close,
     contains_think_close_or_partial,
+    is_chat_eos_stop_reason,
 )
 from branching_eval.local_lru import LocalLruCache
 from branching_eval.runtime_types import DecodeOutcome, PathState
@@ -43,14 +49,23 @@ from branching_eval.selector_runtime import (
 )
 from branching_eval.selector_types import SelectionOutcome, SelectorMode, SelectorParams
 from branching_eval.steer_normalization import (
+    EXEC_CLOSE_TAG,
+    STEER_CLOSE_TAG,
+    STEER_OPEN_TAG,
+    ends_at_exec_choice_boundary,
+    exec_choice_boundary_suffix,
+    explicit_exec_stop_completion_suffix,
     has_trailing_steer_open_prefix,
+    is_steer_decision_boundary,
     normalize_steer_boundary_text,
     selected_candidate_normalization_suffix,
     steer_candidate_stop_markers,
 )
 from branching_eval.event_types import EventContext
 from branching_eval.steer_decode_flow import (
+    continue_after_think_close_async,
     continue_with_single_steer_candidate_async,
+    prepare_steer_generation_prefix_async,
     resolve_steer_length_outcome_async,
     resolve_think_close_outcome_async,
     should_branch_at_trigger,
@@ -72,13 +87,14 @@ from branching_eval.tree_types import (
     TreeNode,
 )
 from chat_templating import build_raw_im_prompt
-from token_metrics import probability_from_logprob
 from vllm_client import (
     GenerationChoice,
     ParsedToken,
     VllmClient,
     VllmRequestError,
     is_prompt_token_ids_unsupported_error,
+    is_retryable_vllm_request_error,
+    truncate_choice_at_chat_eos,
 )
 
 INLINE_EPSILON_SELECTOR_MODE: SelectorMode = "embed_diverse_topk_random"
@@ -86,16 +102,24 @@ EXEC_REPEAT_SIMILARITY_THRESHOLD = 0.85
 EXEC_REPEAT_SIMILARITY_LOOKBACK_WINDOW = 3
 EXEC_REPEAT_TERMINATION_BLOCK_COUNT = 3
 EXEC_REPEAT_STOP_REASON = "repeated_exec_block_loop"
-STEER_REPEAT_SIMILARITY_THRESHOLD = 0.85
+STEER_REPEAT_SIMILARITY_THRESHOLD = 0.92
 STEER_REPEAT_SIMILARITY_LOOKBACK_WINDOW = 3
 STEER_REPEAT_TERMINATION_BLOCK_COUNT = 4
 STEER_REPEAT_STOP_REASON = "repeated_steer_block_loop"
-REPEAT_TERMINATION_MIN_GENERATED_TOKENS = 10_000
+REPEAT_TERMINATION_MIN_GENERATED_TOKENS = 5_000
+BASELINE_REQUEST_KINDS = frozenset(
+    {"baseline_rollout_greedy", "baseline_rollout_pool", "baseline_rollout_single"}
+)
 STEER_REPETITION_REQUEST_KINDS = frozenset(
     {"candidate_pool_steer_boundary", "steer_single_candidate"}
 )
+ASSISTANT_PREFIX_TAIL_CHARS = 200
 NODE_CHILD_ID_PATTERN = re.compile(
     r"^node_(?P<parent_node_id>.+)_(?P<child_offset>\d+)_(?P<candidate_id>\d+)$"
+)
+CONTROL_TAG_PATTERN = re.compile(
+    r"</?(?P<tag>think|steer|exec)\b[^>]*>",
+    flags=re.IGNORECASE,
 )
 TOKENIZE_CACHE_MAX_ENTRIES = 512
 DETOKENIZE_CACHE_MAX_ENTRIES = 256
@@ -117,6 +141,25 @@ class _RequestStreamState:
     request_id: str
     input_token_ids: tuple[int, ...]
     output_token_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _RequestTokenBudget:
+    """Resolved output-token budget for one vLLM request.
+
+    Args:
+        max_tokens: Max output tokens safe to request from vLLM.
+        exhausted_stop_reason: Stop reason to use if `max_tokens` is zero, or
+            if vLLM stops at this exact request cap.
+        context_limited: Whether the model context window capped the request.
+
+    Returns:
+        Dataclass containing the request-local budget decision.
+    """
+
+    max_tokens: int
+    exhausted_stop_reason: str
+    context_limited: bool
 
 
 @dataclass(frozen=True)
@@ -143,6 +186,7 @@ class _ScheduledDecode:
         state: Decode path state to process.
         branching_enabled: Whether trigger branching is enabled for this decode.
         steer_normalization_enabled: Optional steer normalization override.
+        inline_epsilon_enabled: Optional inline epsilon-greedy override.
 
     Returns:
         Dataclass used by the streaming scheduler queue.
@@ -151,6 +195,126 @@ class _ScheduledDecode:
     state: PathState
     branching_enabled: bool = True
     steer_normalization_enabled: bool | None = None
+    inline_epsilon_enabled: bool | None = None
+
+
+@dataclass(frozen=True)
+class _RepeatTermination:
+    """Metadata for one repeated-block forced close."""
+
+    stop_reason: str
+    block_kind: str
+    block_count: int
+    last_similarity_ratio: float | None
+
+
+def _append_steer_phase_span(
+    *,
+    accumulated_spans: tuple[tuple[int, int], ...],
+    base: DecodeOutcome,
+    continued: DecodeOutcome,
+) -> DecodeOutcome:
+    """Attach one steer-request response span without dropping prior spans."""
+
+    span_start = len(base.token_ids)
+    span_end = len(continued.token_ids)
+    if span_end <= span_start:
+        return replace(
+            continued,
+            steer_phase_token_spans=(
+                continued.steer_phase_token_spans
+                or base.steer_phase_token_spans
+                or accumulated_spans
+            ),
+        )
+    prior_spans = base.steer_phase_token_spans or accumulated_spans
+    return replace(
+        continued,
+        steer_phase_token_spans=(
+            *prior_spans,
+            (span_start, span_end),
+        ),
+    )
+
+
+def _repeat_forced_think_close_prefix(*, text: str) -> str:
+    """Return append-only prefix used before forced repeat `</think>` close."""
+
+    normalized_text = _complete_repeat_trailing_control_prefix(text=text)
+    active_tags = tuple(
+        tag for tag in _unclosed_control_tags(text=normalized_text) if tag != "think"
+    )
+    if not active_tags:
+        return normalized_text + _repeat_exec_boundary_suffix(text=normalized_text)
+    return normalized_text + _repeat_unclosed_tag_suffix(
+        text=normalized_text,
+        active_tags=active_tags,
+    )
+
+
+def _complete_repeat_trailing_control_prefix(*, text: str) -> str:
+    for tag, min_length in (
+        (STEER_OPEN_TAG, 2),
+        (STEER_CLOSE_TAG, 3),
+        (EXEC_CLOSE_TAG, 3),
+    ):
+        suffix = _trailing_control_tag_completion_suffix(
+            text=text,
+            tag=tag,
+            min_length=min_length,
+        )
+        if suffix:
+            return text + suffix
+    return text
+
+
+def _trailing_control_tag_completion_suffix(
+    *, text: str, tag: str, min_length: int
+) -> str:
+    lowered = text.lower()
+    lowered_tag = tag.lower()
+    for prefix_length in range(len(lowered_tag) - 1, min_length - 1, -1):
+        if lowered.endswith(lowered_tag[:prefix_length]):
+            return tag[prefix_length:]
+    return ""
+
+
+def _unclosed_control_tags(*, text: str) -> tuple[str, ...]:
+    stack: list[str] = []
+    for match in CONTROL_TAG_PATTERN.finditer(text):
+        tag = match.group("tag").lower()
+        if not match.group(0).startswith("</"):
+            stack.append(tag)
+            continue
+        if stack and stack[-1] == tag:
+            stack.pop()
+        elif tag in stack:
+            tag_index = max(
+                index for index, open_tag in enumerate(stack) if open_tag == tag
+            )
+            del stack[tag_index:]
+    return tuple(stack)
+
+
+def _repeat_exec_boundary_suffix(*, text: str) -> str:
+    if ends_at_exec_choice_boundary(text=text):
+        return exec_choice_boundary_suffix(text=text)
+    return ""
+
+
+def _repeat_unclosed_tag_suffix(*, text: str, active_tags: tuple[str, ...]) -> str:
+    suffix = ""
+    open_tags = list(active_tags)
+    while open_tags:
+        tag = open_tags.pop()
+        if tag == "exec":
+            prefix = (
+                "" if text.endswith("\n") or text.lower().endswith("<exec>") else "\n"
+            )
+            suffix += f"{prefix if not suffix else ''}</exec>\n"
+        elif tag == "steer":
+            suffix += "</steer>\n"
+    return suffix
 
 
 @dataclass(frozen=True)
@@ -215,11 +379,14 @@ class BranchExecutor:
         enable_request_priorities: bool = False,
         branch_task_semaphore: asyncio.Semaphore | None = None,
         allow_true_branching: bool = True,
+        close_runtime_clients_on_finish: bool = True,
+        initial_prompt_token_ids: tuple[int, ...] | None = None,
     ) -> None:
         _ = trigger_entropy_enabled
         self.client = client
         self.cluster_client = cluster_client
         self.prompt_text = prompt_text
+        self.initial_prompt_token_ids = initial_prompt_token_ids
         self.model_name = model_name
         self.cluster_model_name = cluster_model_name
         self.decoding = decoding
@@ -231,6 +398,7 @@ class BranchExecutor:
         self.seed = seed
         self.enable_request_priorities = enable_request_priorities
         self.allow_true_branching = allow_true_branching
+        self.close_runtime_clients_on_finish = close_runtime_clients_on_finish
         self.trigger_steer_enabled = trigger_steer_enabled
         self.random = random.Random(seed)
         self.request_counter = 0
@@ -240,7 +408,9 @@ class BranchExecutor:
         )
         self.openrouter_api_key = resolve_openrouter_api_key(env_paths=env_paths)
         self.openai_api_key = resolve_openai_api_key(env_paths=env_paths)
-        self.max_async_inflight_requests = 1000
+        self.max_async_inflight_requests = int(
+            os.environ.get("BRANCHING_EVAL_MAX_ASYNC_INFLIGHT_REQUESTS", "1000")
+        )
         self._shared_branch_task_semaphore = branch_task_semaphore
         self._branch_task_semaphore: asyncio.Semaphore | None = None
         self._branch_task_semaphore_loop_id: int | None = None
@@ -249,6 +419,7 @@ class BranchExecutor:
         self._request_semaphore_loop_id: int | None = None
         self._event_context: EventContext | None = None
         self._request_stream_state: dict[str, _RequestStreamState] = {}
+        self._runtime_session_keys: set[str] = set()
         self._request_event_counter = 0
         self._candidate_pool_counter = 0
         self._tokenize_text_cache: LocalLruCache[str, tuple[int, ...]] = LocalLruCache(
@@ -372,49 +543,115 @@ class BranchExecutor:
         """Run non-branching baseline rollouts via async completions endpoint."""
 
         context = self._require_event_context()
-        try:
-            choices = await self._generate_many_async(
-                assistant_prefix="",
-                prompt_token_ids=None,
-                max_tokens=self.decoding.max_gen_toks,
-                n=rollout_count,
-                stop=None,
-                request_kind="baseline_rollout_pool",
-                request_stream_id=(
-                    f"baseline:{context.doc_id}:{context.doc_attempt}:{rollout_count}"
-                ),
-                enforce_prefix_chain=False,
+        initial_assistant_prefix = self.decoding.initial_assistant_prefix
+        assert rollout_count >= 1, "rollout_count must be >= 1"
+        pending: set[asyncio.Task[tuple[int, LeafRollout]]] = {
+            asyncio.create_task(
+                self._generate_standard_leaf_async(
+                    rollout_index=rollout_index,
+                    initial_assistant_prefix=initial_assistant_prefix,
+                    doc_id=context.doc_id,
+                    doc_attempt=context.doc_attempt,
+                )
             )
-            return [
-                leaf_from_choice(choice=choice, index=index)
-                for index, choice in enumerate(choices)
-            ]
+            for rollout_index in range(rollout_count)
+        }
+        leaves_by_index: list[LeafRollout | None] = [None] * rollout_count
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    rollout_index, leaf = task.result()
+                    leaves_by_index[rollout_index] = self._apply_leaf_completion_hook(
+                        leaf=leaf
+                    )
+            assert all(leaf is not None for leaf in leaves_by_index)
+            return [cast(LeafRollout, leaf) for leaf in leaves_by_index]
         finally:
+            await self._cancel_standard_rollout_tasks(pending=pending)
             await self._close_runtime_http_sessions_async()
+
+    async def _generate_standard_leaf_async(
+        self,
+        *,
+        rollout_index: int,
+        initial_assistant_prefix: str,
+        doc_id: int | None,
+        doc_attempt: int | None,
+    ) -> tuple[int, LeafRollout]:
+        """Generate one baseline leaf so scoring can run per completion."""
+
+        request_kind = (
+            "baseline_rollout_greedy"
+            if self.decoding.temperature == 0.0
+            else "baseline_rollout_single"
+        )
+        choice = await self._generate_choice_async(
+            assistant_prefix=initial_assistant_prefix,
+            prompt_token_ids=self.initial_prompt_token_ids,
+            max_tokens=self.decoding.max_gen_toks,
+            n=1,
+            stop=None,
+            request_kind=request_kind,
+            request_stream_id=(
+                f"baseline:{doc_id}:{doc_attempt}:{request_kind}:{rollout_index}"
+            ),
+            enforce_prefix_chain=False,
+        )
+        return (
+            rollout_index,
+            leaf_from_choice(
+                choice=choice,
+                index=rollout_index,
+                assistant_prefix=initial_assistant_prefix,
+            ),
+        )
+
+    async def _cancel_standard_rollout_tasks(
+        self, *, pending: set[asyncio.Task[tuple[int, LeafRollout]]]
+    ) -> None:
+        """Cancel pending baseline rollout tasks after failure or shutdown."""
+
+        if not pending:
+            return
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
     async def run_structured_rollouts_async(self, *, rollout_count: int) -> BranchTree:
         """Run steer/exec-preserving rollouts without branching asynchronously."""
 
+        pending_decode: set[asyncio.Task[tuple[_ScheduledDecode, DecodeOutcome]]] = (
+            set()
+        )
         try:
             tree, scheduled_rollouts = self._initialize_parallel_rollout_tree(
                 rollout_count=rollout_count,
                 branching_enabled=False,
             )
-            completed = await asyncio.gather(
-                *[
-                    self._schedule_decode_task(tree=tree, scheduled=scheduled)
-                    for scheduled in scheduled_rollouts
-                ]
-            )
-            for scheduled, outcome in completed:
-                assert (
-                    outcome.event_type == "terminated"
-                ), "structured rollouts must terminate without branching"
-                self._append_leaf_if_room(
-                    tree=tree,
-                    leaf=leaf_from_outcome(outcome=outcome, state=scheduled.state),
-                    leaf_limit=rollout_count,
+            pending_decode = {
+                self._schedule_decode_task(tree=tree, scheduled=scheduled)
+                for scheduled in scheduled_rollouts
+            }
+            while pending_decode:
+                done, pending_decode = await asyncio.wait(
+                    pending_decode, return_when=asyncio.FIRST_COMPLETED
                 )
+                for task in done:
+                    scheduled, outcome = task.result()
+                    assert (
+                        outcome.event_type == "terminated"
+                    ), "structured rollouts must terminate without branching"
+                    self._append_leaf_if_room(
+                        tree=tree,
+                        leaf=leaf_from_outcome(
+                            outcome=outcome,
+                            state=scheduled.state,
+                        ),
+                        leaf_limit=rollout_count,
+                    )
             self._append_tree_event(
                 tree=tree,
                 event_type="rollout_finished",
@@ -428,6 +665,10 @@ class BranchExecutor:
             )
             return tree
         finally:
+            await self._cancel_pending_scheduler_tasks(
+                pending_decode=pending_decode,
+                pending_expansion=set(),
+            )
             await self._close_runtime_http_sessions_async()
 
     async def run_epsilon_greedy_rollouts_async(
@@ -450,12 +691,21 @@ class BranchExecutor:
                 rollout_count=rollout_count,
                 branching_enabled=True,
             )
-            frontier = [scheduled.state for scheduled in scheduled_rollouts]
+            initial_scheduled = [
+                replace(
+                    scheduled,
+                    branching_enabled=False,
+                    steer_normalization_enabled=True,
+                    inline_epsilon_enabled=True,
+                )
+                for scheduled in scheduled_rollouts
+            ]
             await self._decode_frontier_streaming_async(
                 tree=tree,
-                frontier=frontier,
+                frontier=[],
                 doc_id=context.doc_id,
                 leaf_limit=rollout_count,
+                initial_scheduled=initial_scheduled,
             )
             self._append_tree_event(
                 tree=tree,
@@ -501,12 +751,13 @@ class BranchExecutor:
             selector_mode=context.selector_mode,
             root_prompt=self.prompt_text,
         )
+        initial_assistant_prefix = self.decoding.initial_assistant_prefix
         root_node = TreeNode(
             node_id="node_root",
             parent_node_id=None,
             prompt_text=self.prompt_text,
-            assistant_prefix="",
-            prompt_token_ids=None,
+            assistant_prefix=initial_assistant_prefix,
+            prompt_token_ids=self.initial_prompt_token_ids,
             branch_points_used=0,
         )
         tree.add_node(node=root_node)
@@ -549,8 +800,8 @@ class BranchExecutor:
             node_id=f"node_root_rollout_{rollout_index}",
             parent_node_id="node_root",
             prompt_text=self.prompt_text,
-            assistant_prefix="",
-            prompt_token_ids=None,
+            assistant_prefix=self.decoding.initial_assistant_prefix,
+            prompt_token_ids=self.initial_prompt_token_ids,
             branch_points_used=0,
         )
         tree.add_node(node=node)
@@ -562,8 +813,8 @@ class BranchExecutor:
         return _ScheduledDecode(
             state=PathState(
                 node_id=node.node_id,
-                assistant_prefix="",
-                prompt_token_ids=None,
+                assistant_prefix=self.decoding.initial_assistant_prefix,
+                prompt_token_ids=self.initial_prompt_token_ids,
                 token_ids=(),
                 token_traces=(),
                 branch_points_used=0,
@@ -774,6 +1025,7 @@ class BranchExecutor:
         frontier: list[PathState],
         doc_id: int,
         leaf_limit: int,
+        initial_scheduled: list[_ScheduledDecode] | None = None,
     ) -> None:
         """Decode frontier states as they complete and enqueue children immediately.
 
@@ -782,42 +1034,74 @@ class BranchExecutor:
             frontier: Initial decode states.
             doc_id: Document id for candidate pool resolution.
             leaf_limit: Maximum leaf count for rollout.
+            initial_scheduled: Optional preconfigured decode work items.
 
         Returns:
             None.
         """
 
+        scheduled_frontier = (
+            [_ScheduledDecode(state=state) for state in frontier]
+            if initial_scheduled is None
+            else initial_scheduled
+        )
         pending_decode: set[asyncio.Task[tuple[_ScheduledDecode, DecodeOutcome]]] = {
             self._schedule_decode_task(
                 tree=tree,
-                scheduled=_ScheduledDecode(state=state),
+                scheduled=scheduled,
             )
-            for state in frontier
+            for scheduled in scheduled_frontier
         }
         pending_expansion: set[asyncio.Task[list[_ScheduledDecode]]] = set()
-        while (pending_decode or pending_expansion) and len(tree.leaves) < leaf_limit:
-            waiting: set[asyncio.Task[Any]] = set(pending_decode)
-            waiting.update(pending_expansion)
-            done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
-            for completed in done:
-                if completed in pending_decode:
-                    pending_decode.remove(
-                        cast(
-                            asyncio.Task[tuple[_ScheduledDecode, DecodeOutcome]],
-                            completed,
+        try:
+            while (pending_decode or pending_expansion) and len(
+                tree.leaves
+            ) < leaf_limit:
+                waiting: set[asyncio.Task[Any]] = set(pending_decode)
+                waiting.update(pending_expansion)
+                done, _ = await asyncio.wait(
+                    waiting, return_when=asyncio.FIRST_COMPLETED
+                )
+                for completed in done:
+                    if completed in pending_decode:
+                        pending_decode.remove(
+                            cast(
+                                asyncio.Task[tuple[_ScheduledDecode, DecodeOutcome]],
+                                completed,
+                            )
                         )
+                        scheduled, outcome = completed.result()
+                        (
+                            next_scheduled,
+                            scheduled_expansion,
+                        ) = self._handle_state_outcome(
+                            tree=tree,
+                            scheduled=scheduled,
+                            outcome=outcome,
+                            doc_id=doc_id,
+                            leaf_limit=leaf_limit,
+                        )
+                        if len(tree.leaves) >= leaf_limit:
+                            break
+                        for child in next_scheduled:
+                            pending_decode.add(
+                                self._schedule_decode_task(
+                                    tree=tree,
+                                    scheduled=child,
+                                )
+                            )
+                        if scheduled_expansion is not None:
+                            pending_expansion.add(
+                                self._schedule_expansion_task(
+                                    tree=tree,
+                                    scheduled=scheduled_expansion,
+                                )
+                            )
+                        continue
+                    pending_expansion.remove(
+                        cast(asyncio.Task[list[_ScheduledDecode]], completed)
                     )
-                    scheduled, outcome = completed.result()
-                    (
-                        next_scheduled,
-                        scheduled_expansion,
-                    ) = self._handle_state_outcome(
-                        tree=tree,
-                        scheduled=scheduled,
-                        outcome=outcome,
-                        doc_id=doc_id,
-                        leaf_limit=leaf_limit,
-                    )
+                    next_scheduled = completed.result()
                     if len(tree.leaves) >= leaf_limit:
                         break
                     for child in next_scheduled:
@@ -827,33 +1111,13 @@ class BranchExecutor:
                                 scheduled=child,
                             )
                         )
-                    if scheduled_expansion is not None:
-                        pending_expansion.add(
-                            self._schedule_expansion_task(
-                                tree=tree,
-                                scheduled=scheduled_expansion,
-                            )
-                        )
-                    continue
-                pending_expansion.remove(
-                    cast(asyncio.Task[list[_ScheduledDecode]], completed)
-                )
-                next_scheduled = completed.result()
                 if len(tree.leaves) >= leaf_limit:
                     break
-                for child in next_scheduled:
-                    pending_decode.add(
-                        self._schedule_decode_task(
-                            tree=tree,
-                            scheduled=child,
-                        )
-                    )
-            if len(tree.leaves) >= leaf_limit:
-                break
-        await self._cancel_pending_scheduler_tasks(
-            pending_decode=pending_decode,
-            pending_expansion=pending_expansion,
-        )
+        finally:
+            await self._cancel_pending_scheduler_tasks(
+                pending_decode=pending_decode,
+                pending_expansion=pending_expansion,
+            )
 
     def _schedule_decode_task(
         self, *, tree: BranchTree, scheduled: _ScheduledDecode
@@ -882,6 +1146,7 @@ class BranchExecutor:
             if (
                 scheduled.branching_enabled
                 and scheduled.steer_normalization_enabled is None
+                and scheduled.inline_epsilon_enabled is None
             ):
                 outcome = await self._decode_until_event_async(
                     tree=tree,
@@ -893,6 +1158,7 @@ class BranchExecutor:
                     state=scheduled.state,
                     branching_enabled=scheduled.branching_enabled,
                     steer_normalization_enabled=scheduled.steer_normalization_enabled,
+                    inline_epsilon_enabled=scheduled.inline_epsilon_enabled,
                 )
         return scheduled, outcome
 
@@ -940,13 +1206,21 @@ class BranchExecutor:
                     "trigger_type": str(outcome.trigger_type),
                 },
             )
-            resumed_state = self._state_from_outcome(state=state, outcome=outcome)
+            resumed_state = self._state_ready_for_branch_disabled_resume(
+                state=state,
+                outcome=outcome,
+            )
             return (
                 [
                     _ScheduledDecode(
                         state=resumed_state,
                         branching_enabled=False,
                         steer_normalization_enabled=True,
+                        inline_epsilon_enabled=(
+                            scheduled.inline_epsilon_enabled
+                            if scheduled.inline_epsilon_enabled is not None
+                            else scheduled.branching_enabled
+                        ),
                     )
                 ],
                 None,
@@ -1036,20 +1310,21 @@ class BranchExecutor:
             selector_mode=self.active_selector,
             root_prompt=self.prompt_text,
         )
+        initial_assistant_prefix = self.decoding.initial_assistant_prefix
         root_node = TreeNode(
             node_id="node_root",
             parent_node_id=None,
             prompt_text=self.prompt_text,
-            assistant_prefix="",
-            prompt_token_ids=None,
+            assistant_prefix=initial_assistant_prefix,
+            prompt_token_ids=self.initial_prompt_token_ids,
             branch_points_used=0,
         )
         tree.add_node(node=root_node)
         frontier = [
             PathState(
                 node_id=root_node.node_id,
-                assistant_prefix="",
-                prompt_token_ids=None,
+                assistant_prefix=initial_assistant_prefix,
+                prompt_token_ids=self.initial_prompt_token_ids,
                 token_ids=(),
                 token_traces=(),
                 branch_points_used=0,
@@ -1160,6 +1435,11 @@ class BranchExecutor:
 
         if len(tree.leaves) >= leaf_limit:
             return
+        self._append_completed_leaf(tree=tree, leaf=leaf)
+
+    def _append_completed_leaf(self, *, tree: BranchTree, leaf: LeafRollout) -> None:
+        """Append one completed leaf and run the scoring hook."""
+
         tree.leaves.append(leaf)
         self._append_tree_event(
             tree=tree,
@@ -1189,6 +1469,109 @@ class BranchExecutor:
         ), "leaf completion hook must preserve node_id"
         return updated_leaf
 
+    def _append_malformed_steer_decision_event(
+        self,
+        *,
+        tree: BranchTree,
+        node_id: str,
+        source: str,
+        assistant_prefix: str,
+        stop_reason: str = "missing_steer_or_think_close",
+        candidate_id: int | None = None,
+        candidate_text: str = "",
+    ) -> None:
+        """Log a malformed post-exec steer-decision termination."""
+
+        payload: dict[str, object] = {
+            "node_id": node_id,
+            "source": source,
+            "stop_reason": stop_reason,
+            "assistant_prefix_tail": assistant_prefix[-ASSISTANT_PREFIX_TAIL_CHARS:],
+        }
+        if candidate_id is not None:
+            payload["candidate_id"] = candidate_id
+        if candidate_text:
+            payload["candidate_text"] = candidate_text
+        self._append_tree_event(
+            tree=tree,
+            event_type="malformed_steer_decision",
+            payload=payload,
+        )
+
+    def _append_malformed_steer_decision_if_needed(
+        self,
+        *,
+        tree: BranchTree,
+        node_id: str,
+        source: str,
+        assistant_prefix: str,
+        outcome: DecodeOutcome,
+    ) -> None:
+        """Log malformed post-exec steer-decision termination outcomes."""
+
+        if outcome.stop_reason != "missing_steer_or_think_close":
+            return
+        candidate_text = ""
+        if outcome.assistant_prefix.startswith(assistant_prefix):
+            candidate_text = outcome.assistant_prefix[len(assistant_prefix) :]
+        self._append_malformed_steer_decision_event(
+            tree=tree,
+            node_id=node_id,
+            source=source,
+            assistant_prefix=assistant_prefix,
+            stop_reason=outcome.stop_reason,
+            candidate_text=candidate_text,
+        )
+
+    def _state_ready_for_branch_disabled_resume(
+        self, *, state: PathState, outcome: DecodeOutcome
+    ) -> PathState:
+        """Return a resumed state that cannot decode through a steer boundary."""
+
+        resumed_state = self._state_from_outcome(state=state, outcome=outcome)
+        if not self._needs_explicit_exec_stop_completion(outcome=outcome):
+            return resumed_state
+        completed_prefix, completed_prompt_ids = (
+            self._append_explicit_steer_stop_prefix(
+                assistant_prefix=resumed_state.assistant_prefix,
+                prompt_token_ids=resumed_state.prompt_token_ids,
+            )
+        )
+        return replace(
+            resumed_state,
+            assistant_prefix=completed_prefix,
+            prompt_token_ids=completed_prompt_ids,
+        )
+
+    async def _state_ready_for_branch_disabled_resume_async(
+        self, *, state: PathState, outcome: DecodeOutcome
+    ) -> PathState:
+        """Async variant of branch-disabled resume state preparation."""
+
+        resumed_state = self._state_from_outcome(state=state, outcome=outcome)
+        if not self._needs_explicit_exec_stop_completion(outcome=outcome):
+            return resumed_state
+        completed_prefix, completed_prompt_ids = (
+            await self._append_explicit_steer_stop_prefix_async(
+                assistant_prefix=resumed_state.assistant_prefix,
+                prompt_token_ids=resumed_state.prompt_token_ids,
+            )
+        )
+        return replace(
+            resumed_state,
+            assistant_prefix=completed_prefix,
+            prompt_token_ids=completed_prompt_ids,
+        )
+
+    @staticmethod
+    def _needs_explicit_exec_stop_completion(*, outcome: DecodeOutcome) -> bool:
+        """Return whether a max-branch trigger stopped on excluded `</exec`."""
+
+        return (
+            outcome.trigger_type == "steer_boundary"
+            and outcome.assistant_prefix.lower().endswith("</exec")
+        )
+
     async def _resume_maxed_states_async(
         self,
         *,
@@ -1206,9 +1589,13 @@ class BranchExecutor:
             *[
                 self._decode_until_event_async(
                     tree=tree,
-                    state=self._state_from_outcome(state=state, outcome=outcome),
+                    state=await self._state_ready_for_branch_disabled_resume_async(
+                        state=state,
+                        outcome=outcome,
+                    ),
                     branching_enabled=False,
                     steer_normalization_enabled=True,
+                    inline_epsilon_enabled=True,
                 )
                 for state, outcome in maxed
             ]
@@ -1430,7 +1817,8 @@ class BranchExecutor:
             selector_mode=self.active_selector,
         )
         selected_ids = self._selected_ids_for_branch(
-            pool=pool, selected_ids=selected_ids
+            pool=pool,
+            selected_ids=selected_ids,
         )
         self._append_selector_applied_event(
             tree=tree,
@@ -1531,11 +1919,53 @@ class BranchExecutor:
             if candidate.candidate_id == candidate_id
         )
         candidate_text, candidate_token_ids = (
+            await self._append_think_close_stop_suffix_async(candidate=candidate)
+        )
+        candidate_token_ids = tuple(candidate_token_ids)
+        if candidate_text and not candidate_token_ids:
+            candidate_token_ids = tuple(
+                await self._tokenize_text_async(text=candidate_text)
+            )
+        if not steer_candidate_has_decision_tag(
+            prefix=outcome.assistant_prefix,
+            candidate_text=candidate_text,
+        ):
+            span_start = len(outcome.token_ids)
+            updated_token_ids = tuple(outcome.token_ids) + candidate_token_ids
+            updated_prompt_ids = append_prompt_token_ids(
+                prompt_token_ids=outcome.prompt_token_ids,
+                continuation_token_ids=candidate_token_ids,
+            )
+            self._append_malformed_steer_decision_event(
+                tree=tree,
+                node_id=state.node_id,
+                source="inline_selection",
+                assistant_prefix=outcome.assistant_prefix + candidate_text,
+                candidate_id=candidate_id,
+                candidate_text=candidate_text,
+            )
+            return DecodeOutcome(
+                event_type="terminated",
+                trigger_type=None,
+                assistant_prefix=outcome.assistant_prefix + candidate_text,
+                prompt_token_ids=updated_prompt_ids,
+                token_ids=updated_token_ids,
+                token_traces=tuple(outcome.token_traces) + tuple(candidate.tokens),
+                generated_tokens=len(updated_token_ids),
+                stop_reason="missing_steer_or_think_close",
+                branch_points_used=state.branch_points_used,
+                steer_phase_token_spans=(
+                    *outcome.steer_phase_token_spans,
+                    (span_start, len(updated_token_ids)),
+                ),
+            )
+        candidate_text, candidate_token_ids = (
             await self._normalized_child_candidate_async(
                 trigger_type=pool.trigger_type,
                 candidate=candidate,
             )
         )
+        span_start = len(outcome.token_ids)
         updated_generated_tokens = len(outcome.token_ids) + len(candidate_token_ids)
         continued = DecodeOutcome(
             event_type="continued",
@@ -1550,6 +1980,10 @@ class BranchExecutor:
             generated_tokens=updated_generated_tokens,
             stop_reason="",
             branch_points_used=state.branch_points_used,
+            steer_phase_token_spans=(
+                *outcome.steer_phase_token_spans,
+                (span_start, updated_generated_tokens),
+            ),
         )
         self._reset_request_stream_state(request_stream_id=f"decode:{state.node_id}")
         self._append_inline_selection_event(
@@ -1571,10 +2005,17 @@ class BranchExecutor:
         state: PathState,
         trigger_outcome: DecodeOutcome,
         branching_enabled: bool,
+        inline_epsilon_enabled: bool | None = None,
     ) -> DecodeOutcome:
         """Return inline epsilon or legacy single-candidate continuation."""
 
-        if not self._should_use_inline_epsilon(branching_enabled=branching_enabled):
+        if not self._should_use_inline_epsilon(
+            inline_epsilon_enabled=(
+                branching_enabled
+                if inline_epsilon_enabled is None
+                else inline_epsilon_enabled
+            )
+        ):
             return await continue_with_single_steer_candidate_async(
                 executor=self,
                 assistant_prefix=trigger_outcome.assistant_prefix,
@@ -1716,6 +2157,118 @@ class BranchExecutor:
             candidate = candidates_by_id.get(candidate_id)
             if candidate is None:
                 continue
+            candidate_decision_text, candidate_decision_token_ids = (
+                await self._append_think_close_stop_suffix_async(candidate=candidate)
+            )
+            candidate_decision_token_ids = tuple(candidate_decision_token_ids)
+            if candidate_decision_text and not candidate_decision_token_ids:
+                candidate_decision_token_ids = tuple(
+                    await self._tokenize_text_async(text=candidate_decision_text)
+                )
+            if not steer_candidate_has_decision_tag(
+                prefix=outcome.assistant_prefix,
+                candidate_text=candidate_decision_text,
+            ):
+                child_node_id = (
+                    f"node_{parent_state.node_id}_{child_offset}_{candidate_id}"
+                )
+                child_prefix = outcome.assistant_prefix + candidate_decision_text
+                child_prompt_token_ids = append_prompt_token_ids(
+                    prompt_token_ids=outcome.prompt_token_ids,
+                    continuation_token_ids=candidate_decision_token_ids,
+                )
+                child_token_ids = (
+                    tuple(outcome.token_ids) + candidate_decision_token_ids
+                )
+                child_token_traces = tuple(outcome.token_traces) + tuple(
+                    candidate.tokens
+                )
+                span_start = len(outcome.token_ids)
+                child_steer_spans = (
+                    *outcome.steer_phase_token_spans,
+                    (span_start, len(child_token_ids)),
+                )
+                child_state = PathState(
+                    node_id=child_node_id,
+                    assistant_prefix=child_prefix,
+                    prompt_token_ids=child_prompt_token_ids,
+                    token_ids=child_token_ids,
+                    token_traces=child_token_traces,
+                    branch_points_used=parent_state.branch_points_used + 1,
+                    steer_phase_token_spans=child_steer_spans,
+                )
+                tree.add_node(
+                    node=TreeNode(
+                        node_id=child_node_id,
+                        parent_node_id=parent_state.node_id,
+                        prompt_text=self.prompt_text,
+                        assistant_prefix=child_state.assistant_prefix,
+                        prompt_token_ids=child_state.prompt_token_ids,
+                        branch_points_used=child_state.branch_points_used,
+                    )
+                )
+                edge = TreeEdge(
+                    edge_id=f"edge_{parent_state.node_id}_{child_node_id}",
+                    parent_node_id=parent_state.node_id,
+                    child_node_id=child_node_id,
+                    candidate_pool_id=pool.candidate_pool_id,
+                    candidate_id=candidate.candidate_id,
+                    selector_mode=self.active_selector,
+                )
+                tree.edges.append(edge)
+                self._append_tree_event(
+                    tree=tree,
+                    event_type="node_created",
+                    payload={
+                        "node_id": child_node_id,
+                        "parent_node_id": parent_state.node_id,
+                        "branch_points_used": child_state.branch_points_used,
+                    },
+                )
+                self._append_tree_event(
+                    tree=tree,
+                    event_type="edge_selected",
+                    payload={
+                        "edge_id": edge.edge_id,
+                        "parent_node_id": edge.parent_node_id,
+                        "child_node_id": edge.child_node_id,
+                        "candidate_pool_id": edge.candidate_pool_id,
+                        "candidate_id": edge.candidate_id,
+                        "selector_mode": edge.selector_mode,
+                        "candidate_text_normalized": candidate_decision_text,
+                        "candidate_token_ids_normalized": list(
+                            candidate_decision_token_ids
+                        ),
+                    },
+                )
+                self._append_malformed_steer_decision_event(
+                    tree=tree,
+                    node_id=child_node_id,
+                    source="branch_selection",
+                    assistant_prefix=child_prefix,
+                    candidate_id=candidate_id,
+                    candidate_text=candidate_decision_text,
+                )
+                terminal_outcome = DecodeOutcome(
+                    event_type="terminated",
+                    trigger_type=None,
+                    assistant_prefix=child_prefix,
+                    prompt_token_ids=child_prompt_token_ids,
+                    token_ids=child_token_ids,
+                    token_traces=child_token_traces,
+                    generated_tokens=len(child_token_ids),
+                    stop_reason="missing_steer_or_think_close",
+                    branch_points_used=child_state.branch_points_used,
+                    steer_phase_token_spans=child_steer_spans,
+                )
+                self._append_completed_leaf(
+                    tree=tree,
+                    leaf=leaf_from_outcome(
+                        outcome=terminal_outcome,
+                        state=child_state,
+                    ),
+                )
+                continue
             candidate_text, candidate_token_ids = (
                 await self._normalized_child_candidate_async(
                     trigger_type=pool.trigger_type,
@@ -1724,6 +2277,7 @@ class BranchExecutor:
             )
             child_node_id = f"node_{parent_state.node_id}_{child_offset}_{candidate_id}"
             child_prefix = outcome.assistant_prefix + candidate_text
+            span_start = len(outcome.token_ids)
             child_token_ids = tuple(outcome.token_ids) + tuple(candidate_token_ids)
             child_token_traces = tuple(outcome.token_traces) + tuple(candidate.tokens)
             child_state = PathState(
@@ -1736,6 +2290,10 @@ class BranchExecutor:
                 token_ids=child_token_ids,
                 token_traces=child_token_traces,
                 branch_points_used=parent_state.branch_points_used + 1,
+                steer_phase_token_spans=(
+                    *outcome.steer_phase_token_spans,
+                    (span_start, len(child_token_ids)),
+                ),
             )
             tree.add_node(
                 node=TreeNode(
@@ -1789,6 +2347,7 @@ class BranchExecutor:
         state: PathState,
         branching_enabled: bool = True,
         steer_normalization_enabled: bool | None = None,
+        inline_epsilon_enabled: bool | None = None,
     ) -> DecodeOutcome:
         """Compatibility wrapper that executes the async decode workflow."""
 
@@ -1798,6 +2357,7 @@ class BranchExecutor:
                 state=state,
                 branching_enabled=branching_enabled,
                 steer_normalization_enabled=steer_normalization_enabled,
+                inline_epsilon_enabled=inline_epsilon_enabled,
             )
         )
 
@@ -1808,6 +2368,7 @@ class BranchExecutor:
         state: PathState,
         branching_enabled: bool = True,
         steer_normalization_enabled: bool | None = None,
+        inline_epsilon_enabled: bool | None = None,
     ) -> DecodeOutcome:
         """Async decode loop until trigger or termination for one path state.
 
@@ -1817,6 +2378,8 @@ class BranchExecutor:
             branching_enabled: Whether branching trigger returns are allowed.
             steer_normalization_enabled: Optional steer boundary normalization toggle.
                 Defaults to `branching_enabled` for backward-compatible behavior.
+            inline_epsilon_enabled: Optional inline epsilon-greedy toggle.
+                Defaults to `branching_enabled`.
 
         Returns:
             Decode outcome for one path.
@@ -1832,8 +2395,16 @@ class BranchExecutor:
             if steer_normalization_enabled is not None
             else branching_enabled
         )
+        effective_inline_epsilon_enabled = (
+            branching_enabled
+            if inline_epsilon_enabled is None
+            else inline_epsilon_enabled
+        )
         trigger_steer_enabled = self.trigger_steer_enabled and steer_mode_enabled
-        branch_prob = self.branching.branch_prob if branching_enabled else 0.0
+        boundary_detection_prob = self._steer_boundary_detection_probability(
+            branching_enabled=branching_enabled,
+            inline_epsilon_enabled=effective_inline_epsilon_enabled,
+        )
         rollout_stop = rollout_stop_markers(steer_enabled=trigger_steer_enabled)
         exec_repetition_state = initialize_exec_repetition_state(
             text=assistant_prefix,
@@ -1845,6 +2416,7 @@ class BranchExecutor:
             similarity_threshold=STEER_REPEAT_SIMILARITY_THRESHOLD,
             similarity_lookback_window=STEER_REPEAT_SIMILARITY_LOOKBACK_WINDOW,
         )
+        steer_phase_token_spans = state.steer_phase_token_spans
 
         def finalize_outcome(*, outcome: DecodeOutcome) -> DecodeOutcome:
             """Attach the current path trigger count to one returned outcome."""
@@ -1852,10 +2424,97 @@ class BranchExecutor:
             return replace(
                 outcome,
                 branch_points_used=state.branch_points_used,
+                steer_phase_token_spans=(
+                    outcome.steer_phase_token_spans or steer_phase_token_spans
+                ),
             )
 
+        def adopt_decode_state(*, outcome: DecodeOutcome) -> None:
+            """Make one continued outcome the active decode state."""
+
+            nonlocal assistant_prefix
+            nonlocal generated_tokens
+            nonlocal prompt_token_ids
+            nonlocal state
+            nonlocal steer_phase_token_spans
+            nonlocal token_ids
+            nonlocal token_traces
+
+            assistant_prefix = outcome.assistant_prefix
+            prompt_token_ids = outcome.prompt_token_ids
+            token_ids = list(outcome.token_ids)
+            token_traces = list(outcome.token_traces)
+            generated_tokens = outcome.generated_tokens
+            steer_phase_token_spans = outcome.steer_phase_token_spans
+            state = replace(
+                state,
+                branch_points_used=outcome.branch_points_used
+                or state.branch_points_used,
+                steer_phase_token_spans=outcome.steer_phase_token_spans,
+            )
+
+        def track_steer_phase_span(
+            *, base: DecodeOutcome, continued: DecodeOutcome
+        ) -> DecodeOutcome:
+            """Attach the response-token delta produced by one steer request."""
+
+            return _append_steer_phase_span(
+                accumulated_spans=steer_phase_token_spans,
+                base=base,
+                continued=continued,
+            )
+
+        async def steer_repeat_close_base_async(
+            *, base: DecodeOutcome
+        ) -> DecodeOutcome:
+            """Return the pre-candidate base used for steer-repeat forced close."""
+
+            span_base = replace(
+                base,
+                steer_phase_token_spans=(
+                    base.steer_phase_token_spans or steer_phase_token_spans
+                ),
+            )
+            if not span_base.assistant_prefix.lower().endswith(STEER_OPEN_TAG):
+                return span_base
+            trimmed_prefix = span_base.assistant_prefix[: -len(STEER_OPEN_TAG)]
+            trimmed_prompt_ids = await prompt_ids_without_trailing_text_async(
+                prompt_token_ids=span_base.prompt_token_ids,
+                suffix_text=STEER_OPEN_TAG,
+            )
+            return replace(
+                span_base,
+                assistant_prefix=trimmed_prefix,
+                prompt_token_ids=trimmed_prompt_ids,
+            )
+
+        async def prompt_ids_without_trailing_text_async(
+            *,
+            prompt_token_ids: tuple[int, ...] | None,
+            suffix_text: str,
+        ) -> tuple[int, ...] | None:
+            """Remove one known synthetic suffix from prompt ids."""
+
+            if prompt_token_ids is None:
+                return None
+            suffix_token_ids = tuple(await self._tokenize_text_async(text=suffix_text))
+            if not suffix_token_ids:
+                return prompt_token_ids
+            assert prompt_token_ids[-len(suffix_token_ids) :] == suffix_token_ids
+            return prompt_token_ids[: -len(suffix_token_ids)]
+
+        async def close_base_for_repeat_async(
+            *, repeat: _RepeatTermination, base: DecodeOutcome, continued: DecodeOutcome
+        ) -> DecodeOutcome | None:
+            """Return rollback base for steer repeats; keep exec repeats current."""
+
+            if repeat.block_kind == "steer":
+                return await steer_repeat_close_base_async(base=base)
+            adopt_decode_state(outcome=continued)
+            return None
+
         def think_closed_outcome() -> DecodeOutcome:
-            """Build terminal outcome when the prefix already contains `</think>`."""
+            """Build terminal outcome once post-think answer text already exists."""
 
             return DecodeOutcome(
                 event_type="terminated",
@@ -1866,6 +2525,21 @@ class BranchExecutor:
                 token_traces=tuple(token_traces),
                 generated_tokens=generated_tokens,
                 stop_reason="think_end",
+            )
+
+        async def resolve_existing_think_close_prefix_async() -> DecodeOutcome:
+            """Continue once after a bare `</think>` to generate the answer."""
+
+            if has_boxed_answer_after_first_think_close(text=assistant_prefix):
+                return think_closed_outcome()
+            return await continue_after_think_close_async(
+                executor=self,
+                assistant_prefix=assistant_prefix,
+                prompt_token_ids=prompt_token_ids,
+                token_ids=tuple(token_ids),
+                token_traces=tuple(token_traces),
+                generated_tokens=generated_tokens,
+                request_stream_id=f"decode:{state.node_id}",
             )
 
         def update_exec_repetition(*, delta_text: str) -> float | None:
@@ -1885,12 +2559,18 @@ class BranchExecutor:
             )
             return similarity_ratio
 
-        def update_steer_repetition(*, delta_text: str) -> float | None:
+        def update_steer_repetition(
+            *,
+            delta_text: str,
+            prefix_before: str | None = None,
+            prefix_after: str | None = None,
+        ) -> float | None:
             """Update steer repetition tracking from one appended text delta."""
 
             nonlocal steer_repetition_state
             if not trigger_steer_enabled:
                 return None
+            _ = prefix_before, prefix_after
             (
                 steer_repetition_state,
                 similarity_ratio,
@@ -1902,12 +2582,133 @@ class BranchExecutor:
             )
             return similarity_ratio
 
-        def repeated_block_termination_outcome(
+        async def continue_after_forced_think_close_async(
+            *, repeat: _RepeatTermination, close_base: DecodeOutcome | None = None
+        ) -> DecodeOutcome:
+            """Append `</think>` and continue with the post-think decode path."""
+
+            nonlocal assistant_prefix
+            nonlocal generated_tokens
+            nonlocal prompt_token_ids
+            nonlocal state
+            nonlocal steer_phase_token_spans
+            nonlocal token_ids
+            nonlocal token_traces
+
+            if close_base is not None:
+                assistant_prefix = close_base.assistant_prefix
+                prompt_token_ids = close_base.prompt_token_ids
+                token_ids = list(close_base.token_ids)
+                token_traces = list(close_base.token_traces)
+                generated_tokens = close_base.generated_tokens
+                steer_phase_token_spans = (
+                    close_base.steer_phase_token_spans or steer_phase_token_spans
+                )
+                state = replace(
+                    state,
+                    steer_phase_token_spans=steer_phase_token_spans,
+                )
+            normalized_prefix = _repeat_forced_think_close_prefix(text=assistant_prefix)
+            assert normalized_prefix.startswith(
+                assistant_prefix
+            ), "forced think-close normalization must be append-only"
+            normalization_suffix = normalized_prefix[len(assistant_prefix) :]
+            (
+                assistant_prefix,
+                prompt_token_ids,
+                token_ids_tuple,
+                token_traces_tuple,
+                generated_tokens,
+                normalization_token_ids,
+            ) = await self._append_synthetic_suffix_to_decode_state_async(
+                assistant_prefix=assistant_prefix,
+                prompt_token_ids=prompt_token_ids,
+                token_ids=tuple(token_ids),
+                token_traces=tuple(token_traces),
+                generated_tokens=generated_tokens,
+                suffix_text=normalization_suffix,
+                context="repeat_forced_think_close_normalization",
+            )
+            token_ids = list(token_ids_tuple)
+            token_traces = list(token_traces_tuple)
+            think_close_span_start = len(token_ids)
+            (
+                assistant_prefix,
+                prompt_token_ids,
+                token_ids_tuple,
+                token_traces_tuple,
+                generated_tokens,
+                think_close_token_ids,
+            ) = await self._append_synthetic_suffix_to_decode_state_async(
+                assistant_prefix=assistant_prefix,
+                prompt_token_ids=prompt_token_ids,
+                token_ids=token_ids_tuple,
+                token_traces=token_traces_tuple,
+                generated_tokens=generated_tokens,
+                suffix_text=THINK_CLOSE_TAG,
+                context="repeat_forced_think_close",
+            )
+            token_ids = list(token_ids_tuple)
+            token_traces = list(token_traces_tuple)
+            think_close_span_end = len(token_ids)
+            if think_close_span_end > think_close_span_start:
+                steer_phase_token_spans = (
+                    *steer_phase_token_spans,
+                    (think_close_span_start, think_close_span_end),
+                )
+                state = replace(
+                    state,
+                    steer_phase_token_spans=steer_phase_token_spans,
+                )
+            self._append_tree_event(
+                tree=tree,
+                event_type="repeat_forced_think_close",
+                payload={
+                    "node_id": state.node_id,
+                    "repeat_stop_reason": repeat.stop_reason,
+                    "repeat_block_kind": repeat.block_kind,
+                    "repeat_block_count": repeat.block_count,
+                    "repeat_last_similarity_ratio": repeat.last_similarity_ratio,
+                    "normalization_suffix": normalization_suffix,
+                    "normalization_token_ids": list(normalization_token_ids),
+                    "think_close_token_ids": list(think_close_token_ids),
+                    "forced_close_text": normalization_suffix + THINK_CLOSE_TAG,
+                    "forced_close_token_ids": [
+                        *normalization_token_ids,
+                        *think_close_token_ids,
+                    ],
+                    "chunk_was_normalized": True,
+                    "chunk_token_ids_source": "synthetic_repeat_forced_close",
+                    "source": "repeat_forced_think_close",
+                    "generated_tokens_after_close": generated_tokens,
+                },
+            )
+            continued = await continue_after_think_close_async(
+                executor=self,
+                assistant_prefix=assistant_prefix,
+                prompt_token_ids=prompt_token_ids,
+                token_ids=tuple(token_ids),
+                token_traces=tuple(token_traces),
+                generated_tokens=generated_tokens,
+                request_stream_id=f"decode:{state.node_id}",
+            )
+            return replace(
+                continued,
+                repeat_stop_reason=repeat.stop_reason,
+                repeat_block_kind=repeat.block_kind,
+                repeat_block_count=repeat.block_count,
+                repeat_last_similarity_ratio=repeat.last_similarity_ratio,
+                steer_phase_token_spans=(
+                    continued.steer_phase_token_spans or steer_phase_token_spans
+                ),
+            )
+
+        def repeated_block_termination(
             *,
             last_exec_similarity_ratio: float | None,
             last_steer_similarity_ratio: float | None,
-        ) -> DecodeOutcome | None:
-            """Return repeat-loop termination outcome when threshold is reached."""
+        ) -> _RepeatTermination | None:
+            """Return repeat-loop metadata when the threshold is reached."""
 
             if (
                 trigger_steer_enabled
@@ -1922,15 +2723,11 @@ class BranchExecutor:
                     last_similarity_ratio=last_exec_similarity_ratio,
                     previous_exec_block=exec_repetition_state.previous_exec_block,
                 )
-                return DecodeOutcome(
-                    event_type="terminated",
-                    trigger_type=None,
-                    assistant_prefix=assistant_prefix,
-                    prompt_token_ids=prompt_token_ids,
-                    token_ids=tuple(token_ids),
-                    token_traces=tuple(token_traces),
-                    generated_tokens=generated_tokens,
+                return _RepeatTermination(
                     stop_reason=EXEC_REPEAT_STOP_REASON,
+                    block_kind="exec",
+                    block_count=exec_repetition_state.repeated_exec_blocks,
+                    last_similarity_ratio=last_exec_similarity_ratio,
                 )
             if (
                 trigger_steer_enabled
@@ -1945,32 +2742,177 @@ class BranchExecutor:
                     last_similarity_ratio=last_steer_similarity_ratio,
                     previous_steer_block=steer_repetition_state.previous_exec_block,
                 )
-                return DecodeOutcome(
-                    event_type="terminated",
-                    trigger_type=None,
-                    assistant_prefix=assistant_prefix,
-                    prompt_token_ids=prompt_token_ids,
-                    token_ids=tuple(token_ids),
-                    token_traces=tuple(token_traces),
-                    generated_tokens=generated_tokens,
+                return _RepeatTermination(
                     stop_reason=STEER_REPEAT_STOP_REASON,
+                    block_kind="steer",
+                    block_count=steer_repetition_state.repeated_exec_blocks,
+                    last_similarity_ratio=last_steer_similarity_ratio,
                 )
             return None
 
+        async def resolve_steer_decision_prefix(
+            *, source: str
+        ) -> DecodeOutcome | None:
+            """Resolve a steer decision prefix before exec decoding starts."""
+
+            nonlocal assistant_prefix
+            nonlocal generated_tokens
+            nonlocal prompt_token_ids
+            nonlocal state
+            nonlocal token_ids
+            nonlocal token_traces
+
+            if prompt_token_ids is None:
+                prompt_token_ids = await self._tokenize_text_async(
+                    text=build_raw_im_prompt(
+                        prompt=self.prompt_text,
+                        assistant_prefix=assistant_prefix,
+                    )
+                )
+            normalized_prefix, normalized_prompt_ids = (
+                await prepare_steer_generation_prefix_async(
+                    executor=self,
+                    assistant_prefix=assistant_prefix,
+                    prompt_token_ids=prompt_token_ids,
+                )
+            )
+            trigger_outcome = DecodeOutcome(
+                event_type="trigger",
+                trigger_type="steer_boundary",
+                assistant_prefix=normalized_prefix,
+                prompt_token_ids=normalized_prompt_ids,
+                token_ids=tuple(token_ids),
+                token_traces=tuple(token_traces),
+                generated_tokens=generated_tokens,
+                stop_reason="",
+            )
+            if self._should_branch_at_steer_trigger(
+                branching_enabled=branching_enabled
+            ):
+                if not self._trigger_has_branch_budget(
+                    trigger_type="steer_boundary",
+                    generated_tokens=trigger_outcome.generated_tokens,
+                ):
+                    return replace(
+                        trigger_outcome,
+                        event_type="terminated",
+                        trigger_type=None,
+                        stop_reason="max_gen_toks_reached",
+                    )
+                return trigger_outcome
+            continued = await self._resolve_nonbranch_steer_trigger_async(
+                tree=tree,
+                state=state,
+                trigger_outcome=trigger_outcome,
+                branching_enabled=branching_enabled,
+                inline_epsilon_enabled=effective_inline_epsilon_enabled,
+            )
+            continued = track_steer_phase_span(
+                base=trigger_outcome, continued=continued
+            )
+            if continued.event_type == "terminated":
+                self._append_malformed_steer_decision_if_needed(
+                    tree=tree,
+                    node_id=state.node_id,
+                    source=source,
+                    assistant_prefix=trigger_outcome.assistant_prefix,
+                    outcome=continued,
+                )
+                return continued
+            steer_chunk_text, _ = self._state_delta(
+                prefix_before=trigger_outcome.assistant_prefix,
+                prefix_after=continued.assistant_prefix,
+                token_ids_before=trigger_outcome.token_ids,
+                token_ids_after=continued.token_ids,
+            )
+            last_exec_similarity_ratio = update_exec_repetition(
+                delta_text=steer_chunk_text
+            )
+            last_steer_similarity_ratio = update_steer_repetition(
+                delta_text=steer_chunk_text,
+                prefix_before=trigger_outcome.assistant_prefix,
+                prefix_after=continued.assistant_prefix,
+            )
+            repeat = repeated_block_termination(
+                last_exec_similarity_ratio=last_exec_similarity_ratio,
+                last_steer_similarity_ratio=last_steer_similarity_ratio,
+            )
+            if repeat is not None:
+                close_base = await close_base_for_repeat_async(
+                    repeat=repeat,
+                    base=trigger_outcome,
+                    continued=continued,
+                )
+                return await continue_after_forced_think_close_async(
+                    repeat=repeat,
+                    close_base=close_base,
+                )
+            self._append_steer_block_event(
+                tree=tree,
+                node_id=state.node_id,
+                source=source,
+                base_prefix=trigger_outcome.assistant_prefix,
+                base_token_ids=trigger_outcome.token_ids,
+                generated_tokens_before_chunk=trigger_outcome.generated_tokens,
+                continued=continued,
+            )
+            adopt_decode_state(outcome=continued)
+            return None
+
         if contains_think_close(text=assistant_prefix):
-            return finalize_outcome(outcome=think_closed_outcome())
+            return finalize_outcome(
+                outcome=await resolve_existing_think_close_prefix_async()
+            )
 
         while generated_tokens < self.decoding.max_gen_toks:
             if contains_think_close(text=assistant_prefix):
-                return finalize_outcome(outcome=think_closed_outcome())
+                return finalize_outcome(
+                    outcome=await resolve_existing_think_close_prefix_async()
+                )
+            if trigger_steer_enabled and is_steer_decision_boundary(
+                text=assistant_prefix
+            ):
+                boundary_outcome = await resolve_steer_decision_prefix(
+                    source="steer_decision_boundary_nonbranch"
+                )
+                if boundary_outcome is not None:
+                    return finalize_outcome(outcome=boundary_outcome)
+                continue
+            if trigger_steer_enabled and has_trailing_steer_open_prefix(
+                text=assistant_prefix
+            ):
+                open_steer_outcome = await resolve_steer_decision_prefix(
+                    source="open_steer_prefix_nonbranch"
+                )
+                if open_steer_outcome is not None:
+                    return finalize_outcome(outcome=open_steer_outcome)
+                continue
+            request_budget = self._request_token_budget(
+                prompt_token_ids=prompt_token_ids,
+                generated_tokens=generated_tokens,
+            )
+            if request_budget.max_tokens <= 0:
+                return finalize_outcome(
+                    outcome=DecodeOutcome(
+                        event_type="terminated",
+                        trigger_type=None,
+                        assistant_prefix=assistant_prefix,
+                        prompt_token_ids=prompt_token_ids,
+                        token_ids=tuple(token_ids),
+                        token_traces=tuple(token_traces),
+                        generated_tokens=generated_tokens,
+                        stop_reason=request_budget.exhausted_stop_reason,
+                    )
+                )
             chunk_prefix_before = assistant_prefix
             chunk_prompt_token_ids_before = prompt_token_ids
             chunk_token_ids_before = tuple(token_ids)
             generated_before_chunk = generated_tokens
             chunk_tokens = min(
                 self.decoding.decode_chunk_tokens,
-                self.decoding.max_gen_toks - generated_tokens,
+                request_budget.max_tokens,
             )
+            chunk_length_limited = chunk_tokens < request_budget.max_tokens
             choice = await self._generate_choice_async(
                 assistant_prefix=assistant_prefix,
                 prompt_token_ids=prompt_token_ids,
@@ -1981,8 +2923,10 @@ class BranchExecutor:
                 request_stream_id=f"decode:{state.node_id}",
                 enforce_prefix_chain=True,
             )
+            choice = truncate_choice_at_chat_eos(choice=choice)
             raw_chunk_text = str(choice.text)
             raw_chunk_token_ids = tuple(choice.token_ids or ())
+            chat_eos_stop = is_chat_eos_stop_reason(stop_reason=choice.stop_reason)
 
             def append_decode_event(
                 *,
@@ -2008,7 +2952,13 @@ class BranchExecutor:
                     token_ids_after=token_ids_after,
                 )
 
-            if not choice.tokens:
+            if not choice_has_generated_content(choice=choice):
+                if choice.stop_reason == "max_context_length_reached":
+                    empty_stop_reason = "max_context_length_reached"
+                elif chat_eos_stop:
+                    empty_stop_reason = "model_finished"
+                else:
+                    empty_stop_reason = "empty_generation"
                 append_decode_event(
                     prefix_after=assistant_prefix,
                     prompt_token_ids_after=prompt_token_ids,
@@ -2024,7 +2974,7 @@ class BranchExecutor:
                         token_ids=tuple(token_ids),
                         token_traces=tuple(token_traces),
                         generated_tokens=generated_tokens,
-                        stop_reason="empty_generation",
+                        stop_reason=empty_stop_reason,
                     )
                 )
             explicit_steer_stop = is_explicit_steer_stop(
@@ -2039,10 +2989,11 @@ class BranchExecutor:
                 generated_tokens=generated_tokens,
                 trigger_steer=(
                     trigger_steer_enabled
-                    and branching_enabled
+                    and (branching_enabled or effective_inline_epsilon_enabled)
                     and not explicit_steer_stop
+                    and not chat_eos_stop
                 ),
-                branch_prob=branch_prob,
+                branch_prob=boundary_detection_prob,
                 rng=self.random,
             )
             assistant_prefix = chunk_outcome.assistant_prefix
@@ -2061,6 +3012,21 @@ class BranchExecutor:
                     :consumed_tokens
                 ],
             )
+            if chat_eos_stop:
+                chat_eos_outcome = replace(
+                    chunk_outcome,
+                    event_type="terminated",
+                    trigger_type=None,
+                    prompt_token_ids=prompt_token_ids,
+                    stop_reason="model_finished",
+                )
+                append_decode_event(
+                    prefix_after=chat_eos_outcome.assistant_prefix,
+                    prompt_token_ids_after=chat_eos_outcome.prompt_token_ids,
+                    token_ids_after=chat_eos_outcome.token_ids,
+                    generated_after=chat_eos_outcome.generated_tokens,
+                )
+                return finalize_outcome(outcome=chat_eos_outcome)
             decode_chunk_text, _ = self._state_delta(
                 prefix_before=chunk_prefix_before,
                 prefix_after=assistant_prefix,
@@ -2071,18 +3037,23 @@ class BranchExecutor:
                 delta_text=decode_chunk_text
             )
             last_steer_similarity_ratio = update_steer_repetition(
-                delta_text=decode_chunk_text
+                delta_text=decode_chunk_text,
+                prefix_before=chunk_prefix_before,
+                prefix_after=assistant_prefix,
             )
-            repeated_outcome = repeated_block_termination_outcome(
+            repeat = repeated_block_termination(
                 last_exec_similarity_ratio=last_exec_similarity_ratio,
                 last_steer_similarity_ratio=last_steer_similarity_ratio,
             )
-            if repeated_outcome is not None:
+            if repeat is not None:
                 append_decode_event(
-                    prefix_after=repeated_outcome.assistant_prefix,
-                    prompt_token_ids_after=repeated_outcome.prompt_token_ids,
-                    token_ids_after=repeated_outcome.token_ids,
-                    generated_after=repeated_outcome.generated_tokens,
+                    prefix_after=assistant_prefix,
+                    prompt_token_ids_after=prompt_token_ids,
+                    token_ids_after=tuple(token_ids),
+                    generated_after=generated_tokens,
+                )
+                repeated_outcome = await continue_after_forced_think_close_async(
+                    repeat=repeat
                 )
                 return finalize_outcome(outcome=repeated_outcome)
             if chunk_outcome.event_type == "trigger":
@@ -2116,7 +3087,8 @@ class BranchExecutor:
                     )
                     return finalize_outcome(outcome=trigger_outcome)
                 normalized_prefix, normalized_prompt_ids = (
-                    await self._normalize_steer_prefix_prompt_ids_async(
+                    await prepare_steer_generation_prefix_async(
+                        executor=self,
                         assistant_prefix=assistant_prefix,
                         prompt_token_ids=prompt_token_ids,
                     )
@@ -2159,13 +3131,24 @@ class BranchExecutor:
                     state=state,
                     trigger_outcome=trigger_outcome,
                     branching_enabled=branching_enabled,
+                    inline_epsilon_enabled=effective_inline_epsilon_enabled,
+                )
+                continued = track_steer_phase_span(
+                    base=trigger_outcome, continued=continued
                 )
                 if continued.event_type == "terminated":
+                    self._append_malformed_steer_decision_if_needed(
+                        tree=tree,
+                        node_id=state.node_id,
+                        source="steer_boundary_inline_continuation",
+                        assistant_prefix=trigger_outcome.assistant_prefix,
+                        outcome=continued,
+                    )
                     append_decode_event(
-                        prefix_after=trigger_outcome.assistant_prefix,
-                        prompt_token_ids_after=trigger_outcome.prompt_token_ids,
-                        token_ids_after=trigger_outcome.token_ids,
-                        generated_after=trigger_outcome.generated_tokens,
+                        prefix_after=continued.assistant_prefix,
+                        prompt_token_ids_after=continued.prompt_token_ids,
+                        token_ids_after=continued.token_ids,
+                        generated_after=continued.generated_tokens,
                     )
                     return finalize_outcome(outcome=continued)
                 append_decode_event(
@@ -2173,15 +3156,6 @@ class BranchExecutor:
                     prompt_token_ids_after=trigger_outcome.prompt_token_ids,
                     token_ids_after=trigger_outcome.token_ids,
                     generated_after=trigger_outcome.generated_tokens,
-                )
-                self._append_steer_block_event(
-                    tree=tree,
-                    node_id=state.node_id,
-                    source="steer_boundary_inline_continuation",
-                    base_prefix=trigger_outcome.assistant_prefix,
-                    base_token_ids=trigger_outcome.token_ids,
-                    generated_tokens_before_chunk=trigger_outcome.generated_tokens,
-                    continued=continued,
                 )
                 steer_chunk_text, _ = self._state_delta(
                     prefix_before=trigger_outcome.assistant_prefix,
@@ -2193,24 +3167,35 @@ class BranchExecutor:
                     delta_text=steer_chunk_text
                 )
                 last_steer_similarity_ratio = update_steer_repetition(
-                    delta_text=steer_chunk_text
+                    delta_text=steer_chunk_text,
+                    prefix_before=trigger_outcome.assistant_prefix,
+                    prefix_after=continued.assistant_prefix,
                 )
-                repeated_outcome = repeated_block_termination_outcome(
+                repeat = repeated_block_termination(
                     last_exec_similarity_ratio=last_exec_similarity_ratio,
                     last_steer_similarity_ratio=last_steer_similarity_ratio,
                 )
-                if repeated_outcome is not None:
+                if repeat is not None:
+                    close_base = await close_base_for_repeat_async(
+                        repeat=repeat,
+                        base=trigger_outcome,
+                        continued=continued,
+                    )
+                    repeated_outcome = await continue_after_forced_think_close_async(
+                        repeat=repeat,
+                        close_base=close_base,
+                    )
                     return finalize_outcome(outcome=repeated_outcome)
-                assistant_prefix = continued.assistant_prefix
-                prompt_token_ids = continued.prompt_token_ids
-                token_ids = list(continued.token_ids)
-                token_traces = list(continued.token_traces)
-                generated_tokens = continued.generated_tokens
-                state = replace(
-                    state,
-                    branch_points_used=continued.branch_points_used
-                    or state.branch_points_used,
+                self._append_steer_block_event(
+                    tree=tree,
+                    node_id=state.node_id,
+                    source="steer_boundary_inline_continuation",
+                    base_prefix=trigger_outcome.assistant_prefix,
+                    base_token_ids=trigger_outcome.token_ids,
+                    generated_tokens_before_chunk=trigger_outcome.generated_tokens,
+                    continued=continued,
                 )
+                adopt_decode_state(outcome=continued)
                 continue
             if trigger_steer_enabled and contains_think_close_or_partial(
                 text=str(choice.text)
@@ -2240,7 +3225,8 @@ class BranchExecutor:
                     )
                 )
                 normalized_prefix, normalized_prompt_ids = (
-                    await self._normalize_steer_prefix_prompt_ids_async(
+                    await prepare_steer_generation_prefix_async(
+                        executor=self,
                         assistant_prefix=explicit_prefix,
                         prompt_token_ids=explicit_prompt_ids,
                     )
@@ -2260,7 +3246,11 @@ class BranchExecutor:
                     token_ids_after=explicit_trigger.token_ids,
                 )
                 _ = update_exec_repetition(delta_text=explicit_trigger_text)
-                _ = update_steer_repetition(delta_text=explicit_trigger_text)
+                _ = update_steer_repetition(
+                    delta_text=explicit_trigger_text,
+                    prefix_before=assistant_prefix,
+                    prefix_after=explicit_trigger.assistant_prefix,
+                )
                 if self._should_branch_at_steer_trigger(
                     branching_enabled=branching_enabled
                 ):
@@ -2294,8 +3284,19 @@ class BranchExecutor:
                     state=state,
                     trigger_outcome=explicit_trigger,
                     branching_enabled=branching_enabled,
+                    inline_epsilon_enabled=effective_inline_epsilon_enabled,
+                )
+                continued = track_steer_phase_span(
+                    base=explicit_trigger, continued=continued
                 )
                 if continued.event_type == "terminated":
+                    self._append_malformed_steer_decision_if_needed(
+                        tree=tree,
+                        node_id=state.node_id,
+                        source="explicit_stop_nonbranch",
+                        assistant_prefix=explicit_trigger.assistant_prefix,
+                        outcome=continued,
+                    )
                     append_decode_event(
                         prefix_after=continued.assistant_prefix,
                         prompt_token_ids_after=continued.prompt_token_ids,
@@ -2309,15 +3310,6 @@ class BranchExecutor:
                     token_ids_after=explicit_trigger.token_ids,
                     generated_after=explicit_trigger.generated_tokens,
                 )
-                self._append_steer_block_event(
-                    tree=tree,
-                    node_id=state.node_id,
-                    source="explicit_stop_nonbranch",
-                    base_prefix=explicit_trigger.assistant_prefix,
-                    base_token_ids=explicit_trigger.token_ids,
-                    generated_tokens_before_chunk=explicit_trigger.generated_tokens,
-                    continued=continued,
-                )
                 steer_chunk_text, _ = self._state_delta(
                     prefix_before=explicit_trigger.assistant_prefix,
                     prefix_after=continued.assistant_prefix,
@@ -2328,26 +3320,60 @@ class BranchExecutor:
                     delta_text=steer_chunk_text
                 )
                 last_steer_similarity_ratio = update_steer_repetition(
-                    delta_text=steer_chunk_text
+                    delta_text=steer_chunk_text,
+                    prefix_before=explicit_trigger.assistant_prefix,
+                    prefix_after=continued.assistant_prefix,
                 )
-                repeated_outcome = repeated_block_termination_outcome(
+                repeat = repeated_block_termination(
                     last_exec_similarity_ratio=last_exec_similarity_ratio,
                     last_steer_similarity_ratio=last_steer_similarity_ratio,
                 )
-                if repeated_outcome is not None:
+                if repeat is not None:
+                    close_base = await close_base_for_repeat_async(
+                        repeat=repeat,
+                        base=explicit_trigger,
+                        continued=continued,
+                    )
+                    repeated_outcome = await continue_after_forced_think_close_async(
+                        repeat=repeat,
+                        close_base=close_base,
+                    )
                     return finalize_outcome(outcome=repeated_outcome)
-                assistant_prefix = continued.assistant_prefix
-                prompt_token_ids = continued.prompt_token_ids
-                token_ids = list(continued.token_ids)
-                token_traces = list(continued.token_traces)
-                generated_tokens = continued.generated_tokens
-                state = replace(
-                    state,
-                    branch_points_used=continued.branch_points_used
-                    or state.branch_points_used,
+                self._append_steer_block_event(
+                    tree=tree,
+                    node_id=state.node_id,
+                    source="explicit_stop_nonbranch",
+                    base_prefix=explicit_trigger.assistant_prefix,
+                    base_token_ids=explicit_trigger.token_ids,
+                    generated_tokens_before_chunk=explicit_trigger.generated_tokens,
+                    continued=continued,
                 )
+                adopt_decode_state(outcome=continued)
                 continue
-            if trigger_steer_enabled and str(choice.finish_reason) == "length":
+            if (
+                trigger_steer_enabled
+                and str(choice.finish_reason) == "length"
+                and not chunk_length_limited
+            ):
+                terminal_outcome = replace(
+                    chunk_outcome,
+                    event_type="terminated",
+                    trigger_type=None,
+                    prompt_token_ids=prompt_token_ids,
+                    stop_reason=request_budget.exhausted_stop_reason,
+                )
+                append_decode_event(
+                    prefix_after=terminal_outcome.assistant_prefix,
+                    prompt_token_ids_after=terminal_outcome.prompt_token_ids,
+                    token_ids_after=terminal_outcome.token_ids,
+                    generated_after=terminal_outcome.generated_tokens,
+                )
+                return finalize_outcome(outcome=terminal_outcome)
+            if (
+                trigger_steer_enabled
+                and str(choice.finish_reason) == "length"
+                and chunk_length_limited
+            ):
                 steer_length_outcome = await resolve_steer_length_outcome_async(
                     executor=self,
                     choice=choice,
@@ -2401,19 +3427,34 @@ class BranchExecutor:
                     token_ids_after=steer_length_outcome.token_ids,
                 )
                 _ = update_exec_repetition(delta_text=steer_length_trigger_text)
-                _ = update_steer_repetition(delta_text=steer_length_trigger_text)
+                _ = update_steer_repetition(
+                    delta_text=steer_length_trigger_text,
+                    prefix_before=assistant_prefix,
+                    prefix_after=steer_length_outcome.assistant_prefix,
+                )
                 continued = await self._resolve_nonbranch_steer_trigger_async(
                     tree=tree,
                     state=state,
                     trigger_outcome=steer_length_outcome,
                     branching_enabled=branching_enabled,
+                    inline_epsilon_enabled=effective_inline_epsilon_enabled,
+                )
+                continued = track_steer_phase_span(
+                    base=steer_length_outcome, continued=continued
                 )
                 if continued.event_type == "terminated":
+                    self._append_malformed_steer_decision_if_needed(
+                        tree=tree,
+                        node_id=state.node_id,
+                        source="length_boundary_nonbranch",
+                        assistant_prefix=steer_length_outcome.assistant_prefix,
+                        outcome=continued,
+                    )
                     append_decode_event(
-                        prefix_after=steer_length_outcome.assistant_prefix,
-                        prompt_token_ids_after=steer_length_outcome.prompt_token_ids,
-                        token_ids_after=steer_length_outcome.token_ids,
-                        generated_after=steer_length_outcome.generated_tokens,
+                        prefix_after=continued.assistant_prefix,
+                        prompt_token_ids_after=continued.prompt_token_ids,
+                        token_ids_after=continued.token_ids,
+                        generated_after=continued.generated_tokens,
                     )
                     return finalize_outcome(outcome=continued)
                 append_decode_event(
@@ -2421,15 +3462,6 @@ class BranchExecutor:
                     prompt_token_ids_after=steer_length_outcome.prompt_token_ids,
                     token_ids_after=steer_length_outcome.token_ids,
                     generated_after=steer_length_outcome.generated_tokens,
-                )
-                self._append_steer_block_event(
-                    tree=tree,
-                    node_id=state.node_id,
-                    source="length_boundary_nonbranch",
-                    base_prefix=steer_length_outcome.assistant_prefix,
-                    base_token_ids=steer_length_outcome.token_ids,
-                    generated_tokens_before_chunk=steer_length_outcome.generated_tokens,
-                    continued=continued,
                 )
                 steer_chunk_text, _ = self._state_delta(
                     prefix_before=steer_length_outcome.assistant_prefix,
@@ -2441,24 +3473,35 @@ class BranchExecutor:
                     delta_text=steer_chunk_text
                 )
                 last_steer_similarity_ratio = update_steer_repetition(
-                    delta_text=steer_chunk_text
+                    delta_text=steer_chunk_text,
+                    prefix_before=steer_length_outcome.assistant_prefix,
+                    prefix_after=continued.assistant_prefix,
                 )
-                repeated_outcome = repeated_block_termination_outcome(
+                repeat = repeated_block_termination(
                     last_exec_similarity_ratio=last_exec_similarity_ratio,
                     last_steer_similarity_ratio=last_steer_similarity_ratio,
                 )
-                if repeated_outcome is not None:
+                if repeat is not None:
+                    close_base = await close_base_for_repeat_async(
+                        repeat=repeat,
+                        base=steer_length_outcome,
+                        continued=continued,
+                    )
+                    repeated_outcome = await continue_after_forced_think_close_async(
+                        repeat=repeat,
+                        close_base=close_base,
+                    )
                     return finalize_outcome(outcome=repeated_outcome)
-                assistant_prefix = continued.assistant_prefix
-                prompt_token_ids = continued.prompt_token_ids
-                token_ids = list(continued.token_ids)
-                token_traces = list(continued.token_traces)
-                generated_tokens = continued.generated_tokens
-                state = replace(
-                    state,
-                    branch_points_used=continued.branch_points_used
-                    or state.branch_points_used,
+                self._append_steer_block_event(
+                    tree=tree,
+                    node_id=state.node_id,
+                    source="length_boundary_nonbranch",
+                    base_prefix=steer_length_outcome.assistant_prefix,
+                    base_token_ids=steer_length_outcome.token_ids,
+                    generated_tokens_before_chunk=steer_length_outcome.generated_tokens,
+                    continued=continued,
                 )
+                adopt_decode_state(outcome=continued)
                 continue
             if choice.finish_reason in {"stop", "eos"}:
                 finished_outcome = replace(
@@ -2504,6 +3547,9 @@ class BranchExecutor:
                 state.branch_points_used
                 if outcome.branch_points_used is None
                 else outcome.branch_points_used
+            ),
+            steer_phase_token_spans=(
+                outcome.steer_phase_token_spans or state.steer_phase_token_spans
             ),
         )
 
@@ -2614,7 +3660,8 @@ class BranchExecutor:
             trigger_type == "steer_boundary"
         ), f"unsupported trigger_type: {trigger_type}"
         canonical_prefix, canonical_prompt_ids = (
-            await self._normalize_steer_prefix_prompt_ids_async(
+            await prepare_steer_generation_prefix_async(
+                executor=self,
                 assistant_prefix=assistant_prefix,
                 prompt_token_ids=prompt_token_ids,
             )
@@ -2625,7 +3672,6 @@ class BranchExecutor:
             max_tokens=candidate_token_budget,
             n=self.branching.num_candidates,
             stop=steer_candidate_stop_markers(text=canonical_prefix),
-            temperature=1.0,
             request_kind="candidate_pool_steer_boundary",
             request_stream_id=(
                 f"candidate_pool:{state.node_id}:{trigger_type}:{candidate_pool_id}"
@@ -2724,10 +3770,33 @@ class BranchExecutor:
             and should_branch_at_trigger(executor=self)
         )
 
-    def _should_use_inline_epsilon(self, *, branching_enabled: bool) -> bool:
+    def _steer_boundary_detection_probability(
+        self, *, branching_enabled: bool, inline_epsilon_enabled: bool
+    ) -> float:
+        """Return the probability for recognizing a generated steer boundary.
+
+        Branch/epsilon probabilities are sampled after the boundary is recognized.
+        Applying them here as well squares the intended action probability for
+        boundaries that are found while consuming tokens instead of by a vLLM
+        stop marker.
+        """
+
+        true_branch_possible = (
+            branching_enabled
+            and self.allow_true_branching
+            and float(self.branching.branch_prob) > 0.0
+        )
+        inline_epsilon_possible = (
+            inline_epsilon_enabled and float(self.branching.epsilon_greedy_prob) > 0.0
+        )
+        if true_branch_possible or inline_epsilon_possible:
+            return 1.0
+        return 0.0
+
+    def _should_use_inline_epsilon(self, *, inline_epsilon_enabled: bool) -> bool:
         """Return whether the current steer trigger should use selector inline mode."""
 
-        if not branching_enabled:
+        if not inline_epsilon_enabled:
             return False
         epsilon_probability = float(self.branching.epsilon_greedy_prob)
         if epsilon_probability <= 0.0:
@@ -2741,7 +3810,7 @@ class BranchExecutor:
             None.
 
         Returns:
-            Token count reserved for `</steer>\n<exec>\n` normalization.
+            Token count reserved for `</steer>\n<exec>` normalization.
         """
 
         if self._steer_normalization_token_budget is None:
@@ -2762,7 +3831,7 @@ class BranchExecutor:
             None.
 
         Returns:
-            Token count reserved for `</steer>\n<exec>\n` normalization.
+            Token count reserved for `</steer>\n<exec>` normalization.
         """
 
         if self._steer_normalization_token_budget is None:
@@ -2818,6 +3887,88 @@ class BranchExecutor:
         ), f"unsupported trigger_type: {trigger_type}"
         return min(self.branching.max_steer_tokens, remaining_tokens)
 
+    def _request_token_budget(
+        self,
+        *,
+        prompt_token_ids: tuple[int, ...] | None,
+        generated_tokens: int,
+    ) -> _RequestTokenBudget:
+        """Return the response/context-safe max token count for one request."""
+
+        remaining_response_tokens = self.decoding.max_gen_toks - generated_tokens
+        if remaining_response_tokens <= 0:
+            return _RequestTokenBudget(
+                max_tokens=0,
+                exhausted_stop_reason="max_gen_toks_reached",
+                context_limited=False,
+            )
+        max_model_len = self.decoding.max_model_len
+        if max_model_len is None or prompt_token_ids is None:
+            return _RequestTokenBudget(
+                max_tokens=remaining_response_tokens,
+                exhausted_stop_reason="max_gen_toks_reached",
+                context_limited=False,
+            )
+        remaining_context_tokens = max_model_len - len(prompt_token_ids)
+        if remaining_context_tokens <= 0:
+            return _RequestTokenBudget(
+                max_tokens=0,
+                exhausted_stop_reason="max_context_length_reached",
+                context_limited=True,
+            )
+        if remaining_context_tokens < remaining_response_tokens:
+            return _RequestTokenBudget(
+                max_tokens=remaining_context_tokens,
+                exhausted_stop_reason="max_context_length_reached",
+                context_limited=True,
+            )
+        return _RequestTokenBudget(
+            max_tokens=remaining_response_tokens,
+            exhausted_stop_reason="max_gen_toks_reached",
+            context_limited=False,
+        )
+
+    def _request_input_token_budget(
+        self,
+        *,
+        input_token_ids: tuple[int, ...],
+        max_tokens: int,
+    ) -> _RequestTokenBudget:
+        """Return the context-safe max token count for exact request input ids."""
+
+        requested_tokens = max(max_tokens, 0)
+        max_model_len = self.decoding.max_model_len
+        if requested_tokens <= 0:
+            return _RequestTokenBudget(
+                max_tokens=0,
+                exhausted_stop_reason="max_gen_toks_reached",
+                context_limited=False,
+            )
+        if max_model_len is None:
+            return _RequestTokenBudget(
+                max_tokens=requested_tokens,
+                exhausted_stop_reason="max_gen_toks_reached",
+                context_limited=False,
+            )
+        remaining_context_tokens = max_model_len - len(input_token_ids)
+        if remaining_context_tokens <= 0:
+            return _RequestTokenBudget(
+                max_tokens=0,
+                exhausted_stop_reason="max_context_length_reached",
+                context_limited=True,
+            )
+        if remaining_context_tokens < requested_tokens:
+            return _RequestTokenBudget(
+                max_tokens=remaining_context_tokens,
+                exhausted_stop_reason="max_context_length_reached",
+                context_limited=True,
+            )
+        return _RequestTokenBudget(
+            max_tokens=requested_tokens,
+            exhausted_stop_reason="max_gen_toks_reached",
+            context_limited=False,
+        )
+
     def _trigger_has_branch_budget(
         self, *, trigger_type: str | None, generated_tokens: int
     ) -> bool:
@@ -2840,6 +3991,80 @@ class BranchExecutor:
                 generated_tokens=generated_tokens,
             )
             > 0
+        )
+
+    @staticmethod
+    def _synthetic_suffix_token_traces(
+        *,
+        text: str,
+        token_ids: tuple[int, ...],
+        start_index: int,
+    ) -> tuple[TokenTrace, ...]:
+        """Build deterministic traces for executor-injected suffix tokens."""
+
+        if not token_ids:
+            return ()
+        return tuple(
+            TokenTrace(
+                token_index=start_index + offset,
+                token_id=token_id,
+                token_text=text if offset == 0 else "",
+                logprob=0.0,
+                probability=1.0,
+            )
+            for offset, token_id in enumerate(token_ids)
+        )
+
+    async def _append_synthetic_suffix_to_decode_state_async(
+        self,
+        *,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+        token_ids: tuple[int, ...],
+        token_traces: tuple[TokenTrace, ...],
+        generated_tokens: int,
+        suffix_text: str,
+        context: str,
+    ) -> tuple[
+        str,
+        tuple[int, ...] | None,
+        tuple[int, ...],
+        tuple[TokenTrace, ...],
+        int,
+        tuple[int, ...],
+    ]:
+        """Append a deterministic executor-injected suffix to path state."""
+
+        if not suffix_text:
+            return (
+                assistant_prefix,
+                prompt_token_ids,
+                token_ids,
+                token_traces,
+                generated_tokens,
+                (),
+            )
+        suffix_token_ids = await self._tokenize_text_async(text=suffix_text)
+        await self._assert_text_token_alignment_async(
+            text=suffix_text,
+            token_ids=tuple(suffix_token_ids),
+            context=context,
+        )
+        suffix_traces = self._synthetic_suffix_token_traces(
+            text=suffix_text,
+            token_ids=tuple(suffix_token_ids),
+            start_index=len(token_traces),
+        )
+        return (
+            assistant_prefix + suffix_text,
+            append_prompt_token_ids(
+                prompt_token_ids=prompt_token_ids,
+                continuation_token_ids=tuple(suffix_token_ids),
+            ),
+            tuple(token_ids) + tuple(suffix_token_ids),
+            tuple(token_traces) + suffix_traces,
+            generated_tokens + len(suffix_token_ids),
+            tuple(suffix_token_ids),
         )
 
     def _normalize_steer_prefix_prompt_ids(
@@ -2898,16 +4123,38 @@ class BranchExecutor:
         assistant_prefix: str,
         prompt_token_ids: tuple[int, ...] | None,
     ) -> tuple[str, tuple[int, ...] | None]:
-        """Append/tokenize excluded `<steer` stop marker before normalization."""
+        """Append/tokenize excluded `</exec` stop marker before normalization."""
 
-        if has_trailing_steer_open_prefix(text=assistant_prefix):
+        stop_prefix = explicit_exec_stop_completion_suffix(text=assistant_prefix)
+        if not stop_prefix:
             return assistant_prefix, prompt_token_ids
-        stop_prefix = "<steer"
         updated_prefix = assistant_prefix + stop_prefix
         if prompt_token_ids is None:
             return updated_prefix, None
         suffix_token_ids = await self._tokenize_text_async(text=stop_prefix)
         await self._assert_text_token_alignment_async(
+            text=stop_prefix,
+            token_ids=tuple(suffix_token_ids),
+            context="explicit_steer_stop_prefix",
+        )
+        return updated_prefix, tuple(prompt_token_ids) + tuple(suffix_token_ids)
+
+    def _append_explicit_steer_stop_prefix(
+        self,
+        *,
+        assistant_prefix: str,
+        prompt_token_ids: tuple[int, ...] | None,
+    ) -> tuple[str, tuple[int, ...] | None]:
+        """Append/tokenize excluded `</exec` stop marker before normalization."""
+
+        stop_prefix = explicit_exec_stop_completion_suffix(text=assistant_prefix)
+        if not stop_prefix:
+            return assistant_prefix, prompt_token_ids
+        updated_prefix = assistant_prefix + stop_prefix
+        if prompt_token_ids is None:
+            return updated_prefix, None
+        suffix_token_ids = self._tokenize_text(text=stop_prefix)
+        self._assert_text_token_alignment(
             text=stop_prefix,
             token_ids=tuple(suffix_token_ids),
             context="explicit_steer_stop_prefix",
@@ -2924,6 +4171,8 @@ class BranchExecutor:
         candidate_text, candidate_token_ids = self._append_think_close_stop_suffix(
             candidate=aligned_candidate
         )
+        if candidate_text and not candidate_token_ids:
+            candidate_token_ids = tuple(self._tokenize_text(text=candidate_text))
         assert_no_text_after_first_steer_close(text=candidate_text)
         injected_suffix, _ = selected_candidate_normalization_suffix(
             text=candidate_text
@@ -2961,6 +4210,10 @@ class BranchExecutor:
                 candidate=aligned_candidate
             )
         )
+        if candidate_text and not candidate_token_ids:
+            candidate_token_ids = tuple(
+                await self._tokenize_text_async(text=candidate_text)
+            )
         assert_no_text_after_first_steer_close(text=candidate_text)
         injected_suffix, _ = selected_candidate_normalization_suffix(
             text=candidate_text
@@ -3248,8 +4501,17 @@ class BranchExecutor:
         )
 
     def _next_seed(self) -> int:
+        """Return the next request seed from the executor RNG.
+
+        Args:
+            None.
+
+        Returns:
+            Non-negative 31-bit seed for one vLLM request.
+        """
+
         self.request_counter += 1
-        return 10_000_000 + self.request_counter
+        return self.random.randrange(0, 2**31)
 
     @staticmethod
     def _state_delta(
@@ -3466,9 +4728,15 @@ class BranchExecutor:
             assistant_prefix=assistant_prefix,
         )
         sample_temperature = (
-            self.decoding.temperature if temperature is None else float(temperature)
+            self.decoding.request_temperature(request_kind=request_kind)
+            if temperature is None
+            else float(temperature)
         )
+        sample_top_p = self.decoding.request_top_p(request_kind=request_kind)
         repetition_penalty = self._request_repetition_penalty(request_kind=request_kind)
+        top_k = self.decoding.top_k
+        min_p = self.decoding.min_p
+        presence_penalty = self.decoding.presence_penalty
         generation_seed = self._next_seed()
         stream_id = (
             request_stream_id
@@ -3504,7 +4772,10 @@ class BranchExecutor:
                     prompt=None,
                     prompt_token_ids=effective_prompt_token_ids,
                     temperature=sample_temperature,
-                    top_p=self.decoding.top_p,
+                    top_p=sample_top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    presence_penalty=presence_penalty,
                     max_tokens=max_tokens,
                     n=n,
                     seed=generation_seed,
@@ -3533,7 +4804,10 @@ class BranchExecutor:
             prompt=prompt_text,
             prompt_token_ids=None,
             temperature=sample_temperature,
-            top_p=self.decoding.top_p,
+            top_p=sample_top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
             max_tokens=max_tokens,
             n=n,
             seed=generation_seed,
@@ -3556,6 +4830,9 @@ class BranchExecutor:
         prompt_token_ids: tuple[int, ...] | None,
         temperature: float,
         top_p: float,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        presence_penalty: float | None = None,
         max_tokens: int,
         n: int,
         seed: int,
@@ -3577,6 +4854,11 @@ class BranchExecutor:
             prompt=prompt,
             prompt_token_ids=prompt_token_ids,
         )
+        request_budget = self._request_input_token_budget(
+            input_token_ids=input_token_ids,
+            max_tokens=max_tokens,
+        )
+        max_tokens = request_budget.max_tokens
         base_prefix_ids, delta_ids, prev_request_id = self._resolve_prefix_base_delta(
             request_stream_id=request_stream_id,
             current_input_token_ids=input_token_ids,
@@ -3590,6 +4872,9 @@ class BranchExecutor:
             assistant_prefix=assistant_prefix,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
             max_tokens=max_tokens,
             n=n,
             seed=seed,
@@ -3607,26 +4892,88 @@ class BranchExecutor:
             repetition_penalty=repetition_penalty,
         )
         start_time = asyncio.get_running_loop().time()
+        retry_as_split_batch = False
+        choices: tuple[GenerationChoice, ...] = ()
+        session_key = self._session_key_for_request_stream(
+            request_stream_id=request_stream_id
+        )
+        self._runtime_session_keys.add(session_key)
+        if max_tokens <= 0:
+            choices = tuple(
+                GenerationChoice(
+                    index=index,
+                    text="",
+                    finish_reason="length",
+                    stop_reason=request_budget.exhausted_stop_reason,
+                    tokens=(),
+                    prompt_token_ids=input_token_ids,
+                    token_ids=(),
+                )
+                for index in range(n)
+            )
+            self._append_vllm_response_event(
+                request_id=request_id,
+                request_stream_id=request_stream_id,
+                request_kind=request_kind,
+                latency_seconds=0.0,
+                choices=choices,
+            )
+            return choices
         async with semaphore:
             try:
-                choices = await completions_async(
-                    model=model,
-                    prompt=prompt,
-                    prompt_token_ids=prompt_token_ids,
-                    resolved_prompt_token_ids=input_token_ids,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_tokens=max_tokens,
-                    n=n,
-                    seed=seed,
-                    stop=stop,
-                    top_logprobs=top_logprobs,
-                    priority=(
+                completion_kwargs: dict[str, Any] = {
+                    "model": model,
+                    "prompt": prompt,
+                    "prompt_token_ids": prompt_token_ids,
+                    "resolved_prompt_token_ids": input_token_ids,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "max_tokens": max_tokens,
+                    "n": n,
+                    "seed": seed,
+                    "stop": stop,
+                    "top_logprobs": top_logprobs,
+                    "priority": (
                         request_priority.value if request_priority is not None else None
                     ),
-                    repetition_penalty=repetition_penalty,
-                    parse_response_prompt_token_ids=False,
+                    "repetition_penalty": repetition_penalty,
+                    "parse_response_prompt_token_ids": False,
+                }
+                if top_k is not None:
+                    completion_kwargs["top_k"] = top_k
+                if min_p is not None:
+                    completion_kwargs["min_p"] = min_p
+                if presence_penalty is not None:
+                    completion_kwargs["presence_penalty"] = presence_penalty
+                if getattr(self.client, "supports_async_session_keys", False):
+                    completion_kwargs["session_key"] = session_key
+                if self._should_disable_request_timeout(request_kind=request_kind):
+                    completion_kwargs["disable_request_timeout"] = True
+                choices = await completions_async(
+                    **completion_kwargs,
                 )
+                if len(choices) != n:
+                    raise VllmRequestError(
+                        f"incomplete choices: expected {n}, got {len(choices)}"
+                    )
+                choices = tuple(
+                    truncate_choice_at_chat_eos(choice=choice) for choice in choices
+                )
+            except VllmRequestError as exc:
+                latency_seconds = asyncio.get_running_loop().time() - start_time
+                self._append_vllm_response_error_event(
+                    request_id=request_id,
+                    request_stream_id=request_stream_id,
+                    request_kind=request_kind,
+                    error_message=str(exc),
+                    latency_seconds=latency_seconds,
+                )
+                await self._recreate_client_for_session_key(session_key=session_key)
+                if n > 1 and is_retryable_vllm_request_error(error=exc):
+                    retry_as_split_batch = True
+                    choices = ()
+                else:
+                    raise
             except Exception as exc:
                 latency_seconds = asyncio.get_running_loop().time() - start_time
                 self._append_vllm_response_error_event(
@@ -3636,7 +4983,31 @@ class BranchExecutor:
                     error_message=str(exc),
                     latency_seconds=latency_seconds,
                 )
+                await self._recreate_client_for_session_key(session_key=session_key)
                 raise
+        if retry_as_split_batch:
+            return await self._request_split_completion_batch(
+                completions_async=completions_async,
+                model=model,
+                prompt=prompt,
+                prompt_token_ids=prompt_token_ids,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                presence_penalty=presence_penalty,
+                max_tokens=max_tokens,
+                n=n,
+                seed=seed,
+                stop=stop,
+                top_logprobs=top_logprobs,
+                assistant_prefix=assistant_prefix,
+                request_kind=request_kind,
+                request_stream_id=request_stream_id,
+                prefix_chain_enabled=prefix_chain_enabled,
+                request_priority=request_priority,
+                repetition_penalty=repetition_penalty,
+            )
         latency_seconds = asyncio.get_running_loop().time() - start_time
         self._append_vllm_response_event(
             request_id=request_id,
@@ -3653,6 +5024,103 @@ class BranchExecutor:
                 output_token_ids=output_token_ids,
             )
         return choices
+
+    def _should_disable_request_timeout(self, *, request_kind: str) -> bool:
+        """Return whether one generation request should bypass HTTP timeout."""
+
+        return request_kind in BASELINE_REQUEST_KINDS and isinstance(
+            self.client, VllmClient
+        )
+
+    async def _request_split_completion_batch(
+        self,
+        *,
+        completions_async: Callable[..., Awaitable[tuple[GenerationChoice, ...]]],
+        model: str,
+        prompt: str | None,
+        prompt_token_ids: tuple[int, ...] | None,
+        temperature: float,
+        top_p: float,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        presence_penalty: float | None = None,
+        max_tokens: int,
+        n: int,
+        seed: int,
+        stop: tuple[str, ...] | None,
+        top_logprobs: int,
+        assistant_prefix: str,
+        request_kind: str,
+        request_stream_id: str,
+        prefix_chain_enabled: bool,
+        request_priority: _RequestPriority | None,
+        repetition_penalty: float | None,
+    ) -> tuple[GenerationChoice, ...]:
+        """Retry one failed batched request as smaller completion batches.
+
+        Args:
+            completions_async: Async completion callable.
+            model: Served model name.
+            prompt: Text prompt when not using token IDs.
+            prompt_token_ids: Token prompt when available.
+            temperature: Sampling temperature.
+            top_p: Nucleus sampling setting.
+            top_k: Optional top-k sampling setting.
+            min_p: Optional min-p sampling setting.
+            presence_penalty: Optional presence penalty.
+            max_tokens: Maximum generated tokens.
+            n: Number of completions requested by the failed batch.
+            seed: Base sampling seed.
+            stop: Optional stop markers.
+            top_logprobs: Number of alternate logprobs to request.
+            assistant_prefix: Assistant prefix used for event logging.
+            request_kind: Event request kind.
+            request_stream_id: Stable logical request stream id.
+            prefix_chain_enabled: Whether token-prefix chaining is active.
+            request_priority: Optional vLLM priority.
+            repetition_penalty: Optional repetition penalty.
+
+        Returns:
+            Choices from smaller retry batches, re-indexed to the original batch.
+
+        Example:
+            A failed `n=10` request is retried as `n=5` and `n=5`.
+        """
+
+        assert n > 1, "split retry requires a batched request"
+        first_count = n // 2
+        batch_sizes = (first_count, n - first_count)
+        collected: list[GenerationChoice] = []
+        choice_offset = 0
+        for batch_size in batch_sizes:
+            batch_choices = await self._request_completions_with_limit(
+                completions_async=completions_async,
+                model=model,
+                prompt=prompt,
+                prompt_token_ids=prompt_token_ids,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
+                presence_penalty=presence_penalty,
+                max_tokens=max_tokens,
+                n=batch_size,
+                seed=(seed + choice_offset) % (2**31),
+                stop=stop,
+                top_logprobs=top_logprobs,
+                assistant_prefix=assistant_prefix,
+                request_kind=request_kind,
+                request_stream_id=request_stream_id,
+                prefix_chain_enabled=prefix_chain_enabled,
+                request_priority=request_priority,
+                repetition_penalty=repetition_penalty,
+            )
+            collected.extend(
+                replace(choice, index=choice_offset + choice.index)
+                for choice in batch_choices
+            )
+            choice_offset += batch_size
+        return tuple(collected)
 
     async def _resolve_input_token_ids_async(
         self,
@@ -3675,6 +5143,51 @@ class BranchExecutor:
         self._candidate_pool_counter += 1
         return f"pool_{self._candidate_pool_counter:08d}"
 
+    def _session_key_for_request_stream(self, *, request_stream_id: str) -> str:
+        """Return branch-scoped vLLM HTTP session key for one request stream.
+
+        Args:
+            request_stream_id: Logical stream id such as `decode:<node_id>`.
+
+        Returns:
+            Stable branch key shared by decode and candidate-pool calls.
+
+        Example:
+            `candidate_pool:node_a:steer_boundary:pool_1` maps to
+            `doc:7:attempt:0:branch:node_a` when doc context is set.
+        """
+
+        context = self._event_context
+        scope_prefix = ""
+        if context is not None and context.doc_id is not None:
+            doc_attempt = 0 if context.doc_attempt is None else context.doc_attempt
+            scope_prefix = f"doc:{context.doc_id}:attempt:{doc_attempt}:"
+        node_id = self._node_id_from_request_stream_id(
+            request_stream_id=request_stream_id
+        )
+        if node_id is not None:
+            return f"{scope_prefix}branch:{node_id}"
+        return f"{scope_prefix}stream:{request_stream_id}"
+
+    async def _recreate_client_for_session_key(self, *, session_key: str) -> None:
+        """Recreate a branch-scoped async vLLM client/session after an error.
+
+        Args:
+            session_key: Branch-scoped HTTP session key.
+
+        Returns:
+            None.
+        """
+
+        recreate_async_session = getattr(self.client, "recreate_async_session", None)
+        if not callable(recreate_async_session):
+            return
+        recreate = cast(
+            Callable[..., Awaitable[None]],
+            recreate_async_session,
+        )
+        await recreate(session_key=session_key)
+
     def _resolve_request_priority(
         self, *, request_stream_id: str
     ) -> _RequestPriority | None:
@@ -3695,19 +5208,19 @@ class BranchExecutor:
         return _RequestPriority(value=priority_value, branch_number=branch_number)
 
     def _request_repetition_penalty(self, *, request_kind: str) -> float | None:
-        """Resolve optional repetition penalty for steer-token generation.
+        """Resolve optional repetition penalty for one request kind.
 
         Args:
             request_kind: Request kind label for the outbound vLLM call.
 
         Returns:
             Configured steer repetition penalty for steer-token request kinds,
-            otherwise `None`.
+            otherwise the shared decoding repetition penalty.
         """
 
         if request_kind in STEER_REPETITION_REQUEST_KINDS:
             return self.branching.steer_repetition_penalty
-        return None
+        return self.decoding.repetition_penalty
 
     def _priority_value_for_branch_path(self, *, branch_path: tuple[int, ...]) -> int:
         """Encode one dotted branch path as sortable integer priority."""
@@ -3838,6 +5351,9 @@ class BranchExecutor:
         assistant_prefix: str,
         temperature: float,
         top_p: float,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        presence_penalty: float | None = None,
         max_tokens: int,
         n: int,
         seed: int,
@@ -3861,6 +5377,9 @@ class BranchExecutor:
                 "request_kind": request_kind,
                 "temperature": temperature,
                 "top_p": top_p,
+                "top_k": top_k,
+                "min_p": min_p,
+                "presence_penalty": presence_penalty,
                 "max_tokens": max_tokens,
                 "n": n,
                 "seed": seed,
@@ -3874,6 +5393,9 @@ class BranchExecutor:
                 "delta_token_count": len(delta_input_token_ids),
                 "delta_input_token_ids": list(delta_input_token_ids),
                 "assistant_prefix_char_count": len(assistant_prefix),
+                "assistant_prefix_tail": assistant_prefix[
+                    -ASSISTANT_PREFIX_TAIL_CHARS:
+                ],
             },
         )
 
@@ -3941,9 +5463,6 @@ class BranchExecutor:
                     "token_id": token_id,
                     "token_text": parsed_token.token,
                     "selected_logprob": parsed_token.logprob,
-                    "selected_probability": probability_from_logprob(
-                        logprob=parsed_token.logprob
-                    ),
                 }
             )
         return {
@@ -4217,6 +5736,16 @@ class BranchExecutor:
     async def _close_runtime_http_sessions_async(self) -> None:
         """Close reusable async HTTP sessions owned by the runtime clients."""
 
+        if not self.close_runtime_clients_on_finish:
+            close_session_key = getattr(self.client, "recreate_async_session", None)
+            if callable(close_session_key):
+                for session_key in tuple(self._runtime_session_keys):
+                    await cast(
+                        Callable[..., Awaitable[None]],
+                        close_session_key,
+                    )(session_key=session_key)
+            self._runtime_session_keys.clear()
+            return
         close_client = getattr(self.client, "close_async", None)
         if callable(close_client):
             await cast(Callable[[], Awaitable[None]], close_client)()

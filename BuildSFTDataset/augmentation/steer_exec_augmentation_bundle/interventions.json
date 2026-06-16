@@ -35,6 +35,7 @@
     "sample_cut_points_at_pair_boundaries_only": true,
     "style_window_pairs": 2,
     "exec_token_limit": 512,
+    "steer_token_limit": 15,
     "bridge_default_policy": "judge_whether_the_next_original_steer_still_fits",
     "first_new_steer_should_match_variant_exactly": true
   },
@@ -1476,6 +1477,254 @@
         "redirect": 0.7
       },
       "suffix_handling_hint": "regen_from_augmented_prefix"
+    },
+    {
+      "name": "Enumerate Diverse Options",
+      "category": "verbalized_sampling",
+      "variants": [
+        "list two solution paths before choosing",
+        "generate five approaches and select one",
+        "explore varied options before deciding"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This asks the trace to sample multiple candidate routes before committing to one.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.6,
+        "redirect": 0.4
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Compare Alternatives Explicitly",
+      "category": "verbalized_sampling",
+      "variants": [
+        "compare six alternatives and explain differences",
+        "list seven options and contrast their pros",
+        "evaluate alternatives before selecting one"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This makes the trace state differences among sampled options instead of picking implicitly.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.65,
+        "redirect": 0.35
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Select Path with Justification",
+      "category": "verbalized_sampling",
+      "variants": [
+        "choose one of eight paths and justify",
+        "pick one of nine approaches and explain",
+        "decide on one option with reasons"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 1
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This forces the sampled choice to be verbalized with a reason.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.7,
+        "redirect": 0.3
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "List Alternatives Then Narrow",
+      "category": "verbalized_sampling",
+      "variants": [
+        "list ten alternatives then narrow down",
+        "generate two options and filter to one",
+        "enumerate choices before selecting one"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This encourages broad candidate generation followed by an explicit narrowing step.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.6,
+        "redirect": 0.4
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Seek Diversity in Candidates",
+      "category": "verbalized_sampling",
+      "variants": [
+        "seek five diverse candidate solutions",
+        "generate six varied options avoiding duplicates",
+        "propose distinct approaches before choosing"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This directly rewards non-redundant sampled candidates before selecting a path.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.55,
+        "redirect": 0.45
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Explain Sampling for Solutions",
+      "category": "verbalized_sampling",
+      "variants": [
+        "verbalize how you sample seven paths",
+        "describe sampling eight options",
+        "explain method for generating candidates"
+      ],
+      "preferred_slots": [
+        "early",
+        "mid"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 1
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This makes the trace expose how it is sampling candidate solution paths.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.65,
+        "redirect": 0.35
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Contrast Options With Reasons",
+      "category": "verbalized_sampling",
+      "variants": [
+        "compare nine options then choose one",
+        "contrast ten choices then select one",
+        "weigh alternatives and choose one"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This makes sampled options comparable through contrasts before one is selected.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.65,
+        "redirect": 0.35
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
+    },
+    {
+      "name": "Iterate Sampling and Choice",
+      "category": "verbalized_sampling",
+      "variants": [
+        "sample three options and refine choice",
+        "sample four options and select one",
+        "cycle through candidates before deciding"
+      ],
+      "preferred_slots": [
+        "mid",
+        "late"
+      ],
+      "pairs_to_generate": {
+        "min": 1,
+        "max": 2,
+        "default": 2
+      },
+      "recommended_editor_mode": "bridge",
+      "allowed_editor_modes": [
+        "bridge",
+        "redirect"
+      ],
+      "post_splice_policy": "keep_if_next_steer_still_fits_else_regenerate",
+      "why": "This encourages repeated candidate sampling before settling on a robust choice.",
+      "mode_weight_hint": {
+        "insert": 0.0,
+        "bridge": 0.55,
+        "redirect": 0.45
+      },
+      "suffix_handling_hint": "run_bridge_judge_then_keep_or_regen"
     }
   ]
 }

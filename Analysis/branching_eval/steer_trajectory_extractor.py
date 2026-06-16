@@ -8,8 +8,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from branching_eval.event_db import EventDatabase
+
 STEER_REQUEST_KIND = "steer_single_candidate"
-TREE_EVENTS_FILENAME = "tree_events.jsonl"
+TREE_EVENTS_DB_FILENAME = "tree_events.sqlite"
 JsonDict = dict[str, Any]
 
 
@@ -113,7 +115,7 @@ class TrajectoryExtraction:
     """Extracted steer rows for one successful trajectory.
 
     Args:
-        tree_events_path: Input event file path.
+        tree_events_path: Input event DB path.
         selected_leaf: Successful leaf that anchors the trajectory.
         path_nodes: Node ancestry from root to terminal success node.
         steer_rows: Raw request/response rows on the successful path.
@@ -125,7 +127,7 @@ class TrajectoryExtraction:
 
     Example:
         >>> extraction = TrajectoryExtraction(
-        ...     tree_events_path=Path("/tmp/tree_events.jsonl"),
+        ...     tree_events_path=Path("/tmp/tree_events.sqlite"),
         ...     selected_leaf=SuccessfulLeaf(
         ...         leaf_id="leaf_1",
         ...         terminal_node=NodeKey(doc_id=0, doc_attempt=0, node_id="node_a"),
@@ -191,14 +193,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Extract raw steer_single_candidate rows for one successful "
-            "trajectory from tree_events.jsonl files."
+            "trajectory from tree_events.sqlite files."
         )
     )
     parser.add_argument(
         "--input-path",
         type=Path,
         required=True,
-        help="Tree-events file or directory containing tree_events.jsonl files.",
+        help="Tree-events DB/file or directory containing tree event stores.",
     )
     parser.add_argument(
         "--output-dir",
@@ -210,7 +212,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def iter_tree_event_paths(*, input_path: Path) -> tuple[Path, ...]:
-    """Return ordered tree-event files beneath the given input path.
+    """Return ordered tree-event SQLite DBs beneath the given input path.
 
     Args:
         input_path: Either one tree-events file or a directory tree.
@@ -225,11 +227,11 @@ def iter_tree_event_paths(*, input_path: Path) -> tuple[Path, ...]:
 
     if input_path.is_file():
         assert (
-            input_path.name == TREE_EVENTS_FILENAME
-        ), "input file must be tree_events.jsonl"
+            input_path.name == TREE_EVENTS_DB_FILENAME
+        ), "input file must be tree_events.sqlite"
         return (input_path,)
     assert input_path.is_dir(), f"input path does not exist: {input_path}"
-    return tuple(sorted(input_path.rglob(TREE_EVENTS_FILENAME)))
+    return tuple(sorted(input_path.rglob(TREE_EVENTS_DB_FILENAME)))
 
 
 def success_source_rank(*, event_type: str) -> int:
@@ -242,30 +244,18 @@ def success_source_rank(*, event_type: str) -> int:
     raise AssertionError(f"unsupported success event type: {event_type}")
 
 
-def parse_json_row(*, line: str) -> JsonDict:
-    """Parse one canonical JSONL row into a mapping."""
-
-    row = json.loads(line)
-    assert isinstance(row, dict), "tree-event rows must decode to mappings"
-    return row
-
-
 def iter_json_rows(*, path: Path) -> Iterable[JsonDict]:
-    """Yield parsed rows from one tree-events file.
+    """Yield parsed rows from one tree-events source.
 
     Args:
-        path: Canonical tree-events file path.
+        path: Canonical tree-events SQLite DB path.
 
     Returns:
         Iterator of parsed JSON row mappings.
     """
 
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line_text = line.strip()
-            if not line_text:
-                continue
-            yield parse_json_row(line=line_text)
+    assert path.name == TREE_EVENTS_DB_FILENAME, "expected tree_events.sqlite"
+    yield from EventDatabase(path=path).read_event_rows()
 
 
 def node_key_from_row(*, row: JsonDict, node_id: str) -> NodeKey:
@@ -479,16 +469,16 @@ def summarize_response_rows(
 
 
 def extract_successful_trajectory(*, path: Path) -> TrajectoryExtraction | None:
-    """Extract one successful steer trajectory from one tree-events file.
+    """Extract one successful steer trajectory from one tree-events DB.
 
     Args:
-        path: Canonical tree-events file path.
+        path: Canonical tree-events SQLite DB path.
 
     Returns:
         Extracted trajectory or `None` when no successful leaf exists.
 
     Example:
-        >>> extract_successful_trajectory(path=Path('/tmp/missing-tree-events.jsonl'))
+        >>> extract_successful_trajectory(path=Path('/tmp/missing-tree-events.sqlite'))
         Traceback (most recent call last):
         ...
         FileNotFoundError: ...

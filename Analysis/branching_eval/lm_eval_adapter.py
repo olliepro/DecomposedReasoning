@@ -19,6 +19,8 @@ class DocRecord:
         doc_id: Sequential document id.
         doc_payload: Raw task document payload.
         prompt_text: Prompt string from `task.doc_to_text`.
+        golden_answer: Raw task target answer shown in the viewer.
+        golden_answer_source: Source field/method used to resolve `golden_answer`.
 
     Returns:
         Dataclass containing one evaluation document.
@@ -27,6 +29,8 @@ class DocRecord:
     doc_id: int
     doc_payload: dict[str, Any]
     prompt_text: str
+    golden_answer: str = ""
+    golden_answer_source: str = ""
 
 
 class LmEvalAdapter:
@@ -63,7 +67,8 @@ class LmEvalAdapter:
             DocRecord(
                 doc_id=doc_id,
                 doc_payload=doc_payload,
-                prompt_text=str(self._task.doc_to_text(doc_payload)),
+                prompt_text=self._prompt_text(doc=doc_payload),
+                **self._golden_answer_fields(doc=doc_payload),
             )
             for doc_id, doc_payload in enumerate(docs)
         ]
@@ -190,6 +195,40 @@ class LmEvalAdapter:
         docs = self._task.validation_docs() or self._task.test_docs()
         assert docs is not None, f"No docs available for task: {self.task_name}"
         return [dict(doc) for doc in docs]
+
+    def _prompt_text(self, *, doc: dict[str, Any]) -> str:
+        prompt_text = str(self._task.doc_to_text(doc))
+        if self.task_name in {"aime24", "aime25"}:
+            return _with_boxed_answer_instruction(prompt_text=prompt_text)
+        return prompt_text
+
+    def _golden_answer_fields(self, *, doc: dict[str, Any]) -> dict[str, str]:
+        target = getattr(self._task, "doc_to_target", None)
+        if callable(target):
+            value = target(doc)
+            if value is not None:
+                return {
+                    "golden_answer": str(value),
+                    "golden_answer_source": "doc_to_target",
+                }
+        for key in ("Answer", "answer", "target", "gold", "gold_answer", "label"):
+            if key in doc and doc[key] is not None:
+                return {
+                    "golden_answer": str(doc[key]),
+                    "golden_answer_source": key,
+                }
+        return {"golden_answer": "", "golden_answer_source": ""}
+
+
+def _with_boxed_answer_instruction(*, prompt_text: str) -> str:
+    instruction = (
+        "When you give the final answer, write it in LaTeX boxed form as "
+        "\\boxed{...}."
+    )
+    stripped = prompt_text.rstrip()
+    if instruction in stripped:
+        return prompt_text
+    return f"{stripped}\n\n{instruction}"
 
 
 def _fallback_binary_score(*, metrics: dict[str, Any]) -> int:

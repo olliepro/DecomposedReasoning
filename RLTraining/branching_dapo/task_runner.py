@@ -54,7 +54,7 @@ class BranchingTaskRunner(TaskRunner):
         )
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
         train_dataset = create_rl_dataset(

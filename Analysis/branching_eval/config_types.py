@@ -216,8 +216,19 @@ class DecodingConfig:
 
     Args:
         temperature: Sampling temperature.
+        steer_temperature: Optional sampling temperature for generated steer
+            continuations. When absent, steer requests use `temperature`.
+        initial_assistant_prefix: Optional assistant text prefilled before
+            generation starts, for models that expect an opening control tag.
         top_p: Nucleus sampling cutoff.
+        steer_top_p: Optional nucleus sampling cutoff for generated steer
+            continuations. When absent, steer requests use `top_p`.
+        top_k: Optional top-k sampling cutoff.
+        min_p: Optional min-p sampling cutoff.
+        presence_penalty: Optional OpenAI/vLLM presence penalty.
+        repetition_penalty: Optional repetition penalty for decode requests.
         max_gen_toks: Max completion token budget per rollout.
+        max_model_len: Optional vLLM context window for token-id requests.
         top_logprobs: Requested top-logprob alternatives.
         decode_chunk_tokens: Tokens per decode chunk before event re-check.
         debug_assert_text_token_alignment: Enables expensive tokenizer/text
@@ -228,11 +239,60 @@ class DecodingConfig:
     """
 
     temperature: float = 0.6
+    steer_temperature: float | None = None
+    initial_assistant_prefix: str = ""
     top_p: float = 0.95
+    steer_top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
     max_gen_toks: int = 16384
+    max_model_len: int | None = None
     top_logprobs: int = 20
     decode_chunk_tokens: int = 512
     debug_assert_text_token_alignment: bool = False
+
+    def request_temperature(self, *, request_kind: str) -> float:
+        """Resolve the sampling temperature for one vLLM request kind.
+
+        Args:
+            request_kind: Runtime request label such as `decode_chunk` or
+                `steer_single_candidate`.
+
+        Returns:
+            Temperature to pass to vLLM for this request.
+
+        Example:
+            >>> cfg = DecodingConfig(temperature=0.3, steer_temperature=0.8)
+            >>> cfg.request_temperature(request_kind="steer_single_candidate")
+            0.8
+        """
+
+        if request_kind == "candidate_pool_steer_boundary":
+            if self.steer_temperature is not None:
+                return self.steer_temperature
+            return 1.0
+        if request_kind == "steer_single_candidate":
+            if self.steer_temperature is not None:
+                return self.steer_temperature
+        return self.temperature
+
+    def request_top_p(self, *, request_kind: str) -> float:
+        """Resolve nucleus sampling cutoff for one vLLM request kind.
+
+        Args:
+            request_kind: Runtime request label such as `decode_chunk` or
+                `steer_single_candidate`.
+
+        Returns:
+            Top-p value to pass to vLLM for this request.
+        """
+
+        if request_kind in {"candidate_pool_steer_boundary", "steer_single_candidate"}:
+            if self.steer_top_p is not None:
+                return self.steer_top_p
+        return self.top_p
 
 
 @dataclass(frozen=True)
@@ -381,8 +441,28 @@ class BranchingEvalConfig:
             "lmcache",
         }, "serve.kv_offloading_backend must be one of {native, lmcache}"
         assert 0.0 <= self.decoding.temperature, "temperature must be >= 0"
+        assert (
+            self.decoding.steer_temperature is None
+            or self.decoding.steer_temperature >= 0.0
+        ), "steer_temperature must be >= 0 when provided"
         assert 0.0 < self.decoding.top_p <= 1.0, "top_p must be in (0, 1]"
+        assert (
+            self.decoding.steer_top_p is None or 0.0 < self.decoding.steer_top_p <= 1.0
+        ), "steer_top_p must be in (0, 1] when provided"
+        assert (
+            self.decoding.top_k is None or self.decoding.top_k >= 0
+        ), "top_k must be >= 0 when provided"
+        assert (
+            self.decoding.min_p is None or 0.0 <= self.decoding.min_p <= 1.0
+        ), "min_p must be in [0, 1] when provided"
+        assert (
+            self.decoding.repetition_penalty is None
+            or self.decoding.repetition_penalty > 0.0
+        ), "repetition_penalty must be > 0 when provided"
         assert self.decoding.max_gen_toks >= 1, "max_gen_toks must be >= 1"
+        assert (
+            self.decoding.max_model_len is None or self.decoding.max_model_len >= 1
+        ), "max_model_len must be >= 1 when provided"
         assert (
             self.decoding.decode_chunk_tokens >= 1
         ), "decode_chunk_tokens must be >= 1"
@@ -553,8 +633,24 @@ def _parse_decoding(*, payload: dict[str, Any]) -> DecodingConfig:
         return DecodingConfig()
     return DecodingConfig(
         temperature=float(decoding_payload.get("temperature", 0.6)),
+        steer_temperature=_optional_float(
+            value=decoding_payload.get("steer_temperature")
+        ),
+        initial_assistant_prefix=str(
+            decoding_payload.get("initial_assistant_prefix", "")
+        ),
         top_p=float(decoding_payload.get("top_p", 0.95)),
+        steer_top_p=_optional_float(value=decoding_payload.get("steer_top_p")),
+        top_k=_optional_int(value=decoding_payload.get("top_k")),
+        min_p=_optional_float(value=decoding_payload.get("min_p")),
+        presence_penalty=_optional_float(
+            value=decoding_payload.get("presence_penalty")
+        ),
+        repetition_penalty=_optional_float(
+            value=decoding_payload.get("repetition_penalty")
+        ),
         max_gen_toks=int(decoding_payload.get("max_gen_toks", 16384)),
+        max_model_len=_optional_int(value=decoding_payload.get("max_model_len")),
         top_logprobs=int(decoding_payload.get("top_logprobs", 20)),
         decode_chunk_tokens=int(decoding_payload.get("decode_chunk_tokens", 512)),
         debug_assert_text_token_alignment=bool(

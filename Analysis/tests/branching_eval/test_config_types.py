@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from branching_eval.config_types import load_branching_eval_config
+from branching_eval.config_types import DecodingConfig, load_branching_eval_config
 
 
 def test_config_defaults_parse_from_minimal_payload(tmp_path: Path) -> None:
@@ -22,7 +22,13 @@ def test_config_defaults_parse_from_minimal_payload(tmp_path: Path) -> None:
     config = load_branching_eval_config(config_path=config_path)
     assert config.tasks.task_names == ("aime24",)
     assert config.decoding.temperature == 0.6
+    assert config.decoding.steer_temperature is None
+    assert config.decoding.steer_top_p is None
     assert config.decoding.decode_chunk_tokens == 512
+    assert config.decoding.top_k is None
+    assert config.decoding.min_p is None
+    assert config.decoding.presence_penalty is None
+    assert config.decoding.repetition_penalty is None
     assert config.decoding.debug_assert_text_token_alignment is False
     assert config.branching.num_candidates == 100
     assert config.branching.steer_repetition_penalty == 1.01
@@ -33,6 +39,41 @@ def test_config_defaults_parse_from_minimal_payload(tmp_path: Path) -> None:
     assert config.serve.request_timeout_seconds == 600.0
     assert config.run_matrix.include_structured_baselines is False
     assert config.run_matrix.include_epsilon_greedy is False
+
+
+def test_decoding_sampling_params_parse(tmp_path: Path) -> None:
+    """Thinking-mode sampling params should parse into DecodingConfig."""
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "models": [
+                    {"model_id": "non_sft", "checkpoint_or_repo": "Qwen/Qwen3-8B"}
+                ],
+                "decoding": {
+                    "temperature": 1.0,
+                    "top_p": 0.95,
+                    "top_k": 20,
+                    "min_p": 0.0,
+                    "presence_penalty": 1.5,
+                    "repetition_penalty": 1.0,
+                    "max_model_len": 33792,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = load_branching_eval_config(config_path=config_path)
+    assert config.decoding == DecodingConfig(
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        min_p=0.0,
+        presence_penalty=1.5,
+        repetition_penalty=1.0,
+        max_model_len=33792,
+    )
 
 
 def test_output_paths_resolve_relative_to_config(tmp_path: Path) -> None:
@@ -209,3 +250,77 @@ def test_debug_alignment_flag_parses_from_decoding_block(tmp_path: Path) -> None
     )
     config = load_branching_eval_config(config_path=config_path)
     assert config.decoding.debug_assert_text_token_alignment is True
+
+
+def test_steer_sampling_parses_and_resolves_by_request_kind(tmp_path: Path) -> None:
+    """Steer sampling overrides should affect only steer-generation requests."""
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "models": [{"model_id": "sft", "checkpoint_or_repo": "Qwen/Qwen3-8B"}],
+                "decoding": {
+                    "temperature": 0.3,
+                    "steer_temperature": 0.8,
+                    "top_p": 0.91,
+                    "steer_top_p": 0.77,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_branching_eval_config(config_path=config_path)
+
+    assert config.decoding.temperature == 0.3
+    assert config.decoding.steer_temperature == 0.8
+    assert config.decoding.top_p == 0.91
+    assert config.decoding.steer_top_p == 0.77
+    assert config.decoding.request_temperature(request_kind="decode_chunk") == 0.3
+    assert config.decoding.request_top_p(request_kind="decode_chunk") == 0.91
+    assert (
+        config.decoding.request_temperature(request_kind="steer_single_candidate")
+        == 0.8
+    )
+    assert config.decoding.request_top_p(request_kind="steer_single_candidate") == 0.77
+    assert (
+        config.decoding.request_temperature(
+            request_kind="candidate_pool_steer_boundary"
+        )
+        == 0.8
+    )
+    assert (
+        config.decoding.request_top_p(request_kind="candidate_pool_steer_boundary")
+        == 0.77
+    )
+
+
+def test_initial_assistant_prefix_parses_from_decoding_block(tmp_path: Path) -> None:
+    """Initial assistant prefix should parse from YAML decoding config."""
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "models": [{"model_id": "sft", "checkpoint_or_repo": "Qwen/Qwen3-8B"}],
+                "decoding": {"initial_assistant_prefix": "<think>\n<steer>"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_branching_eval_config(config_path=config_path)
+
+    assert config.decoding.initial_assistant_prefix == "<think>\n<steer>"
+
+
+def test_candidate_pool_temperature_keeps_previous_default() -> None:
+    """Candidate-pool sampling should stay at 1.0 unless explicitly overridden."""
+
+    assert (
+        DecodingConfig().request_temperature(
+            request_kind="candidate_pool_steer_boundary"
+        )
+        == 1.0
+    )

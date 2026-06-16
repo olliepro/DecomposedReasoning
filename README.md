@@ -142,6 +142,12 @@ cd ../Analysis
 uv sync --extra dev
 uv run python run_branching_lm_eval.py --config branching_eval/example_aime24.yaml
 
+# NoveltyBench generation through the branching engine
+uv run python run_branching_novelty_bench.py \
+  --config branching_eval/example_novelty_bench_curated.yaml \
+  --model sft \
+  --seed 1234
+
 # RL dataset
 cd ../BuildRLDataset
 uv sync

@@ -10,14 +10,20 @@ from branching_eval.legacy_steer_rollout import (
 
 EXEC_OPEN_PATTERN = re.compile(r"<exec\b[^>]*>", flags=re.IGNORECASE)
 EXEC_CLOSE_PATTERN = re.compile(r"</exec>", flags=re.IGNORECASE)
-EXEC_TO_STEER_PATTERN = re.compile(r"</exec>(\s*)<steer\b", flags=re.IGNORECASE)
+EXEC_CLOSE_TAG = "</exec>"
 EXEC_CLOSE_SUFFIX_PATTERN = re.compile(r"</exec>(?P<suffix>\n{0,2})$", flags=re.I)
+EXEC_TO_STEER_SEPARATOR = "\n"
+EXEC_TO_STEER_NEWLINE_COUNT = len(EXEC_TO_STEER_SEPARATOR)
 STEER_TO_EXEC_BOUNDARY_PATTERN = re.compile(
     r"</steer>\s*<exec>\s*",
     flags=re.IGNORECASE,
 )
 EXEC_TO_STEER_BOUNDARY_PATTERN = re.compile(
     r"</exec>\s*<steer>",
+    flags=re.IGNORECASE,
+)
+INITIAL_THINK_DECISION_PATTERN = re.compile(
+    r"^\s*<think\b[^>]*>\s*$",
     flags=re.IGNORECASE,
 )
 STEER_ENTRY_BOUNDARY_PATTERN = re.compile(
@@ -42,12 +48,12 @@ def normalize_steer_boundary_text(*, text: str) -> str:
 
     Returns:
         Canonicalized prefix using append-only suffixes. Ordinary exec prefixes
-        end at `</exec>\\n\\n`; prefixes that already contain a 2+ char
+        end at `</exec>\\n`; prefixes that already contain a 2+ char
         `<steer>` suffix are completed to a valid `<steer>` entry boundary.
 
     Example:
         >>> normalize_steer_boundary_text(text="<exec>x")
-        '<exec>x\\n</exec>\\n\\n'
+        '<exec>x\\n</exec>\\n'
     """
 
     normalized_text = text
@@ -89,7 +95,7 @@ def has_trailing_steer_open_prefix(*, text: str) -> bool:
 
 
 def ends_at_exec_choice_boundary(*, text: str) -> bool:
-    """Return whether text can be completed to `</exec>\\n\\n` by appending.
+    """Return whether text can be completed to `</exec>\\n` by appending.
 
     Args:
         text: Assistant prefix text.
@@ -101,20 +107,67 @@ def ends_at_exec_choice_boundary(*, text: str) -> bool:
     return EXEC_CLOSE_SUFFIX_PATTERN.search(text) is not None
 
 
+def is_initial_steer_decision_boundary(*, text: str) -> bool:
+    """Return whether text is the initial think-open steer decision point.
+
+    Args:
+        text: Assistant prefix text.
+
+    Returns:
+        `True` only for an otherwise-empty assistant prefix ending at `<think>`.
+    """
+
+    return INITIAL_THINK_DECISION_PATTERN.fullmatch(text) is not None
+
+
+def is_steer_decision_boundary(*, text: str) -> bool:
+    """Return whether steer mode should sample a steer candidate next.
+
+    Args:
+        text: Assistant prefix text.
+
+    Returns:
+        `True` at the initial `<think>` choice point or after `</exec>`.
+    """
+
+    return is_initial_steer_decision_boundary(
+        text=text
+    ) or ends_at_exec_choice_boundary(text=text)
+
+
 def exec_choice_boundary_suffix(*, text: str) -> str:
-    """Return suffix needed to make trailing `</exec>` boundary `\\n\\n`.
+    """Return suffix needed to make trailing `</exec>` boundary `\\n`.
 
     Args:
         text: Assistant prefix ending in `</exec>` plus up to two newlines.
 
     Returns:
-        Empty string, `\\n`, or `\\n\\n`.
+        Empty string or `\\n`.
     """
 
     match = EXEC_CLOSE_SUFFIX_PATTERN.search(text)
     assert match is not None, "expected text ending at an exec choice boundary"
     suffix = match.group("suffix")
-    return "\n" * (2 - len(suffix))
+    return "\n" * max(0, EXEC_TO_STEER_NEWLINE_COUNT - len(suffix))
+
+
+def explicit_exec_stop_completion_suffix(*, text: str) -> str:
+    """Return the minimal suffix needed after an excluded `</exec` stop.
+
+    Args:
+        text: Assistant prefix after appending model output.
+
+    Returns:
+        Minimal completion for the terminal exec close marker.
+    """
+
+    lowered = text.lower()
+    if lowered.endswith(EXEC_CLOSE_TAG):
+        return ""
+    for prefix_length in range(len(EXEC_CLOSE_TAG) - 1, 0, -1):
+        if lowered.endswith(EXEC_CLOSE_TAG[:prefix_length]):
+            return EXEC_CLOSE_TAG[prefix_length:]
+    return EXEC_CLOSE_TAG
 
 
 def steer_candidate_stop_markers(*, text: str) -> tuple[str, ...]:
@@ -157,20 +210,17 @@ def is_inside_open_exec(*, text: str) -> bool:
 
 
 def inferred_exec_to_steer_separator(*, text: str) -> str:
-    """Infer preferred separator between `</exec>` and `<steer>`.
+    """Return the canonical separator between `</exec>` and `<steer>`.
 
     Args:
         text: Assistant prefix text.
 
     Returns:
-        Observed separator or `\\n\\n` when no prior pattern exists.
+        Single newline separator used when inserting steer candidates.
     """
 
-    matches = list(EXEC_TO_STEER_PATTERN.finditer(text))
-    if not matches:
-        return "\n\n"
-    separator = matches[-1].group(1)
-    return separator if separator is not None else "\n\n"
+    _ = text
+    return EXEC_TO_STEER_SEPARATOR
 
 
 def forced_boundary_suffix(*, text: str) -> str:
@@ -180,9 +230,9 @@ def forced_boundary_suffix(*, text: str) -> str:
         text: Assistant prefix text.
 
     Returns:
-        Append-only suffix. Open exec text is closed to `</exec>\\n\\n`
+        Append-only suffix. Open exec text is closed to `</exec>\\n`
         unless a 2+ char `<steer>` prefix has already been emitted, in which
-        case the old `</exec>\\n\\n<steer>` boundary is preserved.
+        case the canonical `</exec>\\n<steer>` boundary is preserved.
     """
 
     if has_trailing_steer_open_prefix(text=text):
@@ -198,7 +248,7 @@ def forced_boundary_suffix(*, text: str) -> str:
         return ""
     if is_inside_open_exec(text=text):
         newline_before_close = "" if text.endswith("\n") else "\n"
-        return f"{newline_before_close}</exec>\n\n"
+        return f"{newline_before_close}</exec>{EXEC_TO_STEER_SEPARATOR}"
     if ends_at_exec_choice_boundary(text=text):
         return exec_choice_boundary_suffix(text=text)
     return "<steer>"
@@ -277,9 +327,9 @@ def selected_candidate_normalization_suffix(*, text: str) -> tuple[str, str]:
     if normalized_with_newline.endswith("<exec>\n"):
         exec_suffix = ""
     elif normalized_with_newline.endswith("<exec>"):
-        exec_suffix = "\n"
+        exec_suffix = ""
     else:
-        exec_suffix = "<exec>\n"
+        exec_suffix = "<exec>"
     return close_suffix + newline_suffix + exec_suffix, mode
 
 
@@ -295,15 +345,15 @@ def normalize_steer_exec_chunk_text(*, text: str) -> str:
 
     Example:
         >>> normalize_steer_exec_chunk_text(text=\"x</steer>\\n\\n<exec>\\n\")
-        'x</steer>\\n<exec>\\n'
+        'x</steer>\\n<exec>'
     """
 
     repaired_text, _ = complete_trailing_partial_tag(text=text)
     normalized_text = STEER_TO_EXEC_BOUNDARY_PATTERN.sub(
-        "</steer>\n<exec>\n",
+        "</steer>\n<exec>",
         repaired_text,
     )
     return EXEC_TO_STEER_BOUNDARY_PATTERN.sub(
-        "</exec>\n\n<steer>",
+        f"</exec>{EXEC_TO_STEER_SEPARATOR}<steer>",
         normalized_text,
     )

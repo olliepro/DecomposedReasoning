@@ -67,6 +67,9 @@ RLTraining/verl/.venv/
 RLTraining/verl/verl.egg-info/
 /manual_runs/*/logs/
 /manual_runs/*/__pycache__/
+/manual_runs/20260505/
+/manual_runs/20260513/
+/manual_runs/20260526/
 /.codex
 /outputs/
 /scratch_checkpoints

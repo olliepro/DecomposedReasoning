@@ -84,11 +84,23 @@ def extract_prompt_text(raw_prompt: list[dict[str, str]]) -> str:
         Plain-text user prompt string.
     """
 
-    assert len(raw_prompt) == 1, "Branching rollout currently expects one user message per prompt."
-    message = raw_prompt[0]
-    assert message["role"] == "user", "Branching rollout currently expects a user-only prompt."
-    content = message["content"]
-    assert isinstance(content, str) and content.strip(), "Prompt content must be non-empty text."
+    user_messages = [message for message in raw_prompt if message["role"] == "user"]
+    unsupported_roles = {
+        str(message["role"])
+        for message in raw_prompt
+        if message["role"] not in {"system", "user"}
+    }
+    assert not unsupported_roles, (
+        "Branching rollout prompts support only system and user messages, "
+        f"got roles: {sorted(unsupported_roles)}"
+    )
+    assert (
+        len(user_messages) == 1
+    ), "Branching rollout expects exactly one user message per prompt."
+    content = user_messages[0]["content"]
+    assert (
+        isinstance(content, str) and content.strip()
+    ), "Prompt content must be non-empty text."
     return content
 
 
@@ -126,12 +138,15 @@ def build_prompt_groups(
     while group_start < len(prompt_uid_values):
         prompt_uid = str(prompt_uid_values[group_start])
         group_stop = group_start
-        while group_stop < len(prompt_uid_values) and str(prompt_uid_values[group_stop]) == prompt_uid:
+        while (
+            group_stop < len(prompt_uid_values)
+            and str(prompt_uid_values[group_stop]) == prompt_uid
+        ):
             group_stop += 1
         group_size = group_stop - group_start
-        assert group_size == expected_group_size, (
-            f"Expected repeated prompt group size {expected_group_size}, found {group_size} for uid={prompt_uid}"
-        )
+        assert (
+            group_size == expected_group_size
+        ), f"Expected repeated prompt group size {expected_group_size}, found {group_size} for uid={prompt_uid}"
         prompt_groups.append(
             PromptGroup(
                 prompt_uid=prompt_uid,
@@ -164,8 +179,41 @@ def build_path_node_ids(tree: BranchTree, leaf: LeafRollout) -> tuple[str, ...]:
     return tuple(reversed(path_node_ids))
 
 
+def build_branch_token_offsets(
+    *, tree: BranchTree, leaf: LeafRollout, prompt_token_count: int
+) -> tuple[int, ...]:
+    """Build generated-token offsets for each branch edge on one leaf path.
+
+    Args:
+        tree: Branch tree containing node continuation token chains.
+        leaf: Leaf rollout row within the tree.
+        prompt_token_count: Original prompt length before generated response tokens.
+
+    Returns:
+        Generated-token offsets aligned with the path's branch edges.
+    """
+
+    path_node_ids = build_path_node_ids(tree=tree, leaf=leaf)
+    offsets: list[int] = []
+    response_token_count = len(leaf.token_ids)
+    for parent_node_id in path_node_ids[:-1]:
+        parent_node = tree.nodes[parent_node_id]
+        assert parent_node.prompt_token_ids is not None, (
+            "Branch advantage offsets require prompt_token_ids for "
+            f"branch node {parent_node_id}"
+        )
+        raw_offset = len(parent_node.prompt_token_ids) - prompt_token_count
+        offsets.append(min(max(raw_offset, 0), response_token_count))
+    return tuple(offsets)
+
+
 def resolve_leaf_branch_metadata(
-    *, tree: BranchTree, leaf: LeafRollout, prompt_uid: str, selector_mode: str
+    *,
+    tree: BranchTree,
+    leaf: LeafRollout,
+    prompt_uid: str,
+    selector_mode: str,
+    prompt_token_count: int,
 ) -> BranchAdvantageIndex:
     """Resolve one leaf's branch metadata for reward and advantage computation.
 
@@ -174,12 +222,18 @@ def resolve_leaf_branch_metadata(
         leaf: One leaf rollout row.
         prompt_uid: Original repeated-prompt uid.
         selector_mode: Selector mode used for this branch tree.
+        prompt_token_count: Original prompt length before generated response tokens.
 
     Returns:
         Branch-advantage index for the leaf.
     """
 
     path_node_ids = build_path_node_ids(tree=tree, leaf=leaf)
+    branch_token_offsets = build_branch_token_offsets(
+        tree=tree,
+        leaf=leaf,
+        prompt_token_count=prompt_token_count,
+    )
     parent_branch_id = path_node_ids[-2] if len(path_node_ids) > 1 else None
     selected_cluster_id = None
     cluster_name = None
@@ -187,7 +241,7 @@ def resolve_leaf_branch_metadata(
     for branch_point in tree.branch_points:
         if branch_point.node_id != parent_branch_id:
             continue
-        candidate_pool_key = branch_point.candidate_pool_key
+        candidate_pool_key = branch_point.candidate_pool_id
         for selection in branch_point.selections:
             if selection.selector_mode != selector_mode:
                 continue
@@ -195,7 +249,9 @@ def resolve_leaf_branch_metadata(
                 continue
             selected_candidate_id = selection.selected_candidate_ids[0]
             if selection.cluster_by_candidate_id is not None:
-                cluster_name = selection.cluster_by_candidate_id.get(selected_candidate_id)
+                cluster_name = selection.cluster_by_candidate_id.get(
+                    selected_candidate_id
+                )
                 selected_cluster_id = cluster_name
     return BranchAdvantageIndex(
         prompt_uid=prompt_uid,
@@ -203,6 +259,7 @@ def resolve_leaf_branch_metadata(
         leaf_id=leaf.leaf_id,
         leaf_node_id=leaf.node_id,
         path_node_ids=path_node_ids,
+        branch_token_offsets=branch_token_offsets,
         parent_branch_id=parent_branch_id,
         branch_depth=max(len(path_node_ids) - 1, 0),
         selected_cluster_id=selected_cluster_id,
@@ -212,23 +269,45 @@ def resolve_leaf_branch_metadata(
     )
 
 
-def build_reward_scores(branch_index: BranchAdvantageIndex) -> dict[str, object]:
+def build_reward_scores(
+    *,
+    branch_index: BranchAdvantageIndex,
+    initial_assistant_prefix: str = "",
+    logical_response_text: str = "",
+    steer_phase_token_spans: tuple[tuple[int, int], ...] = (),
+    repeat_stop_reason: str | None = None,
+    repeat_block_kind: str | None = None,
+    repeat_block_count: int | None = None,
+    repeat_last_similarity_ratio: float | None = None,
+) -> dict[str, object]:
     """Build rollout metadata payload forwarded through the stock DAPO manager.
 
     Args:
         branch_index: Branch metadata for one leaf.
+        initial_assistant_prefix: Assistant text that was prefilled in the
+            prompt but should still count as part of the logical assistant
+            response for reward-format validation.
+        logical_response_text: Canonical assistant response reconstructed by the
+            branching executor, including any prompt-prefilled assistant text.
+        steer_phase_token_spans: Response-token spans generated by steer-phase
+            requests and eligible for steer-only actor updates.
+        repeat_stop_reason: Optional repeat-loop forced-close reason.
+        repeat_block_kind: Optional repeated block family (`exec` or `steer`).
+        repeat_block_count: Optional consecutive repeated-block count.
+        repeat_last_similarity_ratio: Optional last fuzzy similarity ratio.
 
     Returns:
         Structured reward-scores payload.
     """
 
-    return {
+    reward_scores: dict[str, object] = {
         "branch_metadata": {
             "prompt_uid": branch_index.prompt_uid,
             "branch_tree_id": branch_index.branch_tree_id,
             "leaf_id": branch_index.leaf_id,
             "leaf_node_id": branch_index.leaf_node_id,
             "path_node_ids": list(branch_index.path_node_ids),
+            "branch_token_offsets": list(branch_index.branch_token_offsets),
             "parent_branch_id": branch_index.parent_branch_id,
             "branch_depth": branch_index.branch_depth,
             "selected_cluster_id": branch_index.selected_cluster_id,
@@ -237,6 +316,23 @@ def build_reward_scores(branch_index: BranchAdvantageIndex) -> dict[str, object]
             "candidate_pool_key": branch_index.candidate_pool_key,
         }
     }
+    if initial_assistant_prefix:
+        reward_scores["initial_assistant_prefix"] = initial_assistant_prefix
+    if logical_response_text:
+        reward_scores["logical_response_text"] = logical_response_text
+    if steer_phase_token_spans:
+        reward_scores["steer_phase_token_spans"] = [
+            [span_start, span_end] for span_start, span_end in steer_phase_token_spans
+        ]
+    if repeat_stop_reason is not None:
+        reward_scores["repeat_stop_reason"] = repeat_stop_reason
+    if repeat_block_kind is not None:
+        reward_scores["repeat_block_kind"] = repeat_block_kind
+    if repeat_block_count is not None:
+        reward_scores["repeat_block_count"] = repeat_block_count
+    if repeat_last_similarity_ratio is not None:
+        reward_scores["repeat_last_similarity_ratio"] = repeat_last_similarity_ratio
+    return reward_scores
 
 
 def summarize_rollout_records(records: list[LeafBatchRecord]) -> dict[str, float]:
@@ -261,7 +357,10 @@ def summarize_rollout_records(records: list[LeafBatchRecord]) -> dict[str, float
             "branching/selector_mode_random_ratio": 0.0,
         }
     branch_depths = [float(record.branch_index.branch_depth) for record in records]
-    cluster_flags = [1.0 if record.branch_index.selected_cluster_id is not None else 0.0 for record in records]
+    cluster_flags = [
+        1.0 if record.branch_index.selected_cluster_id is not None else 0.0
+        for record in records
+    ]
     selector_modes = [record.branch_index.selector_mode for record in records]
     unique_clusters_by_prompt: dict[str, set[str]] = defaultdict(set)
     for record in records:
@@ -270,16 +369,22 @@ def summarize_rollout_records(records: list[LeafBatchRecord]) -> dict[str, float
             unique_clusters_by_prompt[record.branch_index.prompt_uid].add(cluster_id)
         else:
             unique_clusters_by_prompt.setdefault(record.branch_index.prompt_uid, set())
-    unique_cluster_counts = [float(len(cluster_ids)) for cluster_ids in unique_clusters_by_prompt.values()]
+    unique_cluster_counts = [
+        float(len(cluster_ids)) for cluster_ids in unique_clusters_by_prompt.values()
+    ]
     return {
         "branching/leaf_count": float(len(records)),
         "branching/branch_depth_mean": float(np.mean(branch_depths)),
         "branching/branch_depth_max": float(np.max(branch_depths)),
         "branching/clustered_leaf_ratio": float(np.mean(cluster_flags)),
         "branching/cluster_count_mean": float(np.mean(unique_cluster_counts)),
-        "branching/unique_cluster_count_per_prompt_mean": float(np.mean(unique_cluster_counts)),
+        "branching/unique_cluster_count_per_prompt_mean": float(
+            np.mean(unique_cluster_counts)
+        ),
         "branching/selector_mode_cluster_across_ratio": float(
-            np.mean([1.0 if mode == "cluster_across" else 0.0 for mode in selector_modes])
+            np.mean(
+                [1.0 if mode == "cluster_across" else 0.0 for mode in selector_modes]
+            )
         ),
         "branching/selector_mode_random_ratio": float(
             np.mean([1.0 if mode == "random" else 0.0 for mode in selector_modes])

@@ -31,13 +31,16 @@ def theme_css() -> str:
   --warn: #ffd166;
   --bad: #ef476f;
   --shadow: 0 22px 44px rgba(2, 8, 22, 0.45);
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-serif: Georgia, "Times New Roman", serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
 }
 * { box-sizing: border-box; }
 html, body {
   margin: 0;
   min-height: 100%;
   color: var(--text);
-  font-family: "IBM Plex Sans", sans-serif;
+  font-family: var(--font-sans);
   background:
     radial-gradient(circle at 12% 8%, rgba(255, 122, 89, 0.22), transparent 26%),
     radial-gradient(circle at 88% 12%, rgba(74, 111, 209, 0.27), transparent 28%),
@@ -63,7 +66,7 @@ html, body {
   min-width: 0;
 }
 .chrome-kicker {
-  font-family: "IBM Plex Serif", serif;
+  font-family: var(--font-serif);
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--accent-soft);
@@ -82,7 +85,7 @@ html, body {
 .chrome-sub {
   margin-left: auto;
   color: var(--muted);
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-mono);
   font-size: 0.76rem;
   max-width: min(48vw, 680px);
   overflow: hidden;
@@ -123,7 +126,7 @@ main {
   border-radius: 999px;
   padding: 0.25rem 0.55rem;
   font-size: 0.76rem;
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-mono);
   color: var(--muted);
   background: rgba(255, 255, 255, 0.03);
 }
@@ -137,11 +140,11 @@ h1, h2, h3 {
   word-break: break-word;
 }
 h1 {
-  font-family: "IBM Plex Serif", serif;
+  font-family: var(--font-serif);
   font-size: clamp(1.4rem, 3vw, 2rem);
 }
 h2 {
-  font-family: "IBM Plex Serif", serif;
+  font-family: var(--font-serif);
   font-size: 1.12rem;
 }
 table {
@@ -162,7 +165,7 @@ th {
   text-transform: uppercase;
 }
 code, pre {
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-mono);
   font-size: 0.77rem;
 }
 .path-row {
@@ -206,7 +209,7 @@ svg {
   border-radius: 0.6rem;
   padding: 0.2rem 0.45rem;
   font-size: 0.74rem;
-  font-family: "IBM Plex Mono", monospace;
+  font-family: var(--font-mono);
 }
 @media (max-width: 960px) {
   .grid-two { grid-template-columns: 1fr; }
@@ -233,6 +236,7 @@ def wrap_page(
     footer_text: str | None = None,
     script: str = "",
     script_urls: tuple[str, ...] = (),
+    style_url: str | None = None,
 ) -> str:
     """Wrap body HTML in a complete themed document shell.
 
@@ -243,6 +247,7 @@ def wrap_page(
         footer_text: Optional footer text.
         script: Optional inline script tag contents.
         script_urls: External script URLs appended at the end of the body.
+        style_url: Optional external stylesheet URL. Defaults to inline CSS.
 
     Returns:
         Complete HTML document string.
@@ -256,16 +261,18 @@ def wrap_page(
     external_scripts = "\n".join(
         f'  <script src="{escape(script_url)}"></script>' for script_url in script_urls
     )
+    style_html = (
+        f'  <link rel="stylesheet" href="{escape(style_url)}">'
+        if style_url
+        else f"  <style>{theme_css()}</style>"
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{escape(title)}</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:wght@400;600&display=swap" rel="stylesheet">
-  <style>{theme_css()}</style>
+{style_html}
 </head>
 <body>
   <header class="top-chrome">

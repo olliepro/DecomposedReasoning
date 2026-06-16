@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
+
+
+ANSWER_MARKER_PREFIX_RE = re.compile(
+    r"(?is)(?:final\s+answer|the\s+answer\s+is|answer)\s*(?:[:=]|is)?\s*"
+)
+INTEGER_RE = re.compile(r"(?<![\w.])-?\d+(?!\.\d)(?![\w])")
+SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]+?\|>")
+
 
 def extract_target_answer(doc: dict[str, Any]) -> str:
     """Extract the reference answer string from one AIME document.
@@ -83,6 +92,10 @@ def normalize_answer_text(value: str) -> str:
     normalized = normalized.replace("\\,", "")
     normalized = normalized.replace(" ", "")
     normalized = normalized.rstrip(".")
+    if re.fullmatch(r"-?\d+", normalized):
+        sign = "-" if normalized.startswith("-") else ""
+        digits = normalized[1:] if sign else normalized
+        normalized = sign + (digits.lstrip("0") or "0")
     return normalized
 
 
@@ -98,7 +111,36 @@ def _extract_dollar_wrapped_answer(response: str) -> str:
     indices = [position for position, char in enumerate(response) if char == "$"]
     if len(indices) <= 1:
         return response
-    return response[indices[0] + 1 : indices[-1]]
+    return response[indices[-2] + 1 : indices[-1]]
+
+
+def _strip_response_special_tokens(response: str) -> str:
+    """Remove model control tokens that should not affect answer parsing."""
+
+    stripped = SPECIAL_TOKEN_RE.sub("", response)
+    return stripped.strip()
+
+
+def _extract_marker_answer(response: str) -> str | None:
+    """Extract the immediate short numeric answer after the final answer marker."""
+
+    matches = list(ANSWER_MARKER_PREFIX_RE.finditer(response))
+    if not matches:
+        return None
+    tail = response[matches[-1].end() :]
+    boxed_answer = last_boxed_only_string(response=tail)
+    if boxed_answer is not None:
+        try:
+            return remove_boxed(boxed_value=boxed_answer)
+        except (AssertionError, IndexError):
+            pass
+    integer_matches = list(INTEGER_RE.finditer(tail))
+    if integer_matches:
+        return integer_matches[0].group(0)
+    dollar_wrapped = _extract_dollar_wrapped_answer(response=tail)
+    if dollar_wrapped != tail:
+        return dollar_wrapped
+    return tail
 
 
 def extract_candidate_answer(response: str) -> str:
@@ -110,15 +152,21 @@ def extract_candidate_answer(response: str) -> str:
     Returns:
         Parsed candidate answer string.
     """
-    candidate = _extract_dollar_wrapped_answer(response=response)
-    boxed_answer = last_boxed_only_string(response=response)
+    cleaned_response = _strip_response_special_tokens(response=response)
+    boxed_answer = last_boxed_only_string(response=cleaned_response)
     if boxed_answer is None:
-        return candidate
+        marker_answer = _extract_marker_answer(response=cleaned_response)
+        if marker_answer is not None:
+            return marker_answer
+        return _extract_dollar_wrapped_answer(response=cleaned_response)
     try:
         boxed_content = remove_boxed(boxed_value=boxed_answer)
     except (AssertionError, IndexError):
-        return candidate
-    return candidate if boxed_content is None else str(boxed_content)
+        marker_answer = _extract_marker_answer(response=cleaned_response)
+        if marker_answer is not None:
+            return marker_answer
+        return _extract_dollar_wrapped_answer(response=cleaned_response)
+    return str(boxed_content)
 
 
 def is_correct_answer(candidate: str, target: str) -> int:

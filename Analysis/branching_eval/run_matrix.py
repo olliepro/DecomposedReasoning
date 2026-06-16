@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean, median
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable, cast
 
 from branching_eval.artifact_store import ArtifactStore, build_run_manifest_payload
 from branching_eval.branch_executor import BranchExecutor
@@ -76,6 +76,47 @@ def build_clustering_runtime_client(
             timeout_seconds=serve_config.request_timeout_seconds,
         ),
         model_spec.clustering_served_model_name,
+    )
+
+
+async def close_runtime_clients_async(
+    *, client: VllmClient, cluster_client: VllmClient | None
+) -> None:
+    """Close shared runtime clients after all concurrent docs finish.
+
+    Args:
+        client: Primary vLLM generation client.
+        cluster_client: Optional clustering client.
+
+    Returns:
+        None.
+    """
+
+    close_client = getattr(client, "close_async", None)
+    if callable(close_client):
+        await cast(Callable[[], Awaitable[None]], close_client)()
+    if cluster_client is None or cluster_client is client:
+        return
+    close_cluster_client = getattr(cluster_client, "close_async", None)
+    if callable(close_cluster_client):
+        await cast(Callable[[], Awaitable[None]], close_cluster_client)()
+
+
+def close_runtime_clients(
+    *, client: VllmClient, cluster_client: VllmClient | None
+) -> None:
+    """Synchronously close shared runtime clients.
+
+    Args:
+        client: Primary vLLM generation client.
+        cluster_client: Optional clustering client.
+
+    Returns:
+        None.
+    """
+
+    asyncio.run(
+        close_runtime_clients_async(client=client, cluster_client=cluster_client)
     )
 
 
@@ -319,22 +360,27 @@ def run_experiment_matrix(
                 model_spec=model_spec,
                 serve_config=config.serve,
             )
-            for spec in model_experiments:
-                run_dir = run_one_experiment(
-                    config=config,
-                    model_spec=model_spec,
-                    spec=spec,
-                    client=client,
-                    cluster_client=cluster_client,
-                    model_name_for_generation=running_server.model_name_for_generation,
-                    cluster_model_name_for_generation=cluster_model_name,
-                    limit=limit,
-                    doc_ids=doc_ids,
-                    resume_run_dir=resume_target,
-                )
-                run_dirs.append(run_dir)
-                if resume_target is not None:
-                    resume_target = None
+            try:
+                for spec in model_experiments:
+                    run_dir = run_one_experiment(
+                        config=config,
+                        model_spec=model_spec,
+                        spec=spec,
+                        client=client,
+                        cluster_client=cluster_client,
+                        model_name_for_generation=(
+                            running_server.model_name_for_generation
+                        ),
+                        cluster_model_name_for_generation=cluster_model_name,
+                        limit=limit,
+                        doc_ids=doc_ids,
+                        resume_run_dir=resume_target,
+                    )
+                    run_dirs.append(run_dir)
+                    if resume_target is not None:
+                        resume_target = None
+            finally:
+                close_runtime_clients(client=client, cluster_client=cluster_client)
     return run_dirs
 
 
@@ -773,6 +819,8 @@ def run_doc_rollouts(
         trigger_steer_enabled=spec.trigger_steer,
         env_paths=env_paths,
         enable_request_priorities=config.serve.scheduling_policy == "priority",
+        allow_true_branching=spec.mode != "epsilon_greedy",
+        close_runtime_clients_on_finish=False,
     )
     executor.set_event_context(
         doc_id=doc_id,
@@ -896,6 +944,7 @@ async def run_doc_rollouts_async(
         enable_request_priorities=config.serve.scheduling_policy == "priority",
         branch_task_semaphore=branch_task_semaphore,
         allow_true_branching=spec.mode != "epsilon_greedy",
+        close_runtime_clients_on_finish=False,
     )
     executor.set_event_context(
         doc_id=doc_id,
@@ -1024,6 +1073,11 @@ async def run_scored_doc_with_limit_async(
             context=context,
             event_type="doc_started",
             payload={"prompt_char_count": len(doc_record.prompt_text)},
+        )
+        store.append_event(
+            context=context,
+            event_type="prompt_logged",
+            payload=prompt_logged_payload(doc_record=doc_record),
         )
     else:
         started_event = None
@@ -1157,6 +1211,19 @@ async def run_scored_doc_with_limit_async(
         doc_metrics=doc_metrics,
         diagnostics=diagnostics,
     )
+
+
+def prompt_logged_payload(*, doc_record: DocRecord) -> dict[str, Any]:
+    """Return graph-visible prompt metadata for one document attempt."""
+
+    return {
+        "node_id": "node_root",
+        "prompt_text": doc_record.prompt_text,
+        "prompt_char_count": len(doc_record.prompt_text),
+        "golden_answer": doc_record.golden_answer,
+        "golden_answer_source": doc_record.golden_answer_source,
+        "text_preview": doc_record.golden_answer,
+    }
 
 
 async def run_docs_with_limit_async(
@@ -1412,6 +1479,7 @@ def leaf_scored_event_payload(*, leaf: LeafRollout) -> dict[str, Any]:
         "length_tokens_exec": leaf.length_tokens_exec,
         "stop_reason": leaf.stop_reason,
         "task_metrics": leaf.task_metrics,
+        "text": leaf.text,
         "text_preview": compact_text_preview(text=leaf.text, max_chars=200),
     }
 

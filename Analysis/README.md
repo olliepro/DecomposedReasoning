@@ -27,6 +27,41 @@ uv run python run_branching_lm_eval.py \
   --config branching_eval/example_aime24.yaml
 ```
 
+## Run NoveltyBench generation
+
+The NoveltyBench path uses the same vLLM/branching runtime, but writes the
+official `generations.jsonl` shape consumed by the upstream NoveltyBench
+partition and scoring scripts.
+
+```bash
+cd Analysis
+uv run python run_branching_novelty_bench.py \
+  --config branching_eval/example_novelty_bench_curated.yaml \
+  --model sft \
+  --seed 1234
+```
+
+The example config is a 5-prompt smoke run on the curated split. For the full
+curated split, pass `--limit 100` or set `run_matrix.default_limit: null`; for
+WildChat, add `--dataset-split wildchat`. NoveltyBench standard metrics use
+`num_generations: 10`, so each run directory contains exactly 10 generations per
+completed prompt unless true tree branching fails to produce enough leaves.
+
+Outputs are written under `artifacts.output_root`:
+- `generations.jsonl`: official-compatible NoveltyBench generation rows.
+- `generation_metadata.jsonl`: raw/cleaned text length sidecar.
+- `tree_events.jsonl`: branching runtime request/tree events.
+- `run_manifest.json` and `config_snapshot.json`: reproducibility metadata.
+
+Score a completed run with the upstream NoveltyBench repo:
+
+```bash
+cd /path/to/novelty-bench
+uv run python src/partition.py --eval-dir /path/to/run-dir --alg classifier
+uv run python src/score.py --eval-dir /path/to/run-dir --patience 0.8
+uv run python src/summarize.py --eval-dir /path/to/run-dir
+```
+
 Optional overrides:
 
 ```bash

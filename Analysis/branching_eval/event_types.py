@@ -36,7 +36,7 @@ class EventContext:
 
 @dataclass(frozen=True)
 class EventEnvelope:
-    """One versioned event row in `tree_events.jsonl`.
+    """One versioned event row in the canonical branching event log.
 
     Args:
         event_index: Monotonic global event index in this run log.

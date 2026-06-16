@@ -1,4 +1,4 @@
-"""OpenAI embedding helpers for branching diversity sampling.
+"""OpenAI-compatible embedding helpers for branching diversity sampling.
 
 This module centralizes candidate-text cleaning, embedding lookup, and greedy
 diversity sampling for the `embed_diverse_topk_random` selector.
@@ -23,16 +23,64 @@ from candidate_clustering import parse_dotenv, strip_steer_suffix
 
 OPENAI_EMBEDDING_API_URL = "https://api.openai.com/v1/embeddings"
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
+OPENROUTER_EMBEDDING_API_URL = "https://openrouter.ai/api/v1/embeddings"
+OPENROUTER_EMBEDDING_MODEL = "openai/text-embedding-3-small"
 OPENAI_EMBEDDING_BATCH_SIZE = 1024
 # Request the reduced vector size directly from OpenAI.
 OPENAI_EMBEDDING_DIMENSIONS = 128
 OPENAI_EMBEDDING_MAX_ATTEMPTS = 5
-OPENAI_EMBEDDING_RETRY_BASE_DELAY_SECONDS = 1.0
-OPENAI_EMBEDDING_RETRY_MAX_DELAY_SECONDS = 16.0
+OPENAI_EMBEDDING_RETRY_BASE_DELAY_SECONDS = 5.0
+OPENAI_EMBEDDING_RETRY_MAX_DELAY_SECONDS = 40.0
 OPENAI_EMBEDDING_RETRY_STATUS_CODES = frozenset(
-    {408, 409, 425, 429, 500, 502, 503, 504}
+    {408, 409, 425, 429}
 )
 OPENAI_EMBEDDING_ERROR_BODY_MAX_CHARS = 2000
+OPENAI_EMBEDDING_COALESCE_DELAY_SECONDS = 0.002
+
+
+@dataclass(frozen=True)
+class _EmbeddingProvider:
+    """One embedding API endpoint shape."""
+
+    label: str
+    api_url: str
+    api_key: str
+    model: str
+
+
+@dataclass(frozen=True)
+class _EmbeddingBatchKey:
+    """Lookup key for coalescing compatible embedding requests."""
+
+    loop_id: int
+    session_id: int
+    primary_provider: _EmbeddingProvider
+    fallback_provider: _EmbeddingProvider | None
+    output_dimensions: int | None
+    batch_size: int
+
+
+@dataclass(frozen=True)
+class _PendingEmbeddingRequest:
+    """One waiting embedding request inside a coalesced batch."""
+
+    texts: tuple[str, ...]
+    future: asyncio.Future[dict[str, tuple[float, ...]]]
+
+
+@dataclass
+class _PendingEmbeddingBatch:
+    """Accumulated embedding requests sharing one provider request shape."""
+
+    session: aiohttp.ClientSession
+    primary_provider: _EmbeddingProvider
+    fallback_provider: _EmbeddingProvider | None
+    output_dimensions: int | None
+    batch_size: int
+    requests: list[_PendingEmbeddingRequest]
+
+
+_PENDING_EMBEDDING_BATCHES: dict[_EmbeddingBatchKey, _PendingEmbeddingBatch] = {}
 
 
 @dataclass(frozen=True)
@@ -90,7 +138,8 @@ def openai_diverse_topk_random_ids(
     pool: CandidatePoolRecord,
     branch_count: int,
     rng: Any,
-    openai_api_key: str,
+    openai_api_key: str | None,
+    openrouter_api_key: str | None = None,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Return shortlist and selected ids for the OpenAI diverse-top-k selector.
 
@@ -99,6 +148,7 @@ def openai_diverse_topk_random_ids(
         branch_count: Number of candidate ids to select.
         rng: Random object used for shortlist sampling.
         openai_api_key: OpenAI API key.
+        openrouter_api_key: Optional OpenRouter fallback embedding key.
 
     Returns:
         Tuple of `(shortlist_candidate_ids, selected_candidate_ids)`.
@@ -119,6 +169,7 @@ def openai_diverse_topk_random_ids(
             branch_count=branch_count,
             rng=rng,
             openai_api_key=openai_api_key,
+            openrouter_api_key=openrouter_api_key,
         )
     )
 
@@ -128,7 +179,8 @@ async def openai_diverse_topk_random_ids_async(
     pool: CandidatePoolRecord,
     branch_count: int,
     rng: Any,
-    openai_api_key: str,
+    openai_api_key: str | None,
+    openrouter_api_key: str | None = None,
     session: aiohttp.ClientSession | None = None,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Return shortlist and selected ids from the async OpenAI selector.
@@ -138,6 +190,7 @@ async def openai_diverse_topk_random_ids_async(
         branch_count: Number of candidate ids to select.
         rng: Random object used for shortlist sampling.
         openai_api_key: OpenAI API key.
+        openrouter_api_key: Optional OpenRouter fallback embedding key.
         session: Optional shared HTTP session reused across selector calls.
 
     Returns:
@@ -160,6 +213,7 @@ async def openai_diverse_topk_random_ids_async(
     embeddings_by_text = await openai_embeddings_by_text_async(
         texts=texts,
         openai_api_key=openai_api_key,
+        openrouter_api_key=openrouter_api_key,
         model=OPENAI_EMBEDDING_MODEL,
         batch_size=OPENAI_EMBEDDING_BATCH_SIZE,
         output_dimensions=OPENAI_EMBEDDING_DIMENSIONS,
@@ -329,16 +383,18 @@ def greedy_diverse_indices(*, matrix: np.ndarray, max_count: int) -> tuple[int, 
 def openai_embeddings_by_text(
     *,
     texts: Sequence[str],
-    openai_api_key: str,
+    openai_api_key: str | None,
+    openrouter_api_key: str | None = None,
     model: str = OPENAI_EMBEDDING_MODEL,
     batch_size: int = OPENAI_EMBEDDING_BATCH_SIZE,
     output_dimensions: int | None = None,
 ) -> dict[str, tuple[float, ...]]:
-    """Resolve OpenAI embeddings keyed by text.
+    """Resolve embeddings keyed by text.
 
     Args:
         texts: Ordered input texts.
         openai_api_key: OpenAI API key.
+        openrouter_api_key: Optional OpenRouter fallback embedding key.
         model: Embedding model id.
         batch_size: Maximum texts per API request.
         output_dimensions: Optional output dimension count requested from OpenAI.
@@ -351,6 +407,7 @@ def openai_embeddings_by_text(
         openai_embeddings_by_text_async(
             texts=texts,
             openai_api_key=openai_api_key,
+            openrouter_api_key=openrouter_api_key,
             model=model,
             batch_size=batch_size,
             output_dimensions=output_dimensions,
@@ -361,17 +418,19 @@ def openai_embeddings_by_text(
 async def openai_embeddings_by_text_async(
     *,
     texts: Sequence[str],
-    openai_api_key: str,
+    openai_api_key: str | None,
+    openrouter_api_key: str | None = None,
     model: str = OPENAI_EMBEDDING_MODEL,
     batch_size: int = OPENAI_EMBEDDING_BATCH_SIZE,
     output_dimensions: int | None = None,
     session: aiohttp.ClientSession | None = None,
 ) -> dict[str, tuple[float, ...]]:
-    """Resolve OpenAI embeddings for text strings in API batch order.
+    """Resolve embeddings for text strings in API batch order.
 
     Args:
         texts: Ordered input texts.
         openai_api_key: OpenAI API key.
+        openrouter_api_key: Optional OpenRouter fallback embedding key.
         model: Embedding model id.
         batch_size: Maximum texts per API request.
         output_dimensions: Optional output dimension count requested from OpenAI.
@@ -388,11 +447,64 @@ async def openai_embeddings_by_text_async(
             return await openai_embeddings_by_text_async(
                 texts=texts,
                 openai_api_key=openai_api_key,
+                openrouter_api_key=openrouter_api_key,
                 model=model,
                 batch_size=batch_size,
                 output_dimensions=output_dimensions,
                 session=owned_session,
             )
+    return await _coalesced_openai_embeddings_by_text_async(
+        texts=tuple(texts),
+        openai_api_key=openai_api_key,
+        openrouter_api_key=openrouter_api_key,
+        model=model,
+        batch_size=batch_size,
+        output_dimensions=output_dimensions,
+        session=session,
+    )
+
+
+async def _fetch_openai_embeddings_by_text_async(
+    *,
+    texts: Sequence[str],
+    primary_provider: _EmbeddingProvider,
+    fallback_provider: _EmbeddingProvider | None,
+    batch_size: int,
+    output_dimensions: int | None,
+    session: aiohttp.ClientSession,
+) -> dict[str, tuple[float, ...]]:
+    """Fetch embeddings for one already-coalesced text list."""
+
+    try:
+        return await _fetch_embeddings_with_provider_async(
+            texts=texts,
+            provider=primary_provider,
+            batch_size=batch_size,
+            output_dimensions=output_dimensions,
+            session=session,
+        )
+    except RuntimeError:
+        if fallback_provider is None:
+            raise
+    return await _fetch_embeddings_with_provider_async(
+        texts=texts,
+        provider=fallback_provider,
+        batch_size=batch_size,
+        output_dimensions=output_dimensions,
+        session=session,
+    )
+
+
+async def _fetch_embeddings_with_provider_async(
+    *,
+    texts: Sequence[str],
+    provider: _EmbeddingProvider,
+    batch_size: int,
+    output_dimensions: int | None,
+    session: aiohttp.ClientSession,
+) -> dict[str, tuple[float, ...]]:
+    """Fetch embeddings from one concrete provider."""
+
     batches = _batch_texts(
         texts=list(texts),
         batch_size=batch_size,
@@ -402,9 +514,11 @@ async def openai_embeddings_by_text_async(
             _openai_embedding_batch_async(
                 session=session,
                 texts=batch,
-                model=model,
-                openai_api_key=openai_api_key,
+                model=provider.model,
+                openai_api_key=provider.api_key,
                 output_dimensions=output_dimensions,
+                api_url=provider.api_url,
+                provider_label=provider.label,
             )
             for batch in batches
         ]
@@ -414,6 +528,123 @@ async def openai_embeddings_by_text_async(
     return {text: vector for text, vector in zip(texts, flattened)}
 
 
+async def _coalesced_openai_embeddings_by_text_async(
+    *,
+    texts: tuple[str, ...],
+    openai_api_key: str | None,
+    openrouter_api_key: str | None,
+    model: str,
+    batch_size: int,
+    output_dimensions: int | None,
+    session: aiohttp.ClientSession,
+) -> dict[str, tuple[float, ...]]:
+    """Coalesce concurrent embedding calls sharing one HTTP session."""
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, tuple[float, ...]]] = loop.create_future()
+    primary_provider, fallback_provider = _embedding_providers(
+        openai_api_key=openai_api_key,
+        openrouter_api_key=openrouter_api_key,
+        model=model,
+    )
+    key = _EmbeddingBatchKey(
+        loop_id=id(loop),
+        session_id=id(session),
+        primary_provider=primary_provider,
+        fallback_provider=fallback_provider,
+        output_dimensions=output_dimensions,
+        batch_size=batch_size,
+    )
+    batch = _PENDING_EMBEDDING_BATCHES.get(key)
+    if batch is None:
+        batch = _PendingEmbeddingBatch(
+            session=session,
+            primary_provider=primary_provider,
+            fallback_provider=fallback_provider,
+            output_dimensions=output_dimensions,
+            batch_size=batch_size,
+            requests=[],
+        )
+        _PENDING_EMBEDDING_BATCHES[key] = batch
+        loop.create_task(_flush_coalesced_openai_embeddings_async(key=key))
+    batch.requests.append(_PendingEmbeddingRequest(texts=texts, future=future))
+    return await future
+
+
+async def _flush_coalesced_openai_embeddings_async(*, key: _EmbeddingBatchKey) -> None:
+    """Resolve one pending coalesced embedding batch after a short debounce."""
+
+    await asyncio.sleep(OPENAI_EMBEDDING_COALESCE_DELAY_SECONDS)
+    batch = _PENDING_EMBEDDING_BATCHES.pop(key, None)
+    if batch is None:
+        return
+    try:
+        embeddings = await _resolve_coalesced_openai_embedding_batch_async(batch=batch)
+    except Exception as exc:
+        for request in batch.requests:
+            if not request.future.done():
+                request.future.set_exception(exc)
+        return
+    for request in batch.requests:
+        if request.future.done():
+            continue
+        request.future.set_result({text: embeddings[text] for text in request.texts})
+
+
+async def _resolve_coalesced_openai_embedding_batch_async(
+    *, batch: _PendingEmbeddingBatch
+) -> dict[str, tuple[float, ...]]:
+    """Fetch unique embeddings needed by all requests in a coalesced batch."""
+
+    unique_texts = tuple(
+        dict.fromkeys(text for request in batch.requests for text in request.texts)
+    )
+    return await _fetch_openai_embeddings_by_text_async(
+        texts=unique_texts,
+        primary_provider=batch.primary_provider,
+        fallback_provider=batch.fallback_provider,
+        batch_size=batch.batch_size,
+        output_dimensions=batch.output_dimensions,
+        session=batch.session,
+    )
+
+
+def _embedding_providers(
+    *, openai_api_key: str | None, openrouter_api_key: str | None, model: str
+) -> tuple[_EmbeddingProvider, _EmbeddingProvider | None]:
+    """Return the primary and optional fallback embedding providers."""
+
+    if openai_api_key:
+        primary = _EmbeddingProvider(
+            label="OpenAI",
+            api_url=OPENAI_EMBEDDING_API_URL,
+            api_key=openai_api_key,
+            model=model,
+        )
+        fallback = None
+        if openrouter_api_key:
+            fallback = _EmbeddingProvider(
+                label="OpenRouter",
+                api_url=OPENROUTER_EMBEDDING_API_URL,
+                api_key=openrouter_api_key,
+                model=OPENROUTER_EMBEDDING_MODEL,
+            )
+        return primary, fallback
+    if openrouter_api_key:
+        return (
+            _EmbeddingProvider(
+                label="OpenRouter",
+                api_url=OPENROUTER_EMBEDDING_API_URL,
+                api_key=openrouter_api_key,
+                model=OPENROUTER_EMBEDDING_MODEL,
+            ),
+            None,
+        )
+    raise RuntimeError(
+        "OPENAI_API_KEY or OPEN_ROUTER_KEY required for embedding selector"
+    )
+
+
 async def _openai_embedding_batch_async(
     *,
     session: aiohttp.ClientSession,
@@ -421,8 +652,10 @@ async def _openai_embedding_batch_async(
     model: str,
     openai_api_key: str,
     output_dimensions: int | None,
+    api_url: str = OPENAI_EMBEDDING_API_URL,
+    provider_label: str = "OpenAI",
 ) -> list[tuple[float, ...]]:
-    """Fetch one OpenAI embedding batch through a shared HTTP session.
+    """Fetch one embedding batch through an OpenAI-compatible API.
 
     Args:
         session: Shared HTTP session.
@@ -430,6 +663,8 @@ async def _openai_embedding_batch_async(
         model: Embedding model id.
         openai_api_key: OpenAI API key.
         output_dimensions: Optional reduced output dimension count.
+        api_url: OpenAI-compatible embeddings endpoint.
+        provider_label: Provider name used in error messages.
 
     Returns:
         Embedding vectors in request order.
@@ -451,7 +686,7 @@ async def _openai_embedding_batch_async(
     for attempt_number in range(1, OPENAI_EMBEDDING_MAX_ATTEMPTS + 1):
         try:
             async with session.post(
-                OPENAI_EMBEDDING_API_URL,
+                api_url,
                 headers=headers,
                 json=payload,
             ) as response:
@@ -467,6 +702,7 @@ async def _openai_embedding_batch_async(
                             status_code=response.status,
                             response_text=response_text,
                             attempt_number=attempt_number,
+                            provider_label=provider_label,
                         )
                     )
                 await asyncio.sleep(
@@ -475,7 +711,7 @@ async def _openai_embedding_batch_async(
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             if attempt_number >= OPENAI_EMBEDDING_MAX_ATTEMPTS:
                 raise RuntimeError(
-                    "OpenAI embedding transport error after "
+                    f"{provider_label} embedding transport error after "
                     f"{attempt_number} attempts: {exc}"
                 ) from exc
             await asyncio.sleep(
@@ -485,8 +721,8 @@ async def _openai_embedding_batch_async(
         raise AssertionError("unreachable embedding retry loop state")
     response_payload = json.loads(response_text)
     data = response_payload.get("data")
-    assert isinstance(data, list), "OpenAI embedding response missing data list"
-    assert len(data) == len(texts), "OpenAI embedding batch length mismatch"
+    assert isinstance(data, list), "embedding response missing data list"
+    assert len(data) == len(texts), "embedding batch length mismatch"
     ordered = sorted(data, key=lambda item: int(item.get("index", 0)))
     return [_parse_openai_embedding_row(row=row) for row in ordered]
 
@@ -505,8 +741,9 @@ def _should_retry_openai_embedding_status(
     """
 
     assert attempt_number >= 1, "attempt_number must be one-based"
+    is_transient_server_error = 500 <= status_code <= 599
     return (
-        status_code in OPENAI_EMBEDDING_RETRY_STATUS_CODES
+        (status_code in OPENAI_EMBEDDING_RETRY_STATUS_CODES or is_transient_server_error)
         and attempt_number < OPENAI_EMBEDDING_MAX_ATTEMPTS
     )
 
@@ -522,7 +759,7 @@ def _openai_embedding_retry_delay_seconds(*, attempt_number: int) -> float:
 
     Example:
         >>> _openai_embedding_retry_delay_seconds(attempt_number=1)
-        1.0
+        5.0
     """
 
     assert attempt_number >= 1, "attempt_number must be one-based"
@@ -531,7 +768,11 @@ def _openai_embedding_retry_delay_seconds(*, attempt_number: int) -> float:
 
 
 def _openai_embedding_error_message(
-    *, status_code: int, response_text: str, attempt_number: int
+    *,
+    status_code: int,
+    response_text: str,
+    attempt_number: int,
+    provider_label: str = "OpenAI",
 ) -> str:
     """Format a bounded OpenAI embedding HTTP error message.
 
@@ -539,6 +780,7 @@ def _openai_embedding_error_message(
         status_code: HTTP response status.
         response_text: Raw response body.
         attempt_number: One-based attempt number.
+        provider_label: Provider name used in the error.
 
     Returns:
         Runtime error message safe for logs.
@@ -548,17 +790,18 @@ def _openai_embedding_error_message(
     if len(response_text) > OPENAI_EMBEDDING_ERROR_BODY_MAX_CHARS:
         body = f"{body}...<truncated>"
     return (
-        f"OpenAI embedding error {status_code} after {attempt_number} attempts: "
+        f"{provider_label} embedding error {status_code} after "
+        f"{attempt_number} attempts: "
         f"{body}"
     )
 
 
 def _parse_openai_embedding_row(*, row: object) -> tuple[float, ...]:
-    assert isinstance(row, dict), "OpenAI embedding row must be a mapping"
+    assert isinstance(row, dict), "embedding row must be a mapping"
     embedding = row.get("embedding")
-    assert isinstance(embedding, list), "OpenAI embedding row missing embedding list"
+    assert isinstance(embedding, list), "embedding row missing embedding list"
     vector = tuple(float(value) for value in embedding)
-    assert vector, "OpenAI embedding vectors must be non-empty"
+    assert vector, "embedding vectors must be non-empty"
     return vector
 
 
@@ -589,6 +832,8 @@ __all__ = [
     "OPENAI_EMBEDDING_BATCH_SIZE",
     "OPENAI_EMBEDDING_MODEL",
     "OPENAI_EMBEDDING_DIMENSIONS",
+    "OPENROUTER_EMBEDDING_API_URL",
+    "OPENROUTER_EMBEDDING_MODEL",
     "cleaned_candidate_groups",
     "cleaned_candidate_text",
     "diverse_shortlist_size",

@@ -16,6 +16,7 @@ from sft_training.config_types import RunConfig
 from sft_training.non_sequitur_masking import CharSpan
 from sft_training.non_sequitur_masking import build_assistant_tokenized_record
 from sft_training.non_sequitur_masking import build_overlap_token_mask
+from sft_training.non_sequitur_masking import ensure_final_eos_supervised
 from sft_training.non_sequitur_masking import extract_mask_targets
 from sft_training.non_sequitur_masking import render_chat_text
 from sft_training.non_sequitur_masking import resolve_rendered_mask_spans
@@ -187,6 +188,27 @@ def test_masked_row_keeps_eos_supervised(
     eos_token_id = int(tokenizer.eos_token_id)
     assert tokenized["input_ids"][-1] == eos_token_id
     assert tokenized["assistant_masks"][-1] == 1
+
+
+def test_final_eos_supervision_guard_restores_dropped_mask(
+    tokenizer: Any,
+    masked_row: dict[str, Any],
+) -> None:
+    """The explicit EOS guard should restore a dropped final EOS mask bit."""
+    baseline = tokenize_assistant_messages(
+        tokenizer=tokenizer,
+        messages=masked_row["messages"],
+    )
+    eos_token_id = int(tokenizer.eos_token_id)
+    assert baseline["input_ids"][-1] == eos_token_id
+    assistant_masks = list(baseline["assistant_masks"])
+    assistant_masks[-1] = 0
+    restored = ensure_final_eos_supervised(
+        tokenizer=tokenizer,
+        input_ids=baseline["input_ids"],
+        assistant_masks=assistant_masks,
+    )
+    assert restored[-1] == 1
 
 
 def test_masking_zeroes_overlapping_tokens_and_keeps_neighbors(

@@ -9,6 +9,7 @@ INSERT
 - Intervention name: ${intervention_name}
 - Required first steer text: ${intervention_variant}
 - Exact number of pairs to generate: ${pairs_to_generate_k}
+- Steer token limit: ${steer_token_limit}
 - Exec token limit: ${exec_token_limit}
 
 ## What you are editing
@@ -49,6 +50,7 @@ The intervention should **not**:
 ## Additional instructions
 
 - The **first generated steer** must match this text exactly: `${intervention_variant}`
+- Keep every generated steer at or below `${steer_token_limit}` tokens.
 - Keep each exec focused and comfortably under `${exec_token_limit}` tokens.
 - Make the final generated exec end at a point where the provided next original steer still feels like the natural next move.
 

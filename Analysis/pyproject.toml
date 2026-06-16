@@ -5,7 +5,10 @@ description = "Steer-aware branching analyzer for vLLM OpenAI-compatible APIs."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "datasets>=2.19.0",
   "google-genai>=0.7.0",
+  "grpcio!=1.78.1",
+  "grpcio-reflection!=1.78.1",
   "ipykernel>=7.2.0",
   "lm-eval[hf,vllm,math]>=0.4.7",
   "lmcache>=0.3.14",

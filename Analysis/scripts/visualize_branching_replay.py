@@ -4,17 +4,20 @@
 from __future__ import annotations
 
 import argparse
-import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-import re
 
 ANALYSIS_ROOT = Path(__file__).resolve().parents[1]
 if str(ANALYSIS_ROOT) not in sys.path:
     sys.path.insert(0, str(ANALYSIS_ROOT))
 
+from branching_eval.event_db import (
+    EVENT_DB_FILENAME,
+    EventDatabase,
+)
 from branching_eval.event_types import EventEnvelope, parse_event_row
 from branching_eval.steer_normalization import normalize_steer_exec_chunk_text
 
@@ -194,8 +197,8 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Visualize branching_eval run from tree_events.jsonl only. "
-            "Supports snapshot and live follow modes."
+            "Visualize branching_eval run from tree_events.sqlite. Supports snapshot "
+            "and live follow modes."
         )
     )
     parser.add_argument("--run-dir", type=Path, required=True)
@@ -215,36 +218,34 @@ def read_events_lenient(*, path: Path) -> list[EventEnvelope]:
     """Read and parse canonical events, skipping malformed/incomplete rows.
 
     Args:
-        path: Event log file path.
+        path: Run directory or SQLite DB path.
 
     Returns:
         Ordered list of parsed events.
 
     Example:
-        >>> read_events_lenient(path=Path('/tmp/missing-tree-events.jsonl'))
+        >>> read_events_lenient(path=Path('/tmp/missing-tree-events.sqlite'))
         []
     """
 
-    if not path.exists():
-        return []
     events: list[EventEnvelope] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line_text = line.strip()
-            if not line_text:
-                continue
-            try:
-                payload = json.loads(line_text)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(payload, dict):
-                continue
-            try:
-                events.append(parse_event_row(row=payload))
-            except (AssertionError, KeyError, TypeError, ValueError):
-                continue
+    for payload in _read_event_rows_lenient(path=path):
+        try:
+            events.append(parse_event_row(row=payload))
+        except (AssertionError, KeyError, TypeError, ValueError):
+            continue
     events.sort(key=lambda row: row.event_index)
     return events
+
+
+def _read_event_rows_lenient(*, path: Path) -> list[dict[str, Any]]:
+    """Read event rows from SQLite or a run directory."""
+
+    if path.is_dir():
+        return EventDatabase(path=path / EVENT_DB_FILENAME).read_event_rows()
+    if path.name == EVENT_DB_FILENAME:
+        return EventDatabase(path=path).read_event_rows()
+    return []
 
 
 def replay_attempts(*, events: list[EventEnvelope]) -> dict[AttemptKey, AttemptState]:
@@ -604,9 +605,7 @@ def _apply_leaf_scored_event(*, state: AttemptState, event: EventEnvelope) -> No
             state=state,
             leaf_id=leaf_id,
             node_id=str(payload.get("node_id", "")),
-            fallback_text=str(
-                payload.get("text_preview", payload.get("text", ""))
-            ),
+            fallback_text=str(payload.get("text_preview", payload.get("text", ""))),
         ),
         verification=(
             int(payload["verification"])
@@ -772,6 +771,8 @@ def selected_attempts_by_doc(
             continue
         selected.append(rows[-1])
     return selected
+
+
 STEER_PARTIAL_CLOSE_PATTERN = re.compile(
     r"</steer(?=(?:\s|$|<))",
     flags=re.IGNORECASE,

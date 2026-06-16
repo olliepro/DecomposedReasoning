@@ -8,26 +8,34 @@ from typing import TYPE_CHECKING
 from branching_eval.branch_decode_utils import (
     append_prompt_token_ids,
     candidate_from_choice,
+    choice_has_generated_content,
     consume_choice_tokens,
+    has_boxed_answer_after_first_think_close,
     is_think_close_stop_reason,
+    steer_candidate_has_decision_tag,
     updated_prompt_token_ids,
 )
 from branching_eval.legacy_steer_rollout import (
     complete_trailing_partial_tag,
-    contains_think_close,
     contains_think_close_or_partial,
+    is_chat_eos_stop_reason,
     is_natural_finish_reason,
 )
 from branching_eval.runtime_types import DecodeOutcome
 from branching_eval.steer_normalization import (
     forced_boundary_suffix,
+    is_initial_steer_decision_boundary,
+    is_inside_open_exec,
     steer_candidate_stop_markers,
 )
 from branching_eval.tree_types import TokenTrace
-from vllm_client import GenerationChoice
+from vllm_client import GenerationChoice, truncate_choice_at_chat_eos
 
 if TYPE_CHECKING:
     from branching_eval.branch_executor import BranchExecutor
+
+
+POST_THINK_CONTINUATION_MAX_TOKENS = 2048
 
 
 def should_branch_at_trigger(*, executor: BranchExecutor) -> bool:
@@ -72,19 +80,179 @@ def _build_steer_continuation_outcome(
         Continued decode outcome with normalized steer suffix appended in-path.
     """
 
+    span_start = len(token_ids)
     updated_generated_tokens = generated_tokens + len(steer_token_ids)
-    event_type = "terminated" if contains_think_close(text=steer_text) else "continued"
-    stop_reason = "think_end" if event_type == "terminated" else ""
+    span_end = span_start + len(steer_token_ids)
     return DecodeOutcome(
-        event_type=event_type,
+        event_type="continued",
         trigger_type=None,
         assistant_prefix=canonical_prefix + steer_text,
         prompt_token_ids=updated_prompt_ids,
         token_ids=tuple(token_ids) + tuple(steer_token_ids),
         token_traces=tuple(token_traces) + tuple(steer_candidate_tokens),
         generated_tokens=updated_generated_tokens,
-        stop_reason=stop_reason,
+        stop_reason="",
     )
+
+
+def _build_malformed_steer_termination_outcome(
+    *,
+    canonical_prefix: str,
+    updated_prompt_ids: tuple[int, ...] | None,
+    token_ids: tuple[int, ...],
+    token_traces: tuple[TokenTrace, ...],
+    steer_text: str,
+    steer_token_ids: tuple[int, ...],
+    steer_candidate_tokens: tuple[TokenTrace, ...],
+    generated_tokens: int,
+) -> DecodeOutcome:
+    """Build a terminal outcome that still preserves rejected steer text."""
+
+    span_start = len(token_ids)
+    span_end = span_start + len(steer_token_ids)
+    updated_generated_tokens = generated_tokens + len(steer_token_ids)
+    return DecodeOutcome(
+        event_type="terminated",
+        trigger_type=None,
+        assistant_prefix=canonical_prefix + steer_text,
+        prompt_token_ids=updated_prompt_ids,
+        token_ids=tuple(token_ids) + tuple(steer_token_ids),
+        token_traces=tuple(token_traces) + tuple(steer_candidate_tokens),
+        generated_tokens=updated_generated_tokens,
+        stop_reason="missing_steer_or_think_close",
+        steer_phase_token_spans=((span_start, span_end),),
+    )
+
+
+def terminate_on_chat_eos_choice(
+    *,
+    executor: BranchExecutor,
+    choice: GenerationChoice,
+    assistant_prefix: str,
+    prompt_token_ids: tuple[int, ...] | None,
+    token_ids: tuple[int, ...],
+    token_traces: tuple[TokenTrace, ...],
+    generated_tokens: int,
+    request_stream_id: str,
+) -> DecodeOutcome:
+    """Consume one EOS-stopped choice as terminal without normalization."""
+
+    if not choice_has_generated_content(choice=choice):
+        return DecodeOutcome(
+            event_type="terminated",
+            trigger_type=None,
+            assistant_prefix=assistant_prefix,
+            prompt_token_ids=prompt_token_ids,
+            token_ids=token_ids,
+            token_traces=token_traces,
+            generated_tokens=generated_tokens,
+            stop_reason="model_finished",
+        )
+    outcome = consume_choice_tokens(
+        choice=choice,
+        assistant_prefix=assistant_prefix,
+        token_ids=list(token_ids),
+        token_traces=list(token_traces),
+        generated_tokens=generated_tokens,
+        trigger_steer=False,
+        branch_prob=0.0,
+        rng=executor.random,
+    )
+    consumed_tokens = outcome.generated_tokens - generated_tokens
+    updated_prompt_ids = updated_prompt_token_ids(
+        current_prompt_token_ids=prompt_token_ids,
+        choice=choice,
+        consumed_tokens=consumed_tokens,
+    )
+    executor._update_request_stream_state_output_ids(
+        request_stream_id=request_stream_id,
+        consumed_output_token_ids=tuple(choice.token_ids or ())[:consumed_tokens],
+    )
+    return replace(
+        outcome,
+        event_type="terminated",
+        trigger_type=None,
+        prompt_token_ids=updated_prompt_ids,
+        stop_reason="model_finished",
+    )
+
+
+def _open_steer_generation_prefix(*, text: str) -> str | None:
+    """Return the open steer prefix that should be sampled before normalization."""
+
+    completed_text, repaired_tag = complete_trailing_partial_tag(text=text)
+    if repaired_tag not in (None, "<steer>"):
+        return None
+    if not completed_text.lower().endswith("<steer>"):
+        return None
+    if is_inside_open_exec(text=completed_text):
+        return None
+    return completed_text
+
+
+def prepare_steer_generation_prefix(
+    *,
+    executor: BranchExecutor,
+    assistant_prefix: str,
+    prompt_token_ids: tuple[int, ...] | None,
+) -> tuple[str, tuple[int, ...] | None]:
+    """Prepare the prefix used to sample steer text.
+
+    An already-open steer tag should receive model text before structural
+    normalization runs. Invalid prefixes, especially open exec blocks, still use
+    full normalization before candidate sampling.
+    """
+
+    open_prefix = _open_steer_generation_prefix(text=assistant_prefix)
+    if open_prefix is None:
+        if is_initial_steer_decision_boundary(text=assistant_prefix):
+            return assistant_prefix, prompt_token_ids
+        return executor._normalize_steer_prefix_prompt_ids(
+            assistant_prefix=assistant_prefix,
+            prompt_token_ids=prompt_token_ids,
+        )
+    if prompt_token_ids is None:
+        return open_prefix, None
+    injected_suffix = open_prefix[len(assistant_prefix) :]
+    if not injected_suffix:
+        return open_prefix, prompt_token_ids
+    suffix_token_ids = executor._tokenize_text(text=injected_suffix)
+    executor._assert_text_token_alignment(
+        text=injected_suffix,
+        token_ids=tuple(suffix_token_ids),
+        context="open_steer_prefix_completion",
+    )
+    return open_prefix, tuple(prompt_token_ids) + tuple(suffix_token_ids)
+
+
+async def prepare_steer_generation_prefix_async(
+    *,
+    executor: BranchExecutor,
+    assistant_prefix: str,
+    prompt_token_ids: tuple[int, ...] | None,
+) -> tuple[str, tuple[int, ...] | None]:
+    """Async variant of `prepare_steer_generation_prefix`."""
+
+    open_prefix = _open_steer_generation_prefix(text=assistant_prefix)
+    if open_prefix is None:
+        if is_initial_steer_decision_boundary(text=assistant_prefix):
+            return assistant_prefix, prompt_token_ids
+        return await executor._normalize_steer_prefix_prompt_ids_async(
+            assistant_prefix=assistant_prefix,
+            prompt_token_ids=prompt_token_ids,
+        )
+    if prompt_token_ids is None:
+        return open_prefix, None
+    injected_suffix = open_prefix[len(assistant_prefix) :]
+    if not injected_suffix:
+        return open_prefix, prompt_token_ids
+    suffix_token_ids = await executor._tokenize_text_async(text=injected_suffix)
+    await executor._assert_text_token_alignment_async(
+        text=injected_suffix,
+        token_ids=tuple(suffix_token_ids),
+        context="open_steer_prefix_completion",
+    )
+    return open_prefix, tuple(prompt_token_ids) + tuple(suffix_token_ids)
 
 
 def continue_with_single_steer_candidate(
@@ -127,11 +295,10 @@ def continue_with_single_steer_candidate(
             generated_tokens=generated_tokens,
             stop_reason="max_gen_toks_reached",
         )
-    canonical_prefix, canonical_prompt_ids = (
-        executor._normalize_steer_prefix_prompt_ids(
-            assistant_prefix=assistant_prefix,
-            prompt_token_ids=prompt_token_ids,
-        )
+    canonical_prefix, canonical_prompt_ids = prepare_steer_generation_prefix(
+        executor=executor,
+        assistant_prefix=assistant_prefix,
+        prompt_token_ids=prompt_token_ids,
     )
     # Steer normalization can rewrite the prompt boundary, so the next request
     # must start a fresh prefix chain for this stream.
@@ -146,9 +313,21 @@ def continue_with_single_steer_candidate(
         request_stream_id=request_stream_id,
         enforce_prefix_chain=True,
     )
-    if not steer_choice.tokens and not is_think_close_stop_reason(
-        stop_reason=steer_choice.stop_reason
-    ):
+    steer_choice = truncate_choice_at_chat_eos(choice=steer_choice)
+    if is_chat_eos_stop_reason(stop_reason=steer_choice.stop_reason):
+        return terminate_on_chat_eos_choice(
+            executor=executor,
+            choice=steer_choice,
+            assistant_prefix=canonical_prefix,
+            prompt_token_ids=canonical_prompt_ids,
+            token_ids=token_ids,
+            token_traces=token_traces,
+            generated_tokens=generated_tokens,
+            request_stream_id=request_stream_id,
+        )
+    if not choice_has_generated_content(
+        choice=steer_choice
+    ) and not is_think_close_stop_reason(stop_reason=steer_choice.stop_reason):
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
@@ -164,9 +343,40 @@ def continue_with_single_steer_candidate(
         choice=steer_choice,
         enforce_steer_stop_boundary=True,
     )
+    steer_candidate_text, steer_candidate_token_ids = (
+        executor._append_think_close_stop_suffix(
+            candidate=steer_candidate
+        )
+    )
+    if steer_candidate_text and not steer_candidate_token_ids:
+        steer_candidate_token_ids = tuple(
+            executor._tokenize_text(text=steer_candidate_text)
+        )
+    malformed_prompt_ids = append_prompt_token_ids(
+        prompt_token_ids=canonical_prompt_ids,
+        continuation_token_ids=tuple(steer_candidate_token_ids),
+    )
+    if not steer_candidate_has_decision_tag(
+        prefix=canonical_prefix,
+        candidate_text=steer_candidate_text,
+    ):
+        executor._update_request_stream_state_output_ids(
+            request_stream_id=request_stream_id,
+            consumed_output_token_ids=tuple(steer_candidate.token_ids),
+        )
+        return _build_malformed_steer_termination_outcome(
+            canonical_prefix=canonical_prefix,
+            updated_prompt_ids=malformed_prompt_ids,
+            token_ids=token_ids,
+            token_traces=token_traces,
+            steer_text=steer_candidate_text,
+            steer_token_ids=tuple(steer_candidate_token_ids),
+            steer_candidate_tokens=tuple(steer_candidate.tokens),
+            generated_tokens=generated_tokens,
+        )
     steer_text, steer_token_ids = executor._normalized_child_candidate(
         trigger_type="steer_boundary",
-        candidate=steer_candidate,
+        candidate=steer_candidate
     )
     updated_prompt_ids = append_prompt_token_ids(
         prompt_token_ids=canonical_prompt_ids,
@@ -182,7 +392,7 @@ def continue_with_single_steer_candidate(
         )
     executor._update_request_stream_state_output_ids(
         request_stream_id=request_stream_id,
-        consumed_output_token_ids=tuple(steer_choice.token_ids or ()),
+        consumed_output_token_ids=tuple(steer_candidate.token_ids),
     )
     return _build_steer_continuation_outcome(
         executor=executor,
@@ -225,7 +435,8 @@ async def continue_with_single_steer_candidate_async(
             stop_reason="max_gen_toks_reached",
         )
     canonical_prefix, canonical_prompt_ids = (
-        await executor._normalize_steer_prefix_prompt_ids_async(
+        await prepare_steer_generation_prefix_async(
+            executor=executor,
             assistant_prefix=assistant_prefix,
             prompt_token_ids=prompt_token_ids,
         )
@@ -243,9 +454,21 @@ async def continue_with_single_steer_candidate_async(
         request_stream_id=request_stream_id,
         enforce_prefix_chain=True,
     )
-    if not steer_choice.tokens and not is_think_close_stop_reason(
-        stop_reason=steer_choice.stop_reason
-    ):
+    steer_choice = truncate_choice_at_chat_eos(choice=steer_choice)
+    if is_chat_eos_stop_reason(stop_reason=steer_choice.stop_reason):
+        return terminate_on_chat_eos_choice(
+            executor=executor,
+            choice=steer_choice,
+            assistant_prefix=canonical_prefix,
+            prompt_token_ids=canonical_prompt_ids,
+            token_ids=token_ids,
+            token_traces=token_traces,
+            generated_tokens=generated_tokens,
+            request_stream_id=request_stream_id,
+        )
+    if not choice_has_generated_content(
+        choice=steer_choice
+    ) and not is_think_close_stop_reason(stop_reason=steer_choice.stop_reason):
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
@@ -261,6 +484,37 @@ async def continue_with_single_steer_candidate_async(
         choice=steer_choice,
         enforce_steer_stop_boundary=True,
     )
+    steer_candidate_text, steer_candidate_token_ids = (
+        await executor._append_think_close_stop_suffix_async(
+            candidate=steer_candidate
+        )
+    )
+    if steer_candidate_text and not steer_candidate_token_ids:
+        steer_candidate_token_ids = tuple(
+            await executor._tokenize_text_async(text=steer_candidate_text)
+        )
+    malformed_prompt_ids = append_prompt_token_ids(
+        prompt_token_ids=canonical_prompt_ids,
+        continuation_token_ids=tuple(steer_candidate_token_ids),
+    )
+    if not steer_candidate_has_decision_tag(
+        prefix=canonical_prefix,
+        candidate_text=steer_candidate_text,
+    ):
+        executor._update_request_stream_state_output_ids(
+            request_stream_id=request_stream_id,
+            consumed_output_token_ids=tuple(steer_candidate.token_ids),
+        )
+        return _build_malformed_steer_termination_outcome(
+            canonical_prefix=canonical_prefix,
+            updated_prompt_ids=malformed_prompt_ids,
+            token_ids=token_ids,
+            token_traces=token_traces,
+            steer_text=steer_candidate_text,
+            steer_token_ids=tuple(steer_candidate_token_ids),
+            steer_candidate_tokens=tuple(steer_candidate.tokens),
+            generated_tokens=generated_tokens,
+        )
     steer_text, steer_token_ids = await executor._normalized_child_candidate_async(
         trigger_type="steer_boundary",
         candidate=steer_candidate,
@@ -279,7 +533,7 @@ async def continue_with_single_steer_candidate_async(
         )
     executor._update_request_stream_state_output_ids(
         request_stream_id=request_stream_id,
-        consumed_output_token_ids=tuple(steer_choice.token_ids or ()),
+        consumed_output_token_ids=tuple(steer_candidate.token_ids),
     )
     return _build_steer_continuation_outcome(
         executor=executor,
@@ -324,7 +578,20 @@ def resolve_think_close_outcome(
         finish_reason=str(choice.finish_reason),
         stop_reason=choice.stop_reason,
     )
-    if natural_finish and contains_think_close(text=str(choice.text)):
+    if is_chat_eos_stop_reason(stop_reason=choice.stop_reason):
+        return DecodeOutcome(
+            event_type="terminated",
+            trigger_type=None,
+            assistant_prefix=assistant_prefix,
+            prompt_token_ids=prompt_token_ids,
+            token_ids=token_ids,
+            token_traces=token_traces,
+            generated_tokens=generated_tokens,
+            stop_reason="model_finished",
+        )
+    if natural_finish and has_boxed_answer_after_first_think_close(
+        text=assistant_prefix
+    ):
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
@@ -363,7 +630,20 @@ async def resolve_think_close_outcome_async(
         finish_reason=str(choice.finish_reason),
         stop_reason=choice.stop_reason,
     )
-    if natural_finish and contains_think_close(text=str(choice.text)):
+    if is_chat_eos_stop_reason(stop_reason=choice.stop_reason):
+        return DecodeOutcome(
+            event_type="terminated",
+            trigger_type=None,
+            assistant_prefix=assistant_prefix,
+            prompt_token_ids=prompt_token_ids,
+            token_ids=token_ids,
+            token_traces=token_traces,
+            generated_tokens=generated_tokens,
+            stop_reason="model_finished",
+        )
+    if natural_finish and has_boxed_answer_after_first_think_close(
+        text=assistant_prefix
+    ):
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
@@ -383,6 +663,26 @@ async def resolve_think_close_outcome_async(
         generated_tokens=generated_tokens,
         request_stream_id=request_stream_id,
     )
+
+
+def _think_close_stop_reason(
+    *,
+    finish_reason: str,
+    stop_reason: int | str | None,
+    context_limited: bool = False,
+    post_think_limited: bool = False,
+) -> str:
+    """Return a terminal stop reason for post-think answer continuation."""
+
+    if is_chat_eos_stop_reason(stop_reason=stop_reason):
+        return "model_finished"
+    if str(finish_reason) != "length":
+        return "think_end"
+    if context_limited:
+        return "max_context_length_reached"
+    if post_think_limited:
+        return "post_think_toks_reached"
+    return "max_gen_toks_reached"
 
 
 def continue_after_think_close(
@@ -409,8 +709,11 @@ def continue_after_think_close(
         Terminal decode outcome for no-stop continuation.
     """
 
-    remaining = executor.decoding.max_gen_toks - generated_tokens
-    if remaining <= 0:
+    request_budget = executor._request_token_budget(
+        prompt_token_ids=prompt_token_ids,
+        generated_tokens=generated_tokens,
+    )
+    if request_budget.max_tokens <= 0:
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
@@ -419,19 +722,37 @@ def continue_after_think_close(
             token_ids=token_ids,
             token_traces=token_traces,
             generated_tokens=generated_tokens,
-            stop_reason="max_gen_toks_reached",
+            stop_reason=request_budget.exhausted_stop_reason,
         )
+    continuation_max_tokens = min(
+        request_budget.max_tokens,
+        POST_THINK_CONTINUATION_MAX_TOKENS,
+    )
+    post_think_limited = continuation_max_tokens < request_budget.max_tokens
+    executor._reset_request_stream_state(request_stream_id=request_stream_id)
     continuation_choice = executor._generate_choice(
         assistant_prefix=assistant_prefix,
         prompt_token_ids=prompt_token_ids,
-        max_tokens=remaining,
+        max_tokens=continuation_max_tokens,
         stop=None,
         n=1,
         request_kind="think_close_continuation",
         request_stream_id=request_stream_id,
         enforce_prefix_chain=True,
     )
-    if not continuation_choice.tokens:
+    continuation_choice = truncate_choice_at_chat_eos(choice=continuation_choice)
+    if is_chat_eos_stop_reason(stop_reason=continuation_choice.stop_reason):
+        return terminate_on_chat_eos_choice(
+            executor=executor,
+            choice=continuation_choice,
+            assistant_prefix=assistant_prefix,
+            prompt_token_ids=prompt_token_ids,
+            token_ids=token_ids,
+            token_traces=token_traces,
+            generated_tokens=generated_tokens,
+            request_stream_id=request_stream_id,
+        )
+    if not choice_has_generated_content(choice=continuation_choice):
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
@@ -464,10 +785,11 @@ def continue_after_think_close(
             :consumed_tokens
         ],
     )
-    stop_reason = (
-        "max_gen_toks_reached"
-        if str(continuation_choice.finish_reason) == "length"
-        else "think_end"
+    stop_reason = _think_close_stop_reason(
+        finish_reason=str(continuation_choice.finish_reason),
+        stop_reason=continuation_choice.stop_reason,
+        context_limited=request_budget.context_limited,
+        post_think_limited=post_think_limited,
     )
     return replace(
         continuation,
@@ -489,8 +811,11 @@ async def continue_after_think_close_async(
 ) -> DecodeOutcome:
     """Async variant for no-stop continuation after think-close markers."""
 
-    remaining = executor.decoding.max_gen_toks - generated_tokens
-    if remaining <= 0:
+    request_budget = executor._request_token_budget(
+        prompt_token_ids=prompt_token_ids,
+        generated_tokens=generated_tokens,
+    )
+    if request_budget.max_tokens <= 0:
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
@@ -499,19 +824,37 @@ async def continue_after_think_close_async(
             token_ids=token_ids,
             token_traces=token_traces,
             generated_tokens=generated_tokens,
-            stop_reason="max_gen_toks_reached",
+            stop_reason=request_budget.exhausted_stop_reason,
         )
+    continuation_max_tokens = min(
+        request_budget.max_tokens,
+        POST_THINK_CONTINUATION_MAX_TOKENS,
+    )
+    post_think_limited = continuation_max_tokens < request_budget.max_tokens
+    executor._reset_request_stream_state(request_stream_id=request_stream_id)
     continuation_choice = await executor._generate_choice_async(
         assistant_prefix=assistant_prefix,
         prompt_token_ids=prompt_token_ids,
-        max_tokens=remaining,
+        max_tokens=continuation_max_tokens,
         stop=None,
         n=1,
         request_kind="think_close_continuation",
         request_stream_id=request_stream_id,
         enforce_prefix_chain=True,
     )
-    if not continuation_choice.tokens:
+    continuation_choice = truncate_choice_at_chat_eos(choice=continuation_choice)
+    if is_chat_eos_stop_reason(stop_reason=continuation_choice.stop_reason):
+        return terminate_on_chat_eos_choice(
+            executor=executor,
+            choice=continuation_choice,
+            assistant_prefix=assistant_prefix,
+            prompt_token_ids=prompt_token_ids,
+            token_ids=token_ids,
+            token_traces=token_traces,
+            generated_tokens=generated_tokens,
+            request_stream_id=request_stream_id,
+        )
+    if not choice_has_generated_content(choice=continuation_choice):
         return DecodeOutcome(
             event_type="terminated",
             trigger_type=None,
@@ -544,10 +887,11 @@ async def continue_after_think_close_async(
             :consumed_tokens
         ],
     )
-    stop_reason = (
-        "max_gen_toks_reached"
-        if str(continuation_choice.finish_reason) == "length"
-        else "think_end"
+    stop_reason = _think_close_stop_reason(
+        finish_reason=str(continuation_choice.finish_reason),
+        stop_reason=continuation_choice.stop_reason,
+        context_limited=request_budget.context_limited,
+        post_think_limited=post_think_limited,
     )
     return replace(
         continuation,
@@ -591,11 +935,10 @@ def resolve_steer_length_outcome(
         updated_text=repaired_prefix,
     )
     if repaired_tag == "<steer>":
-        normalized_prefix, normalized_prompt_ids = (
-            executor._normalize_steer_prefix_prompt_ids(
-                assistant_prefix=repaired_prefix,
-                prompt_token_ids=repaired_prompt_ids,
-            )
+        normalized_prefix, normalized_prompt_ids = prepare_steer_generation_prefix(
+            executor=executor,
+            assistant_prefix=repaired_prefix,
+            prompt_token_ids=repaired_prompt_ids,
         )
         return DecodeOutcome(
             event_type="trigger",
@@ -659,7 +1002,8 @@ async def resolve_steer_length_outcome_async(
     )
     if repaired_tag == "<steer>":
         normalized_prefix, normalized_prompt_ids = (
-            await executor._normalize_steer_prefix_prompt_ids_async(
+            await prepare_steer_generation_prefix_async(
+                executor=executor,
                 assistant_prefix=repaired_prefix,
                 prompt_token_ids=repaired_prompt_ids,
             )

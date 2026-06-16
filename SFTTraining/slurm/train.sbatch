@@ -55,20 +55,33 @@ if [[ ! -f "${ACCELERATE_CONFIG_FILE}" ]]; then
   echo "Accelerate config not found: ${ACCELERATE_CONFIG_FILE}"
   exit 1
 fi
-if [[ ! -d "${EVAL_PROJECT_DIR}" ]]; then
-  echo "Eval project directory not found: ${EVAL_PROJECT_DIR}"
-  exit 1
-fi
-EVAL_STANDALONE_SCRIPT="${EVAL_PROJECT_DIR}/scripts/run_standalone_eval.sh"
-if [[ ! -x "${EVAL_STANDALONE_SCRIPT}" ]]; then
-  echo "Eval standalone script not found or not executable: ${EVAL_STANDALONE_SCRIPT}"
-  exit 1
+SKIP_EVAL="${SKIP_EVAL:-0}"
+if [[ "${SKIP_EVAL}" != "1" ]]; then
+  if [[ ! -d "${EVAL_PROJECT_DIR}" ]]; then
+    echo "Eval project directory not found: ${EVAL_PROJECT_DIR}"
+    exit 1
+  fi
+  EVAL_STANDALONE_SCRIPT="${EVAL_PROJECT_DIR}/scripts/run_standalone_eval.sh"
+  if [[ ! -x "${EVAL_STANDALONE_SCRIPT}" ]]; then
+    echo "Eval standalone script not found or not executable: ${EVAL_STANDALONE_SCRIPT}"
+    exit 1
+  fi
 fi
 
 LOG_ROOT_DIR="${SLURM_SUBMIT_DIR:-${PROJECT_DIR}}"
 mkdir -p "${LOG_ROOT_DIR}/logs"
 
 cd "${PROJECT_DIR}"
+
+if ! command -v module >/dev/null 2>&1; then
+  for MODULE_INIT in /etc/profile.d/lmod.sh /apps/lmod/lmod/init/bash; do
+    if [[ -f "${MODULE_INIT}" ]]; then
+      # shellcheck source=/dev/null
+      source "${MODULE_INIT}"
+      break
+    fi
+  done
+fi
 
 module load python/3.12
 module load cuda/12.4.1
@@ -92,25 +105,39 @@ export HUGGINGFACE_HUB_CACHE="${CACHE_ROOT}/hf_hub"
 export TRITON_CACHE_DIR="${CACHE_ROOT}/triton"
 
 uv sync --frozen --extra train
-TRAIN_PYTHON_BIN="${PROJECT_DIR}/.venv/bin/python"
-ACCELERATE_BIN="${PROJECT_DIR}/.venv/bin/accelerate"
+TRAIN_ENV_DIR="${UV_PROJECT_ENVIRONMENT:-${PROJECT_DIR}/.venv}"
+TRAIN_PYTHON_BIN="${TRAIN_ENV_DIR}/bin/python"
+ACCELERATE_BIN="${TRAIN_ENV_DIR}/bin/accelerate"
 if [[ ! -x "${ACCELERATE_BIN}" ]]; then
   echo "Accelerate binary not found in project venv: ${ACCELERATE_BIN}"
   exit 1
 fi
-(
-  cd "${EVAL_PROJECT_DIR}"
-  uv sync --frozen
-)
-EVAL_PYTHON_BIN="${EVAL_PROJECT_DIR}/.venv/bin/python"
-if [[ ! -x "${EVAL_PYTHON_BIN}" ]]; then
-  echo "Eval python binary not found: ${EVAL_PYTHON_BIN}"
-  exit 1
+if [[ "${SKIP_EVAL}" != "1" ]]; then
+  (
+    cd "${EVAL_PROJECT_DIR}"
+    UV_PROJECT_ENVIRONMENT="${EVAL_PROJECT_DIR}/.venv" uv sync --frozen
+  )
+  EVAL_PYTHON_BIN="${EVAL_PROJECT_DIR}/.venv/bin/python"
+  if [[ ! -x "${EVAL_PYTHON_BIN}" ]]; then
+    echo "Eval python binary not found: ${EVAL_PYTHON_BIN}"
+    exit 1
+  fi
 fi
 JOB_TIMESTAMP="$(date -u +"%Y-%m-%d_%H-%M-%S")"
 WANDB_GROUP_NAME="${RUN_CONFIG_STEM}_${JOB_TIMESTAMP}"
 TRAIN_WANDB_RUN_NAME="${RUN_CONFIG_STEM}_train_${JOB_TIMESTAMP}"
 WANDB_RUN_ID="$("${TRAIN_PYTHON_BIN}" -c "import uuid; print(uuid.uuid4().hex)")"
+GRADIENT_ACCUMULATION_STEPS="$(
+  RUN_CONFIG_PATH="${RUN_CONFIG}" "${TRAIN_PYTHON_BIN}" - <<'PY'
+import os
+from pathlib import Path
+
+from sft_training.config_types import RunConfig
+
+config = RunConfig.from_yaml(yaml_path=Path(os.environ["RUN_CONFIG_PATH"]))
+print(config.gradient_accumulation_steps)
+PY
+)"
 export SFT_JOB_TIMESTAMP="${JOB_TIMESTAMP}"
 export SFT_WANDB_GROUP="${WANDB_GROUP_NAME}"
 export SFT_WANDB_RUN_NAME="${TRAIN_WANDB_RUN_NAME}"
@@ -119,12 +146,14 @@ export SFT_WANDB_RUN_ID="${WANDB_RUN_ID}"
 echo "W&B train run name: ${TRAIN_WANDB_RUN_NAME}"
 echo "W&B group: ${WANDB_GROUP_NAME}"
 echo "W&B run id: ${WANDB_RUN_ID}"
+echo "Gradient accumulation steps: ${GRADIENT_ACCUMULATION_STEPS}"
 
 "${ACCELERATE_BIN}" launch \
   --config_file "${ACCELERATE_CONFIG_FILE}" \
   --num_processes "${NUM_PROCESSES}" \
   --num_machines "${NUM_MACHINES}" \
   --machine_rank "${MACHINE_RANK}" \
+  --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
   -m sft_training.train \
   --config "${RUN_CONFIG}" \
   "$@"

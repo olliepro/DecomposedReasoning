@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -12,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from branching_eval.event_db import EVENT_DB_FILENAME, EventDatabase
 from branching_eval.event_types import EventEnvelope, parse_event_row
 
 
@@ -119,13 +119,19 @@ def parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
 
     parser = argparse.ArgumentParser(
-        description="Track high-level stats for a branching batch tree_events.jsonl file."
+        description="Track high-level stats for branching SQLite events."
     )
     parser.add_argument(
         "--tree-events-path",
         type=Path,
-        required=True,
-        help="Path to the batch-scoped tree_events.jsonl file.",
+        default=None,
+        help="Path to tree_events.sqlite.",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Run directory containing tree_events.sqlite.",
     )
     parser.add_argument(
         "--follow",
@@ -141,24 +147,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_json(*, line: str) -> dict[str, object]:
-    """Parse one JSONL row."""
-
-    row = json.loads(line)
-    assert isinstance(row, dict), "event rows must decode to a mapping"
-    return row
-
-
 def load_events(*, path: Path) -> list[EventEnvelope]:
-    """Load typed event envelopes from one tree-events file."""
+    """Load typed event envelopes from a run dir or SQLite DB."""
 
-    rows: list[EventEnvelope] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            rows.append(parse_event_row(row=parse_json(line=line)))
-    return rows
+    raw_rows = load_event_rows(path=path)
+    return [parse_event_row(row=row) for row in raw_rows]
+
+
+def load_event_rows(*, path: Path) -> list[dict[str, object]]:
+    """Load raw event rows from a run dir or SQLite DB."""
+
+    if path.is_dir():
+        return EventDatabase(path=path / EVENT_DB_FILENAME).read_event_rows()
+    if path.name == EVENT_DB_FILENAME:
+        return EventDatabase(path=path).read_event_rows()
+    raise AssertionError(f"expected run dir or {EVENT_DB_FILENAME}: {path}")
 
 
 def summarize_events(*, path: Path, events: Sequence[EventEnvelope]) -> BatchSummary:
@@ -220,7 +223,11 @@ def render_summary(*, summary: BatchSummary) -> str:
     """Render a batch summary as compact console text."""
 
     capacity = summary.leaf_capacity()
-    fill = "n/a" if capacity in (None, 0) else f"{100.0 * summary.leaf_total() / capacity:.1f}%"
+    fill = (
+        "n/a"
+        if capacity in (None, 0)
+        else f"{100.0 * summary.leaf_total() / capacity:.1f}%"
+    )
     lines = [
         f"file={summary.path}",
         (
@@ -275,9 +282,20 @@ def main() -> None:
     """CLI entry point."""
 
     args = parse_args()
+    source_path = resolve_source_path(args=args)
     if args.follow:
-        follow(path=args.tree_events_path, interval_seconds=args.interval_seconds)
+        follow(path=source_path, interval_seconds=args.interval_seconds)
         return
-    events = tuple(load_events(path=args.tree_events_path))
-    summary = summarize_events(path=args.tree_events_path, events=events)
+    events = tuple(load_events(path=source_path))
+    summary = summarize_events(path=source_path, events=events)
     print(render_summary(summary=summary))
+
+
+def resolve_source_path(*, args: argparse.Namespace) -> Path:
+    """Return the event source path selected by CLI args."""
+
+    if args.run_dir is not None:
+        return Path(args.run_dir)
+    if args.tree_events_path is not None:
+        return Path(args.tree_events_path)
+    raise SystemExit("Provide --run-dir or --tree-events-path.")

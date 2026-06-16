@@ -73,14 +73,15 @@ def select_candidates_all_modes(
     require_clusters = any(
         mode in {"cluster_across", "within_cluster"} for mode in selector_modes
     )
-    require_openai_embeddings = any(
+    require_embedding_selector = any(
         mode == "embed_diverse_topk_random" for mode in selector_modes
     )
     if require_clusters and not openrouter_api_key:
         raise RuntimeError("cluster selectors require OPEN_ROUTER_KEY")
-    if require_openai_embeddings and not openai_api_key:
+    if require_embedding_selector and not (openai_api_key or openrouter_api_key):
         raise RuntimeError(
-            "OPENAI_API_KEY required for embed_diverse_topk_random selector mode"
+            "OPENAI_API_KEY or OPEN_ROUTER_KEY required for "
+            "embed_diverse_topk_random selector mode"
         )
     cluster_assignment = None
     if require_clusters:
@@ -92,13 +93,13 @@ def select_candidates_all_modes(
             cluster_log_path=cluster_log_path,
         )
     diverse_topk_random = None
-    if require_openai_embeddings:
-        assert openai_api_key is not None
+    if require_embedding_selector:
         diverse_topk_random = openai_diverse_topk_random_ids(
             pool=pool,
             branch_count=selector_params.branch_fanout,
             rng=rng,
             openai_api_key=openai_api_key,
+            openrouter_api_key=openrouter_api_key,
         )
     return tuple(
         SelectionOutcome(
@@ -159,14 +160,15 @@ async def select_candidates_all_modes_async(
     require_clusters = any(
         mode in {"cluster_across", "within_cluster"} for mode in selector_modes
     )
-    require_openai_embeddings = any(
+    require_embedding_selector = any(
         mode == "embed_diverse_topk_random" for mode in selector_modes
     )
     if require_clusters and not openrouter_api_key:
         raise RuntimeError("cluster selectors require OPEN_ROUTER_KEY")
-    if require_openai_embeddings and not openai_api_key:
+    if require_embedding_selector and not (openai_api_key or openrouter_api_key):
         raise RuntimeError(
-            "OPENAI_API_KEY required for embed_diverse_topk_random selector mode"
+            "OPENAI_API_KEY or OPEN_ROUTER_KEY required for "
+            "embed_diverse_topk_random selector mode"
         )
     if http_session is None:
         async with aiohttp.ClientSession() as owned_session:
@@ -193,13 +195,13 @@ async def select_candidates_all_modes_async(
             http_session=http_session,
         )
     diverse_topk_random = None
-    if require_openai_embeddings:
-        assert openai_api_key is not None
+    if require_embedding_selector:
         diverse_topk_random = await openai_diverse_topk_random_ids_async(
             pool=pool,
             branch_count=selector_params.branch_fanout,
             rng=rng,
             openai_api_key=openai_api_key,
+            openrouter_api_key=openrouter_api_key,
             session=http_session,
         )
     return tuple(

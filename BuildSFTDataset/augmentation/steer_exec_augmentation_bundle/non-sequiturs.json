@@ -35,6 +35,7 @@
     "sample_cut_points_at_pair_boundaries_only": true,
     "style_window_pairs": 2,
     "exec_token_limit": 512,
+    "steer_token_limit": 15,
     "bridge_default_policy": "not_used",
     "first_new_steer_should_match_variant_exactly": false
   },
@@ -136,7 +137,6 @@
         "Audit the phrase",
         "Check the vowel pattern",
         "Scan the phrase twice",
-        "Count the loud letters",
         "Sort the phrase fragments"
       ],
       "preferred_slots": [],

@@ -185,6 +185,29 @@ def workspace_css() -> str:
   border-color: rgba(255, 177, 153, 0.95);
   background: rgba(255, 177, 153, 0.14);
 }
+.event-nav {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.42rem;
+}
+.metadata-details {
+  border: 1px solid var(--line);
+  border-radius: 0.48rem;
+  background: rgba(255, 255, 255, 0.025);
+}
+.metadata-details summary {
+  cursor: pointer;
+  padding: 0.42rem 0.5rem;
+  color: var(--accent-soft);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.73rem;
+}
+.metadata-details pre {
+  border: 0;
+  border-top: 1px solid rgba(158, 178, 217, 0.2);
+  border-radius: 0;
+  background: rgba(2, 8, 20, 0.42);
+}
 .node-pill-title {
   font-family: "IBM Plex Mono", monospace;
   font-size: 8.3px;
@@ -490,6 +513,10 @@ def workspace_css() -> str:
   border-color: rgba(239, 71, 111, 0.72);
   box-shadow: 0 0 0 1px rgba(239, 71, 111, 0.18) inset;
 }
+.leaf-card.format {
+  border-color: rgba(255, 193, 91, 0.78);
+  box-shadow: 0 0 0 1px rgba(255, 193, 91, 0.2) inset;
+}
 .leaf-card.neutral {
   border-color: rgba(158, 178, 217, 0.52);
 }
@@ -615,6 +642,8 @@ def tree_workspace_script() -> str:
   const candidatePoolByBranchPoint = new Map();
   const nodeDetailById = new Map();
   const nodeDetailRequestById = new Map();
+  const eventDetailRequestById = new Map();
+  let inspectorMetadataRows = null;
   for (const [nodeId, events] of Object.entries(nodeEvents)) {
     if (!Array.isArray(events)) continue;
     for (const event of events) {
@@ -651,9 +680,6 @@ def tree_workspace_script() -> str:
         }
       }
     }
-    if (hydratedEvents.length) {
-      nodeEvents[key] = hydratedEvents;
-    }
     return payload;
   }
 
@@ -686,6 +712,65 @@ def tree_workspace_script() -> str:
     return request;
   }
 
+  function eventDetailPath(event) {
+    if (!event || typeof event !== "object") return "";
+    const nodeId = String(event.node_id || "");
+    const rawEventIndex = event.event_index;
+    const eventIndex = (rawEventIndex === undefined || rawEventIndex === null || rawEventIndex === "")
+      ? ""
+      : String(rawEventIndex);
+    const nodePath = detailPathForNode(nodeId);
+    if (!nodePath || !eventIndex) return "";
+    return nodePath.replace(/\\.json$/, `/events/${eventIndex}.json`);
+  }
+
+  function promptTextPath(event) {
+    const detailPath = eventDetailPath(event);
+    return detailPath ? detailPath.replace(/\\.json$/, "/prompt.txt") : "";
+  }
+
+  function loadEventDetail(eventId) {
+    const key = String(eventId || "");
+    const event = eventById.get(key);
+    if (!event) return Promise.resolve(null);
+    const details = event.details && typeof event.details === "object" ? event.details : {};
+    const choices = Array.isArray(details.choices) ? details.choices : [];
+    if (event.event_type === "vllm_step" && choices.length) {
+      return Promise.resolve(event);
+    }
+    const inFlight = eventDetailRequestById.get(key);
+    if (inFlight) return inFlight;
+    const detailPath = eventDetailPath(event);
+    if (!detailPath) {
+      return Promise.reject(new Error("Missing event detail path"));
+    }
+    const request = fetch(detailPath)
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`Failed to load event detail: ${response.status}`);
+        }
+        return response.json();
+      })
+      .then((payload) => {
+        eventDetailRequestById.delete(key);
+        if (payload && typeof payload === "object") {
+          const hydrated = { ...event, ...payload, node_id: event.node_id };
+          eventById.set(key, hydrated);
+          const events = Array.isArray(nodeEvents[event.node_id]) ? nodeEvents[event.node_id] : [];
+          const index = events.findIndex((row) => String(row.event_id) === key);
+          if (index >= 0) events[index] = hydrated;
+          return hydrated;
+        }
+        return event;
+      })
+      .catch((error) => {
+        eventDetailRequestById.delete(key);
+        throw error;
+      });
+    eventDetailRequestById.set(key, request);
+    return request;
+  }
+
   const modeKey = {
     tokens: "tokens",
     steps: "steps",
@@ -711,13 +796,13 @@ def tree_workspace_script() -> str:
     },
   };
   let currentMode = "steps";
-  let selectedNodeId = null;
   let selectedEventId = null;
   let tokenHoverSeq = 0;
   const tokenHoverRowsById = new Map();
   const treeStepMetrics = buildTreeStepMetrics();
   const treeHierarchyLayout = buildTreeHierarchyLayout();
   const leafOutcomeByNode = buildLeafOutcomeByNode();
+  let selectedNodeId = initialInspectableNodeId();
 
   const svgNs = "http://www.w3.org/2000/svg";
 
@@ -912,6 +997,40 @@ def tree_workspace_script() -> str:
     return events;
   }
 
+  function nodeOrderLabel(node) {
+    const nodeId = String(node.node_id || "");
+    return String(treeHierarchyLayout.labelByNode.get(nodeId) || nodeId);
+  }
+
+  function compareNodeOrder(left, right) {
+    return nodeOrderLabel(left).localeCompare(
+      nodeOrderLabel(right),
+      undefined,
+      { numeric: true, sensitivity: "base" },
+    );
+  }
+
+  function nodeHasEvents(node) {
+    const nodeId = String(node.node_id || "");
+    if (!nodeId) return false;
+    if (asNumber(node.event_count) > 0) return true;
+    return Array.isArray(nodeEvents[nodeId]) && nodeEvents[nodeId].length > 0;
+  }
+
+  function initialInspectableNodeId() {
+    const eventful = nodes.filter(nodeHasEvents).sort(compareNodeOrder)[0];
+    if (eventful) return String(eventful.node_id || "");
+    const withDetail = nodes.find((node) => String(node.detail_path || ""));
+    return withDetail ? String(withDetail.node_id || "") : null;
+  }
+
+  function eventfulChildNodes(parentNodeId) {
+    return nodes
+      .filter((node) => String(node.parent_node_id || "") === String(parentNodeId))
+      .filter(nodeHasEvents)
+      .sort(compareNodeOrder);
+  }
+
   function treeNodeMetricValue(node) {
     if (currentMode !== "steps") {
       return metricValue(node.metrics);
@@ -920,6 +1039,18 @@ def tree_workspace_script() -> str:
     const range = treeStepMetrics.rangeByNode.get(nodeId);
     if (range) {
       return asNumber(range.end);
+    }
+    return 0;
+  }
+
+  function treeNodeStartMetricValue(node) {
+    if (currentMode !== "steps") {
+      return treeNodeMetricValue(node);
+    }
+    const nodeId = String(node.node_id || "");
+    const range = treeStepMetrics.rangeByNode.get(nodeId);
+    if (range) {
+      return asNumber(range.start);
     }
     return 0;
   }
@@ -950,6 +1081,8 @@ def tree_workspace_script() -> str:
         outcomeByNode.set(nodeId, {
           eventIndex,
           verification: details.verification,
+          raw_answer_acc: leafField(details, "raw_answer_acc"),
+          format_valid: leafField(details, "format_valid"),
           stopReason: String(details.stop_reason || ""),
         });
       }
@@ -978,13 +1111,51 @@ def tree_workspace_script() -> str:
     return "";
   }
 
+  function boolMetric(value) {
+    if (typeof value === "boolean") return value;
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) return numeric !== 0;
+    const normalized = String(value ?? "").trim().toLowerCase();
+    if (["true", "yes", "y", "on"].includes(normalized)) return true;
+    if (["false", "no", "n", "off"].includes(normalized)) return false;
+    return null;
+  }
+
+  function leafField(leaf, key) {
+    if (!leaf || typeof leaf !== "object") return undefined;
+    if (leaf[key] !== undefined && leaf[key] !== null && leaf[key] !== "") {
+      return leaf[key];
+    }
+    const metrics = leaf.task_metrics && typeof leaf.task_metrics === "object"
+      ? leaf.task_metrics
+      : {};
+    return metrics[key];
+  }
+
+  function leafOutcomeKind(leaf) {
+    const verification = Number(leaf && leaf.verification);
+    const rawAnswerAcc = boolMetric(leafField(leaf, "raw_answer_acc"));
+    const formatValid = boolMetric(leafField(leaf, "format_valid"));
+    if (rawAnswerAcc === true && formatValid === false) return "answer_format_invalid";
+    if (Number.isFinite(verification) && verification === 1) return "correct";
+    if (rawAnswerAcc === true) return "answer_reward_gated";
+    if (Number.isFinite(verification) && verification === 0) return "incorrect";
+    return "unscored";
+  }
+
   function leafStatusSuffix(nodeId) {
     const outcome = leafOutcomeByNode.get(String(nodeId));
     if (!outcome) return "";
-    const verify = verificationIcon(outcome.verification);
+    const outcomeKind = leafOutcomeKind(outcome);
     const stop = stopReasonIcon(outcome.stopReason);
     const pieces = [];
-    if (verify) pieces.push(verify);
+    if (outcomeKind === "correct") pieces.push("✅");
+    else if (outcomeKind === "answer_format_invalid") pieces.push("🟡");
+    else if (outcomeKind === "answer_reward_gated") pieces.push("⚠️");
+    else {
+      const verify = verificationIcon(outcome.verification);
+      if (verify) pieces.push(verify);
+    }
     if (stop) pieces.push(stop);
     return pieces.join(" ");
   }
@@ -1013,7 +1184,9 @@ def tree_workspace_script() -> str:
   }
 
   function formatProbabilityPercent(probability) {
-    const p = Math.max(0, Math.min(1, Number(probability || 0)));
+    const value = Number(probability);
+    if (!Number.isFinite(value)) return "n/a";
+    const p = Math.max(0, Math.min(1, value));
     const rounded = Math.round((p * 100) * 100) / 100;
     if (Number.isInteger(rounded)) return `${rounded}%`;
     return `${rounded.toFixed(2)}%`;
@@ -1021,13 +1194,15 @@ def tree_workspace_script() -> str:
 
   function probabilityFromLogprob(logprob) {
     const value = Number(logprob);
-    if (!Number.isFinite(value)) return 0;
+    if (!Number.isFinite(value)) return null;
     const probability = Math.exp(value);
-    return Number.isFinite(probability) ? Math.max(0, Math.min(1, probability)) : 0;
+    return Number.isFinite(probability) ? Math.max(0, Math.min(1, probability)) : null;
   }
 
   function probColor(probability) {
-    const p = Math.max(0, Math.min(1, Number(probability || 0)));
+    const value = Number(probability);
+    if (!Number.isFinite(value)) return "var(--border)";
+    const p = Math.max(0, Math.min(1, value));
     const hue = Math.round(8 + (p * 106));
     const sat = 84;
     const light = Math.round(76 - (p * 14));
@@ -1169,6 +1344,27 @@ def tree_workspace_script() -> str:
     return best ? `${best}${ellipsis}` : ellipsis;
   }
 
+  function truncateSvgTextPreservingSuffix({ textElement, mainText, suffixText, maxWidth }) {
+    const main = String(mainText || "").trim();
+    const suffix = String(suffixText || "").trim();
+    if (!suffix) {
+      return truncateSvgTextToWidth({ textElement, fullText: main, maxWidth });
+    }
+    const suffixSegment = ` ${suffix}`;
+    textElement.textContent = suffixSegment;
+    const suffixWidth = asNumber(textElement.getComputedTextLength());
+    if (maxWidth <= suffixWidth + 6) {
+      return suffix;
+    }
+    const mainWidth = Math.max(0, maxWidth - suffixWidth);
+    const truncatedMain = truncateSvgTextToWidth({
+      textElement,
+      fullText: main,
+      maxWidth: mainWidth,
+    });
+    return truncatedMain ? `${truncatedMain}${suffixSegment}` : suffix;
+  }
+
   function renderAxis(svg, width, top, bottom, minValue, maxValue) {
     const ticks = axisTicksForMode(minValue, maxValue);
     for (const value of ticks) {
@@ -1198,12 +1394,15 @@ def tree_workspace_script() -> str:
   }
 
   function colorForEvent(type) {
+    if (type === "prompt_logged") return "#d7c5ff";
     if (type === "vllm_step") return "#63e6be";
+    if (type === "decode_chunk") return "#7aa2ff";
+    if (type === "steer_block_generated") return "#ffb86b";
     if (type === "trigger_fired") return "#ff875f";
     if (type === "trigger_skipped_max_branch_points") return "#ff9f7f";
     if (type === "candidate_pool_resolved") return "#ffd166";
     if (type === "selector_applied") return "#f6a6ff";
-    if (type === "selector_continued_inline") return "#c9a3ff";
+    if (type === "selector_continued_inline") return "#00e5ff";
     if (type === "leaf_completed") return "#9fe2ff";
     if (type === "leaf_scored") return "#b8f28d";
     return "#9fb4db";
@@ -1393,20 +1592,22 @@ def tree_workspace_script() -> str:
       title.setAttribute("class", "node-pill-title");
       group.appendChild(title);
       const hierarchyLabel = String(treeHierarchyLayout.labelByNode.get(nodeId) || "?");
+      const advantageLabel = String(draw.node.advantage_label || "").trim();
+      const labelPrefix = advantageLabel || hierarchyLabel;
       const rawLabel = cleanBranchLabelText(draw.node.candidate_preview || "");
       const cleanLabel = rawLabel.length > 56 ? `${rawLabel.slice(0, 53)}...` : rawLabel;
       const statusSuffix = leafStatusSuffix(nodeId);
-      const displaySuffix = statusSuffix ? ` ${statusSuffix}` : "";
-      const fullTitle = `${hierarchyLabel} ${cleanLabel || "Node"}${displaySuffix}`;
+      const titleText = `${labelPrefix} ${cleanLabel || "Node"}`;
       const fallbackRightBoundary = width - 24;
       const nextPillStart = nextPillStartByNode.get(nodeId);
       const titleRightBoundary = nextPillStart === undefined
         ? fallbackRightBoundary
         : Math.min(fallbackRightBoundary, nextPillStart - 8);
       const titleMaxWidth = Math.max(12, titleRightBoundary - draw.pillX);
-      title.textContent = truncateSvgTextToWidth({
+      title.textContent = truncateSvgTextPreservingSuffix({
         textElement: title,
-        fullText: fullTitle,
+        mainText: titleText,
+        suffixText: statusSuffix,
         maxWidth: titleMaxWidth,
       });
 
@@ -1436,6 +1637,21 @@ def tree_workspace_script() -> str:
         const selected = selectedEventId === String(event.event_id);
         const chipWidth = selected ? 10 : 8;
         const chipHeight = selected ? 10 : 7;
+        if (selected) {
+          const outlinePad = 4;
+          const outline = document.createElementNS(svgNs, "rect");
+          outline.setAttribute("x", String(eventX - (chipWidth / 2) - outlinePad));
+          outline.setAttribute("y", String(eventGuideY - (chipHeight / 2) - outlinePad));
+          outline.setAttribute("width", String(chipWidth + outlinePad * 2));
+          outline.setAttribute("height", String(chipHeight + outlinePad * 2));
+          outline.setAttribute("rx", String((chipHeight + outlinePad * 2) / 2));
+          outline.setAttribute("fill", "none");
+          outline.setAttribute("stroke", "#ffb199");
+          outline.setAttribute("stroke-width", "2.3");
+          outline.setAttribute("stroke-opacity", "0.98");
+          outline.setAttribute("pointer-events", "none");
+          group.appendChild(outline);
+        }
         const chip = document.createElementNS(svgNs, "rect");
         chip.setAttribute("x", String(eventX - (chipWidth / 2)));
         chip.setAttribute("y", String(eventGuideY - (chipHeight / 2)));
@@ -1448,9 +1664,10 @@ def tree_workspace_script() -> str:
         chip.style.cursor = "pointer";
         chip.addEventListener("click", (clickEvent) => {
           clickEvent.stopPropagation();
-          selectedNodeId = nodeId;
-          selectedEventId = String(event.event_id || "");
-          renderAll();
+          scheduleEventForInspector({
+            eventId: String(event.event_id || ""),
+            nodeId,
+          });
         });
         group.appendChild(chip);
       });
@@ -1467,17 +1684,58 @@ def tree_workspace_script() -> str:
     return `<div class=\"detail-row\"><div class=\"detail-label\">${esc(label)}</div><div class=\"detail-value\">${esc(value)}</div></div>`;
   }
 
+  function metadataDetails(title, value) {
+    const body = typeof value === "string" ? value : JSON.stringify(withoutRawTokenIds(value), null, 2);
+    if (!body || body === "{}") return "";
+    return `
+      <details class="metadata-details">
+        <summary>${esc(String(title || "Metadata"))}</summary>
+        <pre>${esc(body)}</pre>
+      </details>
+    `;
+  }
+
+  function deferredMetadataDetails(title, value) {
+    const html = metadataDetails(title, value);
+    if (!html) return "";
+    if (Array.isArray(inspectorMetadataRows)) {
+      inspectorMetadataRows.push(html);
+      return "";
+    }
+    return html;
+  }
+
+  function renderDeferredMetadata() {
+    if (!Array.isArray(inspectorMetadataRows) || !inspectorMetadataRows.length) {
+      return "";
+    }
+    return `
+      <section class="metadata-stack">
+        <h4 style="margin:0.38rem 0 0.12rem">Metadata</h4>
+        ${inspectorMetadataRows.join("")}
+      </section>
+    `;
+  }
+
   function leafCardClass(leaf) {
-    const verification = Number(leaf && leaf.verification);
-    if (verification === 1) return "good";
-    if (verification === 0) return "bad";
+    const outcomeKind = leafOutcomeKind(leaf);
+    if (outcomeKind === "correct") return "good";
+    if (outcomeKind === "answer_format_invalid") return "format";
+    if (outcomeKind === "answer_reward_gated") return "format";
+    if (outcomeKind === "incorrect") return "bad";
     return "neutral";
   }
 
   function leafVerificationLabel(leaf) {
-    const verification = Number(leaf && leaf.verification);
-    if (verification === 1) return "✅ correct";
-    if (verification === 0) return "❌ incorrect";
+    const outcomeKind = leafOutcomeKind(leaf);
+    if (outcomeKind === "correct") return "✅ reward correct";
+    if (outcomeKind === "answer_format_invalid") {
+      return "🟡 answer correct, format invalid";
+    }
+    if (outcomeKind === "answer_reward_gated") {
+      return "⚠️ answer correct, reward gated";
+    }
+    if (outcomeKind === "incorrect") return "❌ answer incorrect";
     return "unscored";
   }
 
@@ -1493,15 +1751,30 @@ def tree_workspace_script() -> str:
     `;
   }
 
+  function renderTrajectoryCard(trajectory) {
+    if (!trajectory || typeof trajectory !== "object") return "";
+    const text = String(trajectory.text || "");
+    const segmentCount = Number(trajectory.segment_count || 0);
+    if (!text && !segmentCount) return "";
+    const subtitle = `${segmentCount} segments · ${Number(trajectory.token_count || 0)} tokens`;
+    return renderCompletionCard({
+      title: "Trajectory to this node",
+      subtitle,
+      text,
+    });
+  }
+
   function renderLeafCards(leaves) {
     const rows = Array.isArray(leaves) ? leaves : [];
     if (!rows.length) {
       return "<p class='muted'>No final leaves for this node.</p>";
     }
     return `<div class="leaf-card-list">${rows.map((leaf) => {
-      const metrics = leaf && typeof leaf.task_metrics === "object"
-        ? Object.entries(leaf.task_metrics).map(([key, value]) => `${key}=${value}`).join(", ")
-        : "";
+      const rawAnswerAcc = leafField(leaf, "raw_answer_acc");
+      const formatValid = leafField(leaf, "format_valid");
+      const boxedAnswer = leafField(leaf, "boxed_answer");
+      const structureIssues = leafField(leaf, "structure_issues");
+      const taskMetrics = leaf && typeof leaf.task_metrics === "object" ? leaf.task_metrics : {};
       return `
         <article class="leaf-card ${leafCardClass(leaf)}">
           <div class="candidate-head">
@@ -1511,13 +1784,17 @@ def tree_workspace_script() -> str:
           <div class="detail-kv">
             ${detailRow("length", String(leaf.length_tokens_total ?? ""))}
             ${detailRow("stop", String(leaf.stop_reason || ""))}
-            ${detailRow("metrics", metrics || "none")}
+            ${detailRow("raw answer", String(rawAnswerAcc ?? ""))}
+            ${detailRow("format", String(formatValid ?? ""))}
+            ${boxedAnswer ? detailRow("boxed", String(boxedAnswer)) : ""}
+            ${structureIssues ? detailRow("structure issues", String(structureIssues)) : ""}
           </div>
           ${renderCompletionCard({
             title: "Final completion",
             subtitle: String(leaf.text_preview || ""),
             text: String(leaf.text || leaf.text_preview || ""),
           })}
+          ${deferredMetadataDetails("Metrics", taskMetrics)}
         </article>
       `;
     }).join("")}</div>`;
@@ -1530,11 +1807,16 @@ def tree_workspace_script() -> str:
       inspectorHost.innerHTML = "<p class='muted'>Select a node or event.</p>";
       return;
     }
+    tokenHoverRowsById.clear();
+    tokenHoverSeq = 0;
     const metrics = node.metrics || {};
     const rows = [];
     const stepRange = treeStepMetrics.rangeByNode.get(String(nodeId));
     rows.push(`<h3><code>${esc(nodeId)}</code></h3>`);
     rows.push(detailRow("label", cleanBranchLabelText(node.candidate_preview || "")));
+    if (node.advantage_label) {
+      rows.push(detailRow("advantage", String(node.advantage_label)));
+    }
     rows.push(detailRow("depth", String(node.depth ?? "")));
     rows.push(detailRow("events", String(node.event_count ?? "")));
     rows.push(detailRow("tokens", String(asNumber(metrics.tokens).toFixed(0))));
@@ -1545,9 +1827,72 @@ def tree_workspace_script() -> str:
       ),
     );
     rows.push(detailRow("time_s", String(asNumber(metrics.time_seconds).toFixed(2))));
-    const events = Array.isArray(nodeEvents[nodeId]) ? nodeEvents[nodeId] : [];
+    const graphEvents = Array.isArray(nodeEvents[nodeId]) ? nodeEvents[nodeId] : [];
+    const nodeDetail = nodeDetailById.get(String(nodeId));
+    const events = nodeDetail && Array.isArray(nodeDetail.events)
+      ? nodeDetail.events
+      : graphEvents;
+    const leafRows = nodeDetail && Array.isArray(nodeDetail.leaves)
+      ? nodeDetail.leaves
+      : [];
+    const trajectoryHtml = nodeDetail ? renderTrajectoryCard(nodeDetail.trajectory) : "";
+    const detailPath = String(node.detail_path || "");
+    const fullEventCount = asNumber(node.event_count);
+    const needsFullEventList = (
+      detailPath
+      && !nodeDetail
+      && fullEventCount > graphEvents.length
+    );
+    if ((!events.length && detailPath && !nodeDetail) || needsFullEventList) {
+      rows.push("<p class='muted'>Loading full node event list...</p>");
+      inspectorHost.innerHTML = rows.join("");
+      loadNodeDetail(nodeId)
+        .then(() => {
+          if (selectedNodeId === nodeId && !selectedEventId) {
+            renderNodeInspector(nodeId);
+          }
+        })
+        .catch((error) => {
+          if (selectedNodeId === nodeId && !selectedEventId) {
+            inspectorHost.innerHTML = rows.join("")
+              + `<p class="muted">Failed to load node details: ${esc(error && error.message ? error.message : error)}</p>`;
+          }
+        });
+      return;
+    }
     if (!events.length) {
+      const childNodes = eventfulChildNodes(nodeId);
+      if (childNodes.length) {
+        const buttons = childNodes.slice(0, 80).map((childNode) => {
+          const childId = String(childNode.node_id || "");
+          const orderLabel = nodeOrderLabel(childNode);
+          const eventCount = asNumber(childNode.event_count);
+          const summary = `${orderLabel} · ${childId} · ${eventCount} events`;
+          return `<button class=\"event-btn\" data-node-id=\"${esc(childId)}\">${esc(summary)}</button>`;
+        });
+        rows.push("<h4 style='margin:0.32rem 0 0.12rem'>Rollout nodes</h4>");
+        rows.push("<div class='event-list'>" + buttons.join("") + "</div>");
+        inspectorHost.innerHTML = rows.join("");
+        inspectorHost.querySelectorAll(".event-btn[data-node-id]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const childId = button.getAttribute("data-node-id");
+            if (!childId) return;
+            selectedNodeId = childId;
+            selectedEventId = null;
+            renderAll();
+          });
+        });
+        return;
+      }
       rows.push("<p class='muted'>No node-local events.</p>");
+      if (trajectoryHtml) {
+        rows.push("<h4 style='margin:0.32rem 0 0.12rem'>Trajectory</h4>");
+        rows.push(trajectoryHtml);
+      }
+      if (leafRows.length) {
+        rows.push("<h4 style='margin:0.32rem 0 0.12rem'>Final leaves</h4>");
+        rows.push(renderLeafCards(leafRows));
+      }
       inspectorHost.innerHTML = rows.join("");
       return;
     }
@@ -1558,13 +1903,16 @@ def tree_workspace_script() -> str:
         const active = selectedEventId === String(event.event_id) ? "active" : "";
         const summary = `${event.event_index} · ${event.event_type} · ${event.summary || ""}`;
         return `<button class=\"event-btn ${active}\" data-event-id=\"${esc(event.event_id)}\">${esc(summary)}</button>`;
-      });
+    });
     rows.push("<div class='event-list'>" + buttons.join("") + "</div>");
-    const nodeDetail = nodeDetailById.get(String(nodeId));
-    if (nodeDetail && Array.isArray(nodeDetail.leaves) && nodeDetail.leaves.length) {
+    if (trajectoryHtml) {
+      rows.push("<h4 style='margin:0.32rem 0 0.12rem'>Trajectory</h4>");
+      rows.push(trajectoryHtml);
+    }
+    if (leafRows.length) {
       rows.push("<h4 style='margin:0.32rem 0 0.12rem'>Final leaves</h4>");
-      rows.push(renderLeafCards(nodeDetail.leaves));
-    } else if (String(node.detail_path || "")) {
+      rows.push(renderLeafCards(leafRows));
+    } else if (detailPath && !nodeDetail) {
       rows.push("<p class='muted'>Loading final leaf details...</p>");
       loadNodeDetail(nodeId)
         .then(() => {
@@ -1578,14 +1926,18 @@ def tree_workspace_script() -> str:
               + `<p class="muted">Failed to load node details: ${esc(error && error.message ? error.message : error)}</p>`;
           }
         });
+    } else if (nodeDetail) {
+      rows.push("<p class='muted'>No final leaves yet.</p>");
     }
     inspectorHost.innerHTML = rows.join("");
     inspectorHost.querySelectorAll(".event-btn").forEach((button) => {
       button.addEventListener("click", () => {
         const eventId = button.getAttribute("data-event-id");
         if (!eventId) return;
-        selectedEventId = eventId;
-        renderAll();
+        scheduleEventForInspector({
+          eventId,
+          nodeId,
+        });
       });
     });
   }
@@ -1629,9 +1981,12 @@ def tree_workspace_script() -> str:
   function renderTokenAlternatives(tokenRow) {
     const rows = tokenAlternativeRows(tokenRow)
       .map((alt) => {
-        const probability = Number(alt.probability || 0);
+        const probability = Number(alt.probability);
+        const safeProbability = Number.isFinite(probability)
+          ? Math.max(0, Math.min(1, probability))
+          : 0;
         const selectedClass = alt.selected ? " selected" : "";
-        const fill = `${Math.round(Math.max(0, Math.min(1, probability)) * 100)}%`;
+        const fill = `${Math.round(safeProbability * 100)}%`;
         const swatch = alt.selected ? "var(--accent-soft)" : probColor(probability);
         return `
           <div class="alt-row${selectedClass}" style="--fill:${fill};">
@@ -1655,6 +2010,10 @@ def tree_workspace_script() -> str:
     const showHint = options.showHint !== false;
     const tokenRows = Array.isArray(choice.tokens) ? choice.tokens : [];
     if (!tokenRows.length) {
+      const text = String(choice.text || choice.text_preview || "");
+      if (text) {
+        return `<pre class="candidate-text">${esc(text)}</pre><p class='muted'>No token probability rows.</p>`;
+      }
       return "<p class='muted'>No token probability rows.</p>";
     }
     const chips = tokenRows.map((tokenRow) => {
@@ -1669,6 +2028,32 @@ def tree_workspace_script() -> str:
       ? `<div class="token-strip-hint">Hover a token for top alternatives.</div>`
       : "";
     return `<div class="token-strip-wrap"><div class="token-strip">${chips.join("")}</div>${hint}</div>`;
+  }
+
+  function renderGeneratedChunkDetails(details) {
+    const rows = [];
+    tokenHoverRowsById.clear();
+    tokenHoverSeq = 0;
+    const tokens = Array.isArray(details.tokens) ? details.tokens : [];
+    rows.push(`<h4 style="margin:0.25rem 0">Generated text</h4>`);
+    if (tokens.length) {
+      rows.push(renderChoiceTokenStrip({
+        text: String(details.chunk_text || ""),
+        tokens,
+      }));
+    } else {
+      rows.push(`<pre class="candidate-text">${esc(String(details.chunk_text || ""))}</pre>`);
+      rows.push("<p class='muted'>No token probability rows.</p>");
+    }
+    rows.push(deferredMetadataDetails("Generation metadata", {
+      token_count: details.token_count || 0,
+      generated_tokens_before_chunk: details.generated_tokens_before_chunk ?? "",
+      generated_tokens_after_chunk: details.generated_tokens_after_chunk ?? "",
+      chunk_was_normalized: Boolean(details.chunk_was_normalized),
+      chunk_token_ids_source: details.chunk_token_ids_source || "",
+      source: details.source || "",
+    }));
+    return rows.join("");
   }
 
   function tooltipNode() {
@@ -1736,17 +2121,20 @@ def tree_workspace_script() -> str:
 
   function renderRequestDetails(details) {
     const rows = [];
-    rows.push(detailRow("request_id", String(details.request_id || "")));
-    rows.push(detailRow("request_kind", String(details.request_kind || "")));
-    rows.push(detailRow("stream", String(details.request_stream_id || "")));
-    rows.push(detailRow("base_prefix_tokens", String(details.base_prefix_token_count || 0)));
-    rows.push(detailRow("delta_token_count", String(details.delta_token_count || 0)));
-    rows.push(detailRow("input_token_count", String(details.current_input_token_count || 0)));
-    rows.push(detailRow("assistant_prefix_chars", String(details.assistant_prefix_char_count || 0)));
     if (details.assistant_prefix_tail) {
-      rows.push(`<h4 style=\"margin:0.2rem 0\">assistant_prefix_tail</h4>`);
+      rows.push(`<h4 style=\"margin:0.2rem 0\">Prefix tail</h4>`);
       rows.push(`<pre>${esc(String(details.assistant_prefix_tail || ""))}</pre>`);
     }
+    rows.push(deferredMetadataDetails("Request metadata", {
+      request_id: details.request_id || "",
+      request_kind: details.request_kind || "",
+      request_stream_id: details.request_stream_id || "",
+      delta_token_count: details.delta_token_count || 0,
+      current_input_token_count: details.current_input_token_count || 0,
+      base_prefix_token_count: details.base_prefix_token_count || 0,
+      assistant_prefix_char_count: details.assistant_prefix_char_count || 0,
+      previous_request_id: details.prev_request_id || "",
+    }));
     return rows.join("");
   }
 
@@ -1754,9 +2142,6 @@ def tree_workspace_script() -> str:
     const rows = [];
     tokenHoverRowsById.clear();
     tokenHoverSeq = 0;
-    rows.push(detailRow("request_id", String(details.request_id || "")));
-    rows.push(detailRow("status", String(details.status || "")));
-    rows.push(detailRow("latency_s", String(details.latency_seconds || "")));
     if (details.error_message) rows.push(detailRow("error", String(details.error_message)));
     const choices = Array.isArray(details.choices) ? details.choices : [];
     if (!choices.length) {
@@ -1764,22 +2149,58 @@ def tree_workspace_script() -> str:
       return rows.join("");
     }
     choices.forEach((choice, index) => {
-      rows.push(`<h4 style=\"margin:0.25rem 0\">choice ${index}</h4>`);
-      rows.push(detailRow("finish", String(choice.finish_reason || "")));
-      rows.push(detailRow("stop", String(choice.stop_reason || "")));
-      rows.push(detailRow("output_tokens", String(choice.output_token_count || 0)));
-      rows.push(`<h4 style="margin:0.2rem 0">Generated tokens</h4>`);
+      const label = choices.length > 1 ? `Generated tokens · choice ${index}` : "Generated tokens";
+      rows.push(`<h4 style="margin:0.2rem 0">${esc(label)}</h4>`);
       rows.push(renderChoiceTokenStrip(choice));
+      rows.push(deferredMetadataDetails(`Choice ${index} metadata`, {
+        finish_reason: choice.finish_reason || "",
+        stop_reason: choice.stop_reason || "",
+        output_token_count: choice.output_token_count || 0,
+      }));
     });
+    rows.push(deferredMetadataDetails("Response metadata", {
+      status: details.status || "",
+      request_id: details.request_id || "",
+      latency_seconds: details.latency_seconds || "",
+      choice_count: details.choice_count || 0,
+    }));
     return rows.join("");
   }
 
   function renderVllmStepDetails(details) {
     const rows = [];
-    rows.push('<h4 style="margin:0.2rem 0">Request</h4>');
     rows.push(renderRequestDetails(details));
-    rows.push('<h4 style="margin:0.25rem 0">Response</h4>');
     rows.push(renderResponseDetails(details));
+    return rows.join("");
+  }
+
+  function renderPromptDetails(details, event) {
+    const rows = [];
+    rows.push(detailRow("golden_answer", String(details.golden_answer || "")));
+    rows.push(deferredMetadataDetails("Prompt metadata", {
+      golden_answer_source: details.golden_answer_source || "",
+      prompt_char_count: details.prompt_char_count || 0,
+    }));
+    const promptUrl = promptTextPath(event);
+    if (promptUrl) {
+      rows.push(
+        `<div style="margin:0.25rem 0"><a href="${esc(promptUrl)}" target="_blank" rel="noopener">Open full prompt text</a></div>`,
+      );
+    }
+    const fullText = String(details.prompt_text || "");
+    const headText = String(details.prompt_preview_head || fullText);
+    const tailText = String(details.prompt_preview_tail || "");
+    const omittedChars = Number(details.prompt_omitted_char_count || 0);
+    rows.push(`<h4 style="margin:0.25rem 0">Input prompt</h4>`);
+    if (headText) rows.push(`<pre>${esc(headText)}</pre>`);
+    if (omittedChars > 0) {
+      rows.push(`<p class="muted">${omittedChars.toLocaleString()} middle characters omitted from inspector preview.</p>`);
+    }
+    if (tailText) {
+      rows.push(`<h4 style="margin:0.25rem 0">Input prompt tail</h4>`);
+      rows.push(`<pre>${esc(tailText)}</pre>`);
+    }
+    if (!headText && !tailText) rows.push("<p class='muted'>No prompt text found.</p>");
     return rows.join("");
   }
 
@@ -1900,65 +2321,68 @@ def tree_workspace_script() -> str:
     `;
   }
 
+  function renderSelectorCandidateGroup(title, candidates) {
+    const safeCandidates = Array.isArray(candidates) ? candidates : [];
+    if (!safeCandidates.length) return "";
+    const cards = safeCandidates.map((candidate) => renderClusterCandidateCard({
+      candidateId: candidate.candidate_id,
+      shortlisted: Boolean(candidate.shortlisted),
+      selected: Boolean(candidate.selected),
+      candidate,
+    })).join("");
+    return `
+      <h4 style="margin:0.38rem 0 0.12rem">${esc(title)}</h4>
+      <div class="candidate-list">${cards}</div>
+    `;
+  }
+
   function renderSelectorAppliedDetails(details) {
     const rows = [];
     tokenHoverRowsById.clear();
     tokenHoverSeq = 0;
-    rows.push(detailRow("branch_point_id", String(details.branch_point_id || "")));
-    rows.push(detailRow("node_id", String(details.node_id || "")));
-    rows.push(detailRow("active_selector_mode", String(details.active_selector_mode || "")));
     const selectedIds = Array.isArray(details.selected_candidate_ids)
       ? details.selected_candidate_ids
       : [];
-    rows.push(detailRow("selected_candidate_ids", selectedIds.join(", ")));
-    const selectedByMode = details.selected_by_mode && typeof details.selected_by_mode === "object"
-      ? details.selected_by_mode
-      : {};
-    const shortlistByMode = details.shortlist_by_mode && typeof details.shortlist_by_mode === "object"
-      ? details.shortlist_by_mode
-      : {};
-    const shortlistCandidatesByMode = details.shortlist_candidates_by_mode && typeof details.shortlist_candidates_by_mode === "object"
-      ? details.shortlist_candidates_by_mode
-      : {};
+    const shortlistIds = Array.isArray(details.shortlist_candidate_ids)
+      ? details.shortlist_candidate_ids
+      : [];
+    rows.push(detailRow("selected", selectedIds.join(", ")));
+    rows.push(detailRow("shortlisted", shortlistIds.join(", ")));
+    rows.push(renderSelectorCandidateGroup("Selected candidate", details.selected_candidates));
+    rows.push(renderSelectorCandidateGroup("Shortlisted candidates", details.shortlisted_candidates));
+    rows.push(renderSelectorCandidateGroup("Other candidates", details.other_candidates));
+    if (!Array.isArray(details.candidates) || !details.candidates.length) {
+      rows.push("<p class='muted'>No candidate rows logged for this selector decision.</p>");
+    }
     const clusterGroupsByMode = details.cluster_groups_by_mode && typeof details.cluster_groups_by_mode === "object"
       ? details.cluster_groups_by_mode
       : {};
     const clusterModes = Object.keys(clusterGroupsByMode).sort();
-    const activeSelectorMode = String(details.active_selector_mode || "");
-    if (activeSelectorMode && Array.isArray(shortlistCandidatesByMode[activeSelectorMode])) {
-      const shortlistCards = shortlistCandidatesByMode[activeSelectorMode].map((candidate) => renderClusterCandidateCard({
-        candidateId: candidate.candidate_id,
-        shortlisted: true,
-        selected: selectedIds.includes(candidate.candidate_id),
-        candidate: candidate,
-      })).join("");
-      rows.push(`<h4 style="margin:0.38rem 0 0.12rem">Shortlist · ${esc(activeSelectorMode)}</h4>`);
-      rows.push(`<div class="candidate-list">${shortlistCards}</div>`);
+    const candidateById = new Map();
+    for (const candidate of Array.isArray(details.candidates) ? details.candidates : []) {
+      candidateById.set(String(candidate.candidate_id ?? ""), candidate);
     }
-    if (!clusterModes.length) {
-      rows.push("<p class='muted'>No cluster summaries found in this selector event.</p>");
-      return rows.join("");
-    }
-    const candidateById = candidateMapForBranchPoint(details.branch_point_id);
     for (const modeName of clusterModes) {
       const groups = Array.isArray(clusterGroupsByMode[modeName])
         ? clusterGroupsByMode[modeName]
-        : [];
-      const modeSelected = Array.isArray(selectedByMode[modeName])
-        ? selectedByMode[modeName]
-        : [];
-      const modeShortlist = Array.isArray(shortlistByMode[modeName])
-        ? shortlistByMode[modeName]
         : [];
       rows.push(`<h4 style="margin:0.38rem 0 0.12rem">Clusters · ${esc(String(modeName))}</h4>`);
       rows.push(renderClusterModeDetails({
         modeName,
         groups,
-        shortlistIds: modeShortlist,
-        selectedIds: modeSelected,
+        shortlistIds,
+        selectedIds,
         candidateById,
       }));
     }
+    rows.push(deferredMetadataDetails("Selector metadata", {
+      branch_point_id: details.branch_point_id || "",
+      node_id: details.node_id || "",
+      active_selector_mode: details.active_selector_mode || "",
+      candidate_pool_id: details.candidate_pool_id || "",
+      trigger_type: details.trigger_type || "",
+      num_candidates: details.num_candidates || 0,
+    }));
     return rows.join("");
   }
 
@@ -1966,17 +2390,14 @@ def tree_workspace_script() -> str:
     const rows = [];
     tokenHoverRowsById.clear();
     tokenHoverSeq = 0;
-    rows.push(detailRow("branch_point_id", String(details.branch_point_id || "")));
-    rows.push(detailRow("candidate_pool_id", String(details.candidate_pool_id || "")));
-    rows.push(detailRow("trigger_type", String(details.trigger_type || "")));
     const selectedIds = Array.isArray(details.selected_candidate_ids)
       ? details.selected_candidate_ids
       : [];
     const shortlistIds = Array.isArray(details.shortlist_candidate_ids)
       ? details.shortlist_candidate_ids
       : [];
-    rows.push(detailRow("selected_candidate_ids", selectedIds.join(", ")));
-    rows.push(detailRow("shortlist_candidate_ids", shortlistIds.join(", ")));
+    rows.push(detailRow("selected", selectedIds.join(", ")));
+    rows.push(detailRow("shortlisted", shortlistIds.join(", ")));
     const candidates = Array.isArray(details.candidates) ? details.candidates : [];
     if (!candidates.length) {
       rows.push("<p class='muted'>No candidate rows logged.</p>");
@@ -2013,7 +2434,49 @@ def tree_workspace_script() -> str:
       `;
     });
     rows.push(`<div class=\"candidate-list\">${cards.join("")}</div>`);
+    rows.push(deferredMetadataDetails("Candidate pool metadata", {
+      branch_point_id: details.branch_point_id || "",
+      candidate_pool_id: details.candidate_pool_id || "",
+      trigger_type: details.trigger_type || "",
+    }));
     return rows.join("");
+  }
+
+  function eventSequenceForNode(nodeId) {
+    const key = String(nodeId || "");
+    const nodeDetail = nodeDetailById.get(key);
+    const rows = nodeDetail && Array.isArray(nodeDetail.events)
+      ? nodeDetail.events
+      : (Array.isArray(nodeEvents[key]) ? nodeEvents[key] : []);
+    return rows
+      .slice()
+      .filter((event) => event && event.event_id)
+      .sort((left, right) => asNumber(left.event_index) - asNumber(right.event_index));
+  }
+
+  function adjacentEventIds(event) {
+    const sequence = eventSequenceForNode(String(event.node_id || ""));
+    const currentId = String(event.event_id || "");
+    const index = sequence.findIndex((item) => String(item.event_id || "") === currentId);
+    return {
+      previous: index > 0 ? String(sequence[index - 1].event_id || "") : "",
+      next: index >= 0 && index < sequence.length - 1 ? String(sequence[index + 1].event_id || "") : "",
+      position: index >= 0 ? index + 1 : 0,
+      count: sequence.length,
+    };
+  }
+
+  function renderEventNav(event) {
+    const adjacent = adjacentEventIds(event);
+    const label = adjacent.count
+      ? `${adjacent.position} / ${adjacent.count}`
+      : "";
+    return `
+      <div class="event-nav" data-event-nav="${esc(String(event.event_id || ""))}">
+        <button class="event-btn" data-nav-event-id="${esc(adjacent.previous)}"${adjacent.previous ? "" : " disabled"}>← Previous ${esc(label)}</button>
+        <button class="event-btn" data-nav-event-id="${esc(adjacent.next)}"${adjacent.next ? "" : " disabled"}>Next →</button>
+      </div>
+    `;
   }
 
   function renderEventInspector(eventId) {
@@ -2026,21 +2489,85 @@ def tree_workspace_script() -> str:
       inspectorHost.innerHTML = "<p class='muted'>Select a node or event.</p>";
       return;
     }
+    tokenHoverRowsById.clear();
+    tokenHoverSeq = 0;
+    inspectorMetadataRows = [];
     const details = event.details && typeof event.details === "object" ? event.details : {};
     const rows = [];
     rows.push(`<h3>${esc(String(event.event_type || "event"))}</h3>`);
-    rows.push(detailRow("node", String(event.node_id || "")));
-    rows.push(detailRow("event_index", String(event.event_index || "")));
+    rows.push(renderEventNav(event));
     rows.push(detailRow("summary", String(event.summary || "")));
-    rows.push(detailRow("timestamp", String(event.timestamp_utc || "")));
+    rows.push(deferredMetadataDetails("Event metadata", {
+      event_index: event.event_index || "",
+      node: event.node_id || "",
+      timestamp: event.timestamp_utc || "",
+      local_step: event.local_step || "",
+      step_delta: event.step_delta || 0,
+      token_delta: event.token_delta || 0,
+    }));
     const leafDetailNeedsHydration = (
       (event.event_type === "leaf_scored" || event.event_type === "leaf_completed")
-      && (!details.text)
+      && !details.leaf_detail_hydrated
     );
-    if ((!event.details || leafDetailNeedsHydration) && String(event.node_id || "")) {
+    const vllmDetailNeedsHydration = (
+      event.event_type === "vllm_step"
+      && (!Array.isArray(details.choices) || !details.choices.length)
+    );
+    const selectorDetailNeedsHydration = (
+      (event.event_type === "selector_applied" || event.event_type === "selector_continued_inline")
+      && (!Array.isArray(details.candidates) || !details.candidates.length)
+    );
+    const candidatePoolNeedsHydration = (
+      event.event_type === "candidate_pool_resolved"
+      && (!Array.isArray(details.candidates) || !details.candidates.length)
+    );
+    const promptNeedsHydration = (
+      event.event_type === "prompt_logged"
+      && !details.prompt_detail_hydrated
+    );
+    const chunkNeedsHydration = (
+      (event.event_type === "decode_chunk" || event.event_type === "steer_block_generated")
+      && !details.generated_chunk_detail_hydrated
+    );
+    const eventNodeId = String(event.node_id || "");
+    const nodeDetailAlreadyLoaded = eventNodeId && nodeDetailById.has(eventNodeId);
+    if (
+      leafDetailNeedsHydration
+      || vllmDetailNeedsHydration
+      || selectorDetailNeedsHydration
+      || candidatePoolNeedsHydration
+      || promptNeedsHydration
+      || chunkNeedsHydration
+    ) {
+      const loadingMessage = leafDetailNeedsHydration
+        ? "Loading final completion..."
+        : (vllmDetailNeedsHydration || chunkNeedsHydration)
+          ? "Loading generated tokens..."
+          : (promptNeedsHydration ? "Loading input prompt..." : "Loading selector candidates...");
+      rows.push(`<p class='muted'>${loadingMessage}</p>`);
+      inspectorHost.innerHTML = rows.join("");
+      loadEventDetail(eventId)
+        .then(() => {
+          if (selectedEventId === eventId) {
+            renderEventInspector(eventId);
+          }
+        })
+        .catch((error) => {
+          if (selectedEventId === eventId) {
+            inspectorHost.innerHTML = rows.join("")
+              + `<p class="muted">Failed to load event details: ${esc(error && error.message ? error.message : error)}</p>`;
+          }
+        });
+      return;
+    }
+    if (
+      !event.details
+      && eventNodeId
+      && !nodeDetailAlreadyLoaded
+    ) {
       rows.push("<p class='muted'>Loading event details...</p>");
       inspectorHost.innerHTML = rows.join("");
-      loadNodeDetail(String(event.node_id || ""))
+      loadNodeDetail(eventNodeId)
         .then(() => {
           if (selectedEventId === eventId) {
             renderEventInspector(eventId);
@@ -2056,6 +2583,13 @@ def tree_workspace_script() -> str:
     }
     if (event.event_type === "vllm_step") {
       rows.push(renderVllmStepDetails(details));
+    } else if (event.event_type === "prompt_logged") {
+      rows.push(renderPromptDetails(details, event));
+    } else if (
+      event.event_type === "decode_chunk"
+      || event.event_type === "steer_block_generated"
+    ) {
+      rows.push(renderGeneratedChunkDetails(details));
     } else if (event.event_type === "candidate_pool_resolved") {
       rows.push(renderCandidatePoolDetails(details));
     } else if (event.event_type === "selector_applied") {
@@ -2070,6 +2604,8 @@ def tree_workspace_script() -> str:
     } else {
       rows.push(`<pre>${esc(JSON.stringify(withoutRawTokenIds(details), null, 2))}</pre>`);
     }
+    rows.push(renderDeferredMetadata());
+    inspectorMetadataRows = null;
     rows.push("<button class='event-btn' id='back-to-node'>Back to node events</button>");
     inspectorHost.innerHTML = rows.join("");
     if (
@@ -2077,6 +2613,8 @@ def tree_workspace_script() -> str:
       || event.event_type === "candidate_pool_resolved"
       || event.event_type === "selector_applied"
       || event.event_type === "selector_continued_inline"
+      || event.event_type === "decode_chunk"
+      || event.event_type === "steer_block_generated"
     ) {
       bindTokenHoverTooltips();
     } else {
@@ -2089,6 +2627,16 @@ def tree_workspace_script() -> str:
         renderAll();
       });
     }
+    inspectorHost.querySelectorAll("[data-nav-event-id]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const nextEventId = button.getAttribute("data-nav-event-id");
+        if (!nextEventId) return;
+        scheduleEventForInspector({
+          eventId: nextEventId,
+          nodeId: event.node_id,
+        });
+      });
+    });
   }
 
   function renderInspector() {
@@ -2102,6 +2650,23 @@ def tree_workspace_script() -> str:
     }
     hideTokenTooltip();
     inspectorHost.innerHTML = "<p class='muted'>Click a node or event chip to inspect details.</p>";
+  }
+
+  function selectEventForInspector({ eventId, nodeId }) {
+    selectedNodeId = String(nodeId || selectedNodeId || "");
+    selectedEventId = String(eventId || "");
+    renderAll();
+  }
+
+  function scheduleEventForInspector({ eventId, nodeId }) {
+    const nextEventId = String(eventId || "");
+    const nextNodeId = String(nodeId || selectedNodeId || "");
+    window.setTimeout(() => {
+      selectEventForInspector({
+        eventId: nextEventId,
+        nodeId: nextNodeId,
+      });
+    }, 0);
   }
 
   function syncModeButtons() {

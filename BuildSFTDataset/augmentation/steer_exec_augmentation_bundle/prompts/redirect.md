@@ -9,6 +9,7 @@ REDIRECT
 - Intervention name: ${intervention_name}
 - Required first steer text: ${intervention_variant}
 - Exact number of pairs to generate: ${pairs_to_generate_k}
+- Steer token limit: ${steer_token_limit}
 - Exec token limit: ${exec_token_limit}
 
 ## What you are editing
@@ -50,6 +51,7 @@ The new window should make a later regeneration step from the augmented prefix f
 ## Additional instructions
 
 - The **first generated steer** must match this text exactly: `${intervention_variant}`
+- Keep every generated steer at or below `${steer_token_limit}` tokens.
 - Keep each exec under `${exec_token_limit}` tokens.
 - Do not try to rejoin the old suffix.
 - End in a way that clearly motivates a *different* next move than the one the old trace was about to take.

@@ -17,6 +17,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    cast,
 )
 
 import httpx
@@ -81,11 +82,11 @@ class TokenCounter:
     def __init__(self, tokenizer_name: Optional[str] = None):
         self.method = "whitespace_approx"
         self.tokenizer_name = tokenizer_name
-        self._tokenizer = None
+        self._tokenizer: Any = None
 
         if tokenizer_name:
             try:
-                from transformers import AutoTokenizer
+                from transformers import AutoTokenizer  # type: ignore[reportMissingImports]
 
                 self._tokenizer = AutoTokenizer.from_pretrained(
                     tokenizer_name, trust_remote_code=True
@@ -191,9 +192,12 @@ def parse_trace_text(trace_text: str) -> List[TraceBlock]:
     blocks: List[TraceBlock] = []
     for match in TRACE_TAG_RE.finditer(trace_text):
         block_type = match.group(1).lower()
+        assert block_type in {"steer", "exec"}
         text = match.group(2).strip()
         if text:
-            blocks.append(TraceBlock(type=block_type, text=text))
+            blocks.append(
+                TraceBlock(type=cast(Literal["steer", "exec"], block_type), text=text)
+            )
     return blocks
 
 
@@ -241,7 +245,20 @@ def ensure_interleaved(
     *,
     token_counter: TokenCounter,
     exec_token_limit: int,
+    steer_token_limit: Optional[int] = None,
 ) -> List[str]:
+    """Validate trace block alternation and per-block token limits.
+
+    Inputs:
+        blocks: Candidate trace blocks in expected steer/exec order.
+        token_counter: Token counter used for steer and exec limits.
+        exec_token_limit: Exclusive upper bound for exec block tokens.
+        steer_token_limit: Optional inclusive upper bound for steer block tokens.
+
+    Outputs:
+        A list of validation errors. Empty means the blocks passed validation.
+    """
+
     errors: List[str] = []
     if not blocks:
         return ["no steer/exec blocks found"]
@@ -258,7 +275,13 @@ def ensure_interleaved(
             errors.append(f"block index {i} must be {expected}, got {block.type}")
         if not block.text.strip():
             errors.append(f"block index {i} is empty")
-        if block.type == "exec":
+        if block.type == "steer" and steer_token_limit is not None:
+            n_tokens = token_counter.count(block.text)
+            if n_tokens > steer_token_limit:
+                errors.append(
+                    f"steer block index {i} has {n_tokens} tokens, exceeds limit <= {steer_token_limit}"
+                )
+        elif block.type == "exec":
             n_tokens = token_counter.count(block.text)
             if n_tokens >= exec_token_limit:
                 errors.append(
@@ -567,7 +590,23 @@ def validate_generated_window(
     enforce_first_steer_exact: bool = True,
     token_counter: TokenCounter,
     exec_token_limit: int,
+    steer_token_limit: Optional[int] = None,
 ) -> Tuple[List[TraceBlock], List[str]]:
+    """Parse and validate one generated intervention window.
+
+    Inputs:
+        obj: Structured response payload from the editor model.
+        requested_pairs: Exact number of steer/exec pairs requested.
+        required_first_steer: Required first steer string for exact-match modes.
+        enforce_first_steer_exact: Whether first steer must match exactly.
+        token_counter: Token counter used for block limits.
+        exec_token_limit: Exclusive upper bound for exec block tokens.
+        steer_token_limit: Optional inclusive upper bound for generated steers.
+
+    Outputs:
+        A pair of parsed blocks and validation errors.
+    """
+
     errors: List[str] = []
     try:
         parsed = InterventionWindow.model_validate(obj)
@@ -583,6 +622,7 @@ def validate_generated_window(
         blocks,
         token_counter=token_counter,
         exec_token_limit=exec_token_limit,
+        steer_token_limit=steer_token_limit,
     )
     errors.extend(interleave_errors)
 
@@ -663,6 +703,9 @@ def build_prompt_values(
         "intervention_variant": intervention_variant,
         "pairs_to_generate_k": pairs_to_generate_k,
         "exec_token_limit": exec_token_limit,
+        "steer_token_limit": intervention_spec.get(
+            "steer_token_limit", "not configured"
+        ),
         "trace_prefix": render_trace(prefix_blocks, wrap_think=False),
         "local_style_window": build_style_window(
             prefix_blocks, style_window_pairs=style_window_pairs
@@ -883,6 +926,7 @@ async def augment_record(
             required_first_steer=chosen_variant,
             token_counter=token_counter,
             exec_token_limit=exec_token_limit,
+            steer_token_limit=intervention_spec.get("steer_token_limit"),
         )
         if not generation_errors:
             break
@@ -1013,13 +1057,36 @@ async def augment_record(
     return result
 
 
+def apply_sampling_defaults_to_spec(
+    interventions_obj: Mapping[str, Any], raw_spec: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Return an intervention spec with catalog-level sampling defaults applied.
+
+    Inputs:
+        interventions_obj: Parsed intervention catalog containing sampling defaults.
+        raw_spec: Individual intervention specification.
+
+    Outputs:
+        A mutable intervention spec copy with default validation settings attached.
+    """
+
+    spec = dict(raw_spec)
+    sampling_defaults = interventions_obj.get("sampling_defaults", {})
+    for key in ("steer_token_limit",):
+        if key in sampling_defaults and key not in spec:
+            spec[key] = sampling_defaults[key]
+    return spec
+
+
 def choose_intervention(
     interventions_obj: Dict[str, Any], rng: random.Random, name: Optional[str] = None
 ) -> Dict[str, Any]:
+    """Choose one intervention spec and attach catalog-level defaults."""
+
     interventions = interventions_obj["interventions"]
     if name:
         for item in interventions:
             if item["name"] == name:
-                return item
+                return apply_sampling_defaults_to_spec(interventions_obj, item)
         raise KeyError(f"Unknown intervention name: {name}")
-    return rng.choice(interventions)
+    return apply_sampling_defaults_to_spec(interventions_obj, rng.choice(interventions))

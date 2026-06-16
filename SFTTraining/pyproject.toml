@@ -8,6 +8,7 @@ dependencies = [
   "datasets>=3.0.0",
   "hf-transfer>=0.1.9",
   "pyyaml>=6.0.0",
+  "tilelang>=0.1.11",
   "torch>=2.4.0",
   "transformers>=4.51.0",
   "trl>=0.11.0",
@@ -16,8 +17,10 @@ dependencies = [
 
 [project.optional-dependencies]
 train = [
+  "causal-conv1d==1.6.2.post1",
   "deepspeed==0.17.6",
   "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu128torch2.8-cp312-cp312-linux_x86_64.whl ; python_version == '3.12' and platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "flash-linear-attention==0.5.0",
   "peft>=0.14.0",
   "setuptools>=68.0.0",
   "torch==2.8.0",
@@ -35,6 +38,12 @@ testpaths = ["tests"]
 include = ["sft_training", "tests"]
 pythonVersion = "3.10"
 typeCheckingMode = "basic"
+
+[tool.uv]
+no-build-isolation-package = ["causal-conv1d"]
+
+[tool.uv.sources]
+transformers = { git = "https://github.com/huggingface/transformers.git" }
 
 [build-system]
 requires = ["setuptools>=68.0.0", "wheel"]

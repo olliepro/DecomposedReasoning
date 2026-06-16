@@ -9,6 +9,7 @@ INSERT_NON_SEQUITUR
 - Intervention name: ${intervention_name}
 - Reference steer idea: ${intervention_variant}
 - Exact number of pairs to generate: ${pairs_to_generate_k}
+- Steer token limit: ${steer_token_limit}
 - Exec token limit: ${exec_token_limit}
 
 ## What you are editing
@@ -53,6 +54,7 @@ The intervention should **not**:
 
 - Use `${intervention_variant}` as a reference idea, not an exact string to copy.
 - Keep the first steer short and natural; variation across runs is good.
+- Keep every generated steer at or below `${steer_token_limit}` tokens.
 - Keep each exec focused and comfortably under `${exec_token_limit}` tokens.
 - If the steer asks for a tiny computation or check, actually carry it out in the exec.
 - If the steer is context dependent, make the exec explicitly reference the nearby reasoning state.

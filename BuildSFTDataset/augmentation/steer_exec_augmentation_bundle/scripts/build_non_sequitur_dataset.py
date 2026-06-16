@@ -183,6 +183,9 @@ def validate_interventions_obj(interventions_obj: Mapping[str, Any]) -> None:
     assert (
         sampling_defaults.get("first_new_steer_should_match_variant_exactly") is False
     ), "Non-sequitur catalog should not require exact first-steer matching."
+    steer_token_limit = int(sampling_defaults.get("steer_token_limit", 15))
+    assert steer_token_limit == 15, "Expected a 15-token steer cap."
+    encoding = tiktoken.get_encoding("cl100k_base")
     for spec in interventions:
         assert spec["recommended_editor_mode"] == "insert"
         assert spec["allowed_editor_modes"] == ["insert"]
@@ -190,6 +193,13 @@ def validate_interventions_obj(interventions_obj: Mapping[str, Any]) -> None:
         assert spec["suffix_handling_hint"] == "keep_suffix_without_judge"
         assert spec["preferred_slots"] == []
         assert spec["prompt_template"] == "non_sequitur_insert.md"
+        for variant in spec["variants"]:
+            assert (
+                not variant.strip().lower().startswith("count")
+            ), f"Count nonsequitur variant remains: {variant}"
+            assert (
+                len(encoding.encode(variant)) <= steer_token_limit
+            ), f"Variant exceeds {steer_token_limit} tokens: {variant}"
 
 
 def validate_insertion_range(*, min_insertions: int, max_insertions: int) -> None:
@@ -345,6 +355,7 @@ async def generate_validated_window(
             enforce_first_steer_exact=False,
             token_counter=token_counter,
             exec_token_limit=exec_token_limit,
+            steer_token_limit=intervention_spec.get("steer_token_limit"),
         )
         if not generation_errors:
             return normalize_steer_blocks(blocks=generated_blocks)
@@ -414,7 +425,9 @@ async def process_prepared_row(
             current_cut = original_cut + sum(
                 prior_plan.pairs_generated for prior_plan in plans
             )
-            intervention_spec = dict(choose_intervention(dict(interventions_obj), row_rng))
+            intervention_spec = dict(
+                choose_intervention(dict(interventions_obj), row_rng)
+            )
             plan = build_non_sequitur_plan(
                 record_index=prepared_row.row_index,
                 record=prepared_row.row,
@@ -666,13 +679,15 @@ def summarize_rows(
         str(row.get("augmentation_meta", {}).get("status", "unknown")) for row in rows
     )
     theme_counts = Counter(
-        str(step["plan"]["intervention_name"]) for row in rows for step in row["augmentation_meta"]["steps"]
+        str(step["plan"]["intervention_name"])
+        for row in rows
+        for step in row["augmentation_meta"]["steps"]
     )
-    insertion_counts = Counter(
-        len(row["augmentation_meta"]["steps"]) for row in rows
-    )
+    insertion_counts = Counter(len(row["augmentation_meta"]["steps"]) for row in rows)
     pair_counts = Counter(
-        str(step["plan"]["pairs_generated"]) for row in rows for step in row["augmentation_meta"]["steps"]
+        str(step["plan"]["pairs_generated"])
+        for row in rows
+        for step in row["augmentation_meta"]["steps"]
     )
     steer_counts = Counter(
         len(row["augmentation_meta"]["mask_targets"]["generated_steer_texts"])
@@ -684,7 +699,9 @@ def summarize_rows(
         "max_source_tokens": max_source_tokens,
         "source_prep": prep_summary.to_json(),
         "status_counts": dict(status_counts),
-        "insertion_count_distribution": {str(k): v for k, v in insertion_counts.items()},
+        "insertion_count_distribution": {
+            str(k): v for k, v in insertion_counts.items()
+        },
         "theme_counts": dict(theme_counts),
         "pair_count_distribution": dict(pair_counts),
         "masked_steer_count_distribution": {str(k): v for k, v in steer_counts.items()},

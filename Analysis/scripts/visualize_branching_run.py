@@ -16,6 +16,7 @@ if str(ANALYSIS_ROOT) not in sys.path:
     sys.path.insert(0, str(ANALYSIS_ROOT))
 
 from branching_eval.artifact_store import ArtifactStore
+from branching_eval.event_db import EVENT_DB_FILENAME, event_source_signature
 from branching_eval.event_types import EventEnvelope
 
 try:
@@ -133,7 +134,7 @@ def render_attempt_page(
 <section class="panel">
   <h1>{escape(title)}</h1>
   <p class="muted" style="margin:0.45rem 0 0.9rem 0">
-    Attempt replay is sourced exclusively from <code>tree_events.jsonl</code>.
+    Attempt replay is sourced from <code>tree_events.sqlite</code>.
   </p>
   <div class="pill-row">
     <span class="pill {status_class}">{escape(state.status())}</span>
@@ -309,6 +310,8 @@ def stop_reason_icon(*, stop_reason: str) -> str:
     normalized = normalized_stop_reason(stop_reason=stop_reason)
     if not normalized:
         return ""
+    if normalized == "missing_steer_or_think_close":
+        return "⚠️"
     if normalized.startswith("repeated_") and normalized.endswith("_block_loop"):
         return "🔁"
     if "length" in normalized or normalized == "max_gen_toks_reached":
@@ -406,22 +409,46 @@ def status_badge_class(*, status: str) -> str:
 
 
 def verification_counts_text(*, state: AttemptState) -> str:
-    """Return `correct/incorrect` counts for scored leaves in an attempt.
+    """Return answer-correct/answer-incorrect counts for scored leaves.
 
     Args:
-        state: Attempt replay state containing scored leaf verification values.
+        state: Attempt replay state containing scored leaves.
 
     Returns:
         Text formatted as `{correct}/{incorrect}`.
     """
 
+    answer_values = [
+        value
+        for leaf in state.leaves.values()
+        if (value := bool_metric(value=leaf.task_metrics.get("raw_answer_acc")))
+        is not None
+    ]
+    if answer_values:
+        correct_count = sum(1 for value in answer_values if value)
+        return f"{correct_count}/{len(answer_values) - correct_count}"
     correct_count = sum(1 for leaf in state.leaves.values() if leaf.verification == 1)
     incorrect_count = sum(1 for leaf in state.leaves.values() if leaf.verification == 0)
     return f"{correct_count}/{incorrect_count}"
 
 
+def bool_metric(*, value: object) -> bool | None:
+    """Parse a boolean-ish metric logged as bool, number, or text."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "1.0", "yes", "y"}:
+        return True
+    if normalized in {"false", "0", "0.0", "no", "n"}:
+        return False
+    return None
+
+
 def progress_verification_counts_text(*, progress: ProgressAttemptView) -> str:
-    """Return `correct/incorrect` text from one progress snapshot."""
+    """Return fallback `correct/incorrect` text from one progress snapshot."""
 
     return f"{progress.correct_count}/{progress.incorrect_count}"
 
@@ -433,7 +460,7 @@ def progress_finish_reason_text(*, progress: ProgressAttemptView) -> str:
         progress: Selected progress snapshot row for one doc attempt.
 
     Returns:
-        Human-readable finish-reason summary for gallery/index display.
+        Human-readable finish-reason summary for index display.
 
     Example:
         >>> progress_finish_reason_text(progress=ProgressAttemptView(
@@ -461,9 +488,7 @@ def progress_finish_reason_text(*, progress: ProgressAttemptView) -> str:
         return "none"
     if len(nonzero_counts) == 1 and nonzero_counts[0][1] == progress.leaf_count:
         return nonzero_counts[0][0]
-    detail_text = ", ".join(
-        f"{label}={count}" for label, count in nonzero_counts
-    )
+    detail_text = ", ".join(f"{label}={count}" for label, count in nonzero_counts)
     return f"mixed({detail_text})"
 
 
@@ -539,7 +564,7 @@ def render_index_page(
 ) -> None:
     """Render run-level index page linking all replayed attempt pages."""
 
-    source_path = str(run_dir / "tree_events.jsonl")
+    source_path = str(run_dir / EVENT_DB_FILENAME)
     selected_rows = "".join(
         index_selected_row_html(progress=progress)
         for progress in selected_progress_attempts
@@ -573,7 +598,6 @@ def render_index_page(
     <span class="pill">attempts={len(states)}</span>
     <span class="pill">selected_docs={len(selected_progress_attempts) if selected_progress_attempts else len(selected_states)}</span>
   </div>
-  <p style="margin:0.75rem 0 0 0"><a href="gallery.html">Open all selected docs in one page</a></p>
 </section>
 <section class="panel">
   <h2>Default Doc View (Latest Completed Attempt)</h2>
@@ -598,86 +622,9 @@ def render_index_page(
         title=f"Branching Replay · {run_dir.name}",
         subtitle="events-only replay",
         body_html=body_html,
-        footer_text="Regenerated from tree_events.jsonl without tree snapshots.",
+        footer_text="Regenerated from tree_events.sqlite without tree snapshots.",
     )
     write_text_atomic(path=output_dir / "index.html", text=page)
-
-
-def gallery_card_html(*, progress: ProgressAttemptView) -> str:
-    """Build one gallery card using progress snapshots as the summary source."""
-
-    rel_link = f"docs/{progress.slug()}.html"
-    status = progress.status
-    verification_counts = progress_verification_counts_text(progress=progress)
-    finish_reason_text = progress_finish_reason_text(progress=progress)
-    return f"""
-<section class="panel gallery-card">
-  <div class="pill-row" style="margin-bottom:0.65rem">
-    <span class="pill {status_badge_class(status=status)}">{escape(progress.label())}</span>
-    <span class="pill">mode={escape(progress.rollout_mode)}</span>
-    <span class="pill">selector={escape(progress.selector_mode)}</span>
-    <span class="pill">passrate={escape(_format_metric(progress.passrate))}</span>
-    <span class="pill">avg_tok={escape(_format_metric(progress.avg_token_length))}</span>
-    <span class="pill">leaves={progress.leaf_count}</span>
-    <span class="pill">correct/incorrect={verification_counts}</span>
-    <span class="pill">finish={escape(finish_reason_text)}</span>
-    <span class="pill">unique_answers={progress.unique_answer_count}</span>
-    <a href="{escape(rel_link)}">open full page</a>
-  </div>
-  <iframe class="gallery-frame" src="{escape(rel_link)}" loading="lazy" title="{escape(progress.label())}"></iframe>
-</section>
-"""
-
-
-def render_gallery_page(
-    *,
-    run_dir: Path,
-    output_dir: Path,
-    selected_progress_attempts: list[ProgressAttemptView],
-) -> None:
-    """Render one page containing all selected-doc attempt iframes.
-
-    Args:
-        run_dir: Source run directory for subtitle text.
-        output_dir: Visualization output directory.
-        selected_states: Latest completed attempt per doc.
-
-    Returns:
-        None.
-    """
-
-    gallery_cards = "".join(
-        gallery_card_html(progress=progress)
-        for progress in selected_progress_attempts
-    )
-    if not gallery_cards:
-        gallery_cards = (
-            "<section class='panel'>No selected-doc attempts available.</section>"
-        )
-    body_html = f"""
-<style>
-.gallery-grid {{ display:grid; gap:1rem; }}
-.gallery-card {{ padding:0.8rem; }}
-.gallery-frame {{ width:100%; height:900px; border:1px solid var(--line); border-radius:0.8rem; background:rgba(8, 12, 22, 0.84); }}
-@media (max-width: 960px) {{ .gallery-frame {{ height:640px; }} }}
-</style>
-<section class="panel">
-  <h1>All Selected Docs: {escape(run_dir.name)}</h1>
-  <p class="muted" style="margin:0.45rem 0 0.9rem 0">Gallery summaries come from per-doc progress snapshots.</p>
-  <div class="pill-row">
-    <span class="pill">selected_docs={len(selected_progress_attempts)}</span>
-  </div>
-  <p style="margin:0.75rem 0 0 0"><a href="index.html">Back to run index</a></p>
-</section>
-<div class="gallery-grid">{gallery_cards}</div>
-"""
-    page = wrap_page(
-        title=f"Branching Replay Gallery · {run_dir.name}",
-        subtitle="all selected docs",
-        body_html=body_html,
-        footer_text="Embedded attempt pages generated from tree_events.jsonl.",
-    )
-    write_text_atomic(path=output_dir / "gallery.html", text=page)
 
 
 def index_selected_row_html(*, progress: ProgressAttemptView) -> str:
@@ -850,10 +797,9 @@ def write_node_detail_payloads(
 
 
 def render_snapshot(*, run_dir: Path, output_dir: Path) -> RenderSummary:
-    """Render one snapshot from current `tree_events.jsonl` content."""
+    """Render one snapshot from current SQLite event content."""
 
-    events_path = run_dir / "tree_events.jsonl"
-    events = read_events_lenient(path=events_path)
+    events = read_events_lenient(path=run_dir)
     states = replay_attempts(events=events)
     selected_states = selected_attempts_by_doc(states=states)
     progress_attempts = read_progress_attempts(run_dir=run_dir)
@@ -878,41 +824,6 @@ def render_snapshot(*, run_dir: Path, output_dir: Path) -> RenderSummary:
         states=states,
         selected_states=selected_states,
         selected_progress_attempts=selected_progress_attempts,
-    )
-    render_gallery_page(
-        run_dir=run_dir,
-        output_dir=output_dir,
-        selected_progress_attempts=(
-            selected_progress_attempts
-            if selected_progress_attempts
-            else [
-                ProgressAttemptView(
-                    doc_id=state.key.doc_id,
-                    doc_attempt=state.key.doc_attempt,
-                    task_name=state.key.task_name,
-                    model_id=state.key.model_id,
-                    selector_mode=state.key.selector_mode,
-                    rollout_mode="unknown",
-                    status=state.status(),
-                    leaf_count=state.leaf_count(),
-                    passrate=0.0,
-                    avg_token_length=0.0,
-                    correct_count=sum(
-                        1 for leaf in state.leaves.values() if leaf.verification == 1
-                    ),
-                    incorrect_count=sum(
-                        1 for leaf in state.leaves.values() if leaf.verification == 0
-                    ),
-                    natural_count=0,
-                    max_count=0,
-                    repeating_count=0,
-                    other_count=0,
-                    unique_answer_count=0,
-                    last_update_timestamp=state.last_timestamp_utc or "",
-                )
-                for state in selected_states
-            ]
-        ),
     )
     write_summary_json(
         run_dir=run_dir,
@@ -954,12 +865,11 @@ def main() -> None:
     args = parse_args()
     run_dir = args.run_dir.resolve()
     output_dir = args.output_dir.resolve() if args.output_dir else run_dir / "viz"
-    events_path = run_dir / "tree_events.jsonl"
     poll_seconds = max(0.1, float(args.poll_seconds))
     last_signature: tuple[int, int] | None = None
     iteration = 0
     while True:
-        signature = event_file_signature(path=events_path)
+        signature = event_source_signature(run_dir=run_dir)
         if signature != last_signature:
             summary = render_snapshot(run_dir=run_dir, output_dir=output_dir)
             last_signature = signature

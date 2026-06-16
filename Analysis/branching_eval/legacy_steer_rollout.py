@@ -11,6 +11,7 @@ THINK_CLOSE_PARTIAL_SUFFIX_PATTERN = re.compile(
 )
 REPAIR_TAGS = ("<steer>", "</steer>", "<exec>", "</exec>")
 STEER_CLOSE_TAG = "</steer>"
+CHAT_EOS_STOP_REASONS = frozenset(("<|im_end|>", "<|endoftext|>", "eos"))
 
 
 def contains_think_close(*, text: str) -> bool:
@@ -58,7 +59,15 @@ def is_natural_finish_reason(
         return False
     if finish_reason != "stop":
         return True
-    return stop_reason is None
+    return stop_reason is None or is_chat_eos_stop_reason(stop_reason=stop_reason)
+
+
+def is_chat_eos_stop_reason(*, stop_reason: int | str | None) -> bool:
+    """Return whether a stop reason is a model/chat end-of-message marker."""
+
+    if not isinstance(stop_reason, str):
+        return False
+    return stop_reason.strip().lower() in CHAT_EOS_STOP_REASONS
 
 
 def complete_trailing_partial_tag(*, text: str) -> tuple[str, str | None]:

@@ -137,6 +137,7 @@ def test_managed_server_starts_and_stops_once(monkeypatch, tmp_path: Path) -> No
         return fake_server
 
     def fake_stop(*, server: RunningVllmServer) -> None:
+        assert server.port is not None
         stopped_ports.append(server.port)
 
     monkeypatch.setattr("branching_eval.vllm_runtime.start_vllm_server", fake_start)

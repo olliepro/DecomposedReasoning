@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import asyncio
+import math
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
@@ -14,6 +16,7 @@ from branching_eval.artifact_store import ArtifactStore
 from branching_eval.branch_executor import BranchExecutor
 from branching_eval.config_types import BranchingConfig, DecodingConfig
 from branching_eval.event_types import EventContext
+from branching_eval.event_db_writer import _token_values
 from branching_eval.lm_eval_adapter import DocRecord
 from branching_eval.metrics_types import (
     BreakpointVariance,
@@ -226,7 +229,83 @@ def test_vllm_response_serialization_is_compact(tmp_path: Path) -> None:
     assert isinstance(token_rows, list)
     assert len(token_rows) == 1
     assert "top_logprob_alternatives" not in token_rows[0]
+    assert "selected_probability" not in token_rows[0]
     assert payload["text_preview"] == "answer"
+
+
+def test_vllm_token_writer_derives_probability_from_logprob() -> None:
+    """Typed SQLite rows should keep probability for compact token payloads."""
+
+    row = _token_values(
+        owner_event_index=1,
+        owner_index=0,
+        row={
+            "token_index": 0,
+            "token_id": 123,
+            "token_text": "selected",
+            "selected_logprob": -0.1,
+        },
+    )
+    assert row[-2] == -0.1
+    assert row[-1] == pytest.approx(math.exp(-0.1))
+
+
+def test_vllm_response_event_log_compacts_and_hydrates_tokens(tmp_path: Path) -> None:
+    """Raw event JSON should omit duplicate token rows while reads restore them."""
+
+    executor = build_executor(tmp_path=tmp_path)
+    context = EventContext(
+        run_id=executor.artifact_store.run_id,
+        doc_id=0,
+        doc_attempt=0,
+        task_name="aime24",
+        model_id="fake",
+        selector_mode="random",
+    )
+    choice = GenerationChoice(
+        index=0,
+        text="answer",
+        finish_reason="length",
+        stop_reason=None,
+        tokens=(ParsedToken(token="selected", logprob=-0.1, top_entries=()),),
+        prompt_token_ids=None,
+        token_ids=(123,),
+    )
+    executor.artifact_store.append_event(
+        context=context,
+        event_type="vllm_response",
+        payload={
+            "request_id": "req-1",
+            "request_stream_id": "node_root:decode",
+            "request_kind": "decode_chunk",
+            "status": "ok",
+            "latency_seconds": 0.5,
+            "choice_count": 1,
+            "choices": [executor._serialize_choice_for_vllm_event(choice=choice)],
+        },
+    )
+    executor.artifact_store.flush_events()
+
+    with sqlite3.connect(str(executor.artifact_store.tree_events_db_path)) as conn:
+        payload_json = conn.execute(
+            "SELECT payload_json FROM event_log WHERE event_type = 'vllm_response'"
+        ).fetchone()[0]
+    raw_payload = json.loads(str(payload_json))
+    assert raw_payload["choices_token_rows_compacted"] is True
+    assert "tokens" not in raw_payload["choices"][0]
+    assert "token_ids" not in raw_payload["choices"][0]
+
+    event = executor.artifact_store.read_events()[0]
+    hydrated_choice = event.payload["choices"][0]
+    assert hydrated_choice["token_ids"] == [123]
+    assert hydrated_choice["tokens"] == [
+        {
+            "token_index": 0,
+            "token_id": 123,
+            "token_text": "selected",
+            "selected_logprob": -0.1,
+        }
+    ]
 
 
 def test_vllm_request_includes_branch_priority_fields(tmp_path: Path) -> None:
@@ -320,16 +399,16 @@ def test_event_writer_failure_surfaces_across_flush_append_and_close(
         model_id="fake",
         selector_mode="random",
     )
-    original_serialize = store._serialize_event_line
+    original_event_row = store._event_row
     state = {"calls": 0}
 
-    def fail_once(*, event: Any) -> str:
+    def fail_once(*, event: Any) -> dict[str, Any]:
         state["calls"] += 1
         if state["calls"] == 1:
             raise OSError("boom")
-        return original_serialize(event=event)
+        return original_event_row(event=event)
 
-    monkeypatch.setattr(store, "_serialize_event_line", fail_once)
+    monkeypatch.setattr(store, "_event_row", fail_once)
     store.append_event(context=context, event_type="worker_event", payload={"score": 1})
     with pytest.raises(RuntimeError, match="event writer failed"):
         store.flush_events()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -92,6 +93,24 @@ class _RequestState:
     output_token_ids: tuple[int, ...]
 
 
+def _coerce_token_spans(*, value: object) -> tuple[tuple[int, int], ...]:
+    """Normalize serialized token spans from event payloads."""
+
+    if value is None:
+        return ()
+    assert isinstance(value, list), "token spans payload must be a list"
+    spans: list[tuple[int, int]] = []
+    for item in value:
+        assert (
+            isinstance(item, list) and len(item) == 2
+        ), "each token span must be a two-item list"
+        start = int(item[0])
+        end = int(item[1])
+        assert 0 <= start <= end, f"invalid token span: {(start, end)}"
+        spans.append((start, end))
+    return tuple(spans)
+
+
 def replay_branching_resume_state(
     *,
     events: list[EventEnvelope],
@@ -106,7 +125,7 @@ def replay_branching_resume_state(
     """Replay one doc attempt into resumable branching runtime state.
 
     Args:
-        events: Full run events from `tree_events.jsonl`.
+        events: Full run events from `tree_events.sqlite`.
         prompt_text: Prompt text for this document.
         run_id: Stable run id.
         doc_id: Document id.
@@ -552,6 +571,9 @@ def _apply_leaf_completed(
         ),
         stop_reason=str(payload.get("stop_reason", "")),
         task_metrics={},
+        steer_phase_token_spans=_coerce_token_spans(
+            value=payload.get("steer_phase_token_spans")
+        ),
     )
     _update_tree_node(tree=tree, state=state)
 
@@ -597,6 +619,11 @@ def _apply_leaf_scored(
         ),
         stop_reason=str(payload.get("stop_reason", "")),
         task_metrics=metrics_mapping,
+        steer_phase_token_spans=(
+            existing.steer_phase_token_spans
+            if existing is not None
+            else _coerce_token_spans(value=payload.get("steer_phase_token_spans"))
+        ),
     )
     leaves_by_id[leaf_id] = scored
     pre_scored_leaves[leaf_id] = scored
@@ -670,12 +697,16 @@ def _token_trace_from_row(*, token_index: int, row: dict[str, Any]) -> TokenTrac
     """Parse one token trace row from serialized event payload mapping."""
 
     token_id = row.get("token_id")
+    logprob = float(row.get("selected_logprob", 0.0))
+    probability = row.get("selected_probability")
     return TokenTrace(
         token_index=token_index,
         token_id=int(token_id) if token_id is not None else None,
         token_text=str(row.get("token_text", "")),
-        logprob=float(row.get("selected_logprob", 0.0)),
-        probability=float(row.get("selected_probability", 0.0)),
+        logprob=logprob,
+        probability=(
+            float(probability) if probability is not None else math.exp(logprob)
+        ),
     )
 
 

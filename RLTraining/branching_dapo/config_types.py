@@ -10,7 +10,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-VALID_SELECTOR_MODES = frozenset({"cluster_across", "random"})
+from branching_dapo.update_masking import validate_update_mode
+
+VALID_ROLLOUT_MODES = frozenset(
+    {"branching", "baseline", "no_branching", "structured_baseline", "epsilon_greedy"}
+)
+VALID_SELECTOR_MODES = frozenset(
+    {"cluster_across", "embed_diverse_topk_random", "random", "within_cluster"}
+)
 
 
 @dataclass(frozen=True)
@@ -23,12 +30,14 @@ class BranchAdvantageIndex:
         leaf_id: Stable leaf id inside the branch tree.
         leaf_node_id: Final tree node id for this leaf.
         path_node_ids: Ordered node ids from root to leaf.
+        branch_token_offsets: Generated-token offsets where each path branch
+            starts affecting the leaf continuation.
         parent_branch_id: Parent node id for the final edge, or `None`.
         branch_depth: Number of branch edges on this leaf path.
         selected_cluster_id: Cluster id or label for the final branch choice.
         cluster_name: Human-readable cluster label when available.
         selector_mode: Selector mode used for this tree.
-        candidate_pool_key: Candidate-pool cache key for the final branch point.
+        candidate_pool_key: Candidate-pool id for the final branch point.
 
     Returns:
         Dataclass serialized into `uid` for the custom advantage estimator.
@@ -39,6 +48,7 @@ class BranchAdvantageIndex:
     leaf_id: str
     leaf_node_id: str
     path_node_ids: tuple[str, ...]
+    branch_token_offsets: tuple[int, ...]
     parent_branch_id: str | None
     branch_depth: int
     selected_cluster_id: str | None
@@ -70,23 +80,44 @@ class BranchAdvantageIndex:
         """
 
         payload = json.loads(raw_value)
-        assert isinstance(payload, dict), "Branch advantage index payload must be a mapping."
+        assert isinstance(
+            payload, dict
+        ), "Branch advantage index payload must be a mapping."
         path_node_ids = payload.get("path_node_ids", [])
         assert isinstance(path_node_ids, list), "path_node_ids must be a list."
+        branch_token_offsets = payload["branch_token_offsets"]
+        assert isinstance(
+            branch_token_offsets, list
+        ), "branch_token_offsets must be a list."
         return cls(
             prompt_uid=str(payload["prompt_uid"]),
             branch_tree_id=str(payload["branch_tree_id"]),
             leaf_id=str(payload["leaf_id"]),
             leaf_node_id=str(payload["leaf_node_id"]),
             path_node_ids=tuple(str(node_id) for node_id in path_node_ids),
-            parent_branch_id=None if payload.get("parent_branch_id") is None else str(payload["parent_branch_id"]),
+            branch_token_offsets=tuple(int(offset) for offset in branch_token_offsets),
+            parent_branch_id=(
+                None
+                if payload.get("parent_branch_id") is None
+                else str(payload["parent_branch_id"])
+            ),
             branch_depth=int(payload["branch_depth"]),
             selected_cluster_id=(
-                None if payload.get("selected_cluster_id") is None else str(payload["selected_cluster_id"])
+                None
+                if payload.get("selected_cluster_id") is None
+                else str(payload["selected_cluster_id"])
             ),
-            cluster_name=None if payload.get("cluster_name") is None else str(payload["cluster_name"]),
+            cluster_name=(
+                None
+                if payload.get("cluster_name") is None
+                else str(payload["cluster_name"])
+            ),
             selector_mode=str(payload["selector_mode"]),
-            candidate_pool_key=None if payload.get("candidate_pool_key") is None else str(payload["candidate_pool_key"]),
+            candidate_pool_key=(
+                None
+                if payload.get("candidate_pool_key") is None
+                else str(payload["candidate_pool_key"])
+            ),
         )
 
 
@@ -95,6 +126,7 @@ class BranchingRolloutSettings:
     """Repo-local rollout settings used by the branching manager.
 
     Args:
+        rollout_mode: Rollout execution mode aligned to `Analysis` eval runs.
         selector_mode: Branch selector mode (`cluster_across` or `random`).
         branch_fanout: Number of selected candidates per branch point.
         max_branch_points_per_rollout: Maximum branch points on one path.
@@ -103,7 +135,13 @@ class BranchingRolloutSettings:
         branch_prob: Probability of branching at eligible steer boundaries.
         candidate_span_tokens: Span used by entropy-trigger candidate generation.
         max_steer_tokens: Maximum tokens generated for steer candidates.
+        steer_temperature: Optional temperature for steer candidate generation.
+        steer_top_p: Optional nucleus cutoff for steer candidate generation.
         steer_repetition_penalty: Repetition penalty used for steer candidate generation.
+        top_logprobs: Requested top-logprob alternatives per generated token.
+        epsilon_greedy_prob: Probability that a non-branch steer trigger uses
+            inline one-candidate selector exploration instead of a plain steer
+            continuation. This is compatible with true branching.
         entropy_threshold: Optional explicit entropy-trigger threshold override.
         entropy_profile_name: Calibration profile label retained for parity with
             `Analysis/branching_eval` configs.
@@ -113,11 +151,14 @@ class BranchingRolloutSettings:
         seed: Base RNG seed for prompt-group branching runs.
         cache_root: Root directory for branching artifacts.
         env_paths: Dotenv paths used for external selector API keys.
+        update_mode: Actor update mask mode. `steer_only` trains only tokens
+            generated by steer-phase requests.
 
     Returns:
         Dataclass used by the rollout manager.
     """
 
+    rollout_mode: str = "branching"
     selector_mode: str = "cluster_across"
     branch_fanout: int = 4
     max_branch_points_per_rollout: int = 2
@@ -126,7 +167,11 @@ class BranchingRolloutSettings:
     branch_prob: float = 1.0
     candidate_span_tokens: int = 15
     max_steer_tokens: int = 15
+    steer_temperature: float | None = None
+    steer_top_p: float | None = None
     steer_repetition_penalty: float = 1.01
+    top_logprobs: int = 1
+    epsilon_greedy_prob: float = 0.05
     entropy_threshold: float | None = None
     entropy_profile_name: str = "aime24_default"
     max_concurrent_branches: int = 64
@@ -135,6 +180,12 @@ class BranchingRolloutSettings:
     seed: int = 0
     cache_root: Path = Path("/tmp/branching_dapo")
     env_paths: tuple[Path, ...] = ()
+    update_mode: str = "all"
+
+    def __post_init__(self) -> None:
+        """Validate scalar settings that should fail before rollout starts."""
+
+        assert self.top_logprobs >= 0, "top_logprobs must be non-negative."
 
     @classmethod
     def from_config(cls, config: Any) -> "BranchingRolloutSettings":
@@ -147,31 +198,55 @@ class BranchingRolloutSettings:
             Parsed rollout settings with defaults filled in.
         """
 
-        rollout_custom = cls._as_mapping(getattr(config.actor_rollout_ref.rollout, "custom", None))
+        rollout_custom = cls._as_mapping(
+            getattr(config.actor_rollout_ref.rollout, "custom", None)
+        )
         payload = cls._as_mapping(rollout_custom.get("branching_dapo"))
-        default_cache_root = Path(os.environ.get("SCRATCH_ROOT", "/tmp")) / "branching_dapo"
+        default_cache_root = (
+            Path(os.environ.get("SCRATCH_ROOT", "/tmp")) / "branching_dapo"
+        )
         return cls(
+            rollout_mode=str(payload.get("rollout_mode", "branching")),
             selector_mode=str(payload.get("selector_mode", "cluster_across")),
             branch_fanout=int(payload.get("branch_fanout", 4)),
-            max_branch_points_per_rollout=int(payload.get("max_branch_points_per_rollout", 2)),
+            max_branch_points_per_rollout=int(
+                payload.get("max_branch_points_per_rollout", 2)
+            ),
             num_candidates=int(payload.get("num_candidates", 100)),
             max_clusters=int(payload.get("max_clusters", 4)),
             branch_prob=float(payload.get("branch_prob", 1.0)),
             candidate_span_tokens=int(payload.get("candidate_span_tokens", 15)),
             max_steer_tokens=int(payload.get("max_steer_tokens", 15)),
-            steer_repetition_penalty=float(payload.get("steer_repetition_penalty", 1.01)),
+            steer_temperature=(
+                float(payload["steer_temperature"])
+                if payload.get("steer_temperature") is not None
+                else None
+            ),
+            steer_top_p=(
+                float(payload["steer_top_p"])
+                if payload.get("steer_top_p") is not None
+                else None
+            ),
+            steer_repetition_penalty=float(
+                payload.get("steer_repetition_penalty", 1.01)
+            ),
+            top_logprobs=int(payload.get("top_logprobs", 1)),
+            epsilon_greedy_prob=float(payload.get("epsilon_greedy_prob", 0.05)),
             entropy_threshold=(
                 float(payload["entropy_threshold"])
                 if payload.get("entropy_threshold") is not None
                 else None
             ),
-            entropy_profile_name=str(payload.get("entropy_profile_name", "aime24_default")),
+            entropy_profile_name=str(
+                payload.get("entropy_profile_name", "aime24_default")
+            ),
             max_concurrent_branches=int(payload.get("max_concurrent_branches", 64)),
             trigger_steer_enabled=bool(payload.get("trigger_steer_enabled", True)),
             trigger_entropy_enabled=bool(payload.get("trigger_entropy_enabled", False)),
             seed=int(payload.get("seed", 0)),
             cache_root=Path(payload.get("cache_root", default_cache_root)),
             env_paths=cls._normalize_path_sequence(value=payload.get("env_paths")),
+            update_mode=str(payload.get("update_mode", "all")),
         )
 
     @staticmethod
@@ -214,6 +289,27 @@ class BranchingRolloutSettings:
             return ()
         return tuple(Path(str(path_value)) for path_value in value)
 
+    def validated_rollout_mode(self) -> str:
+        """Validate and return the configured rollout mode.
+
+        Args:
+            None.
+
+        Returns:
+            Supported rollout-mode string.
+        """
+
+        assert self.rollout_mode in VALID_ROLLOUT_MODES, (
+            f"Unsupported rollout mode {self.rollout_mode!r}. "
+            f"Expected one of {sorted(VALID_ROLLOUT_MODES)}."
+        )
+        return self.rollout_mode
+
+    def validated_update_mode(self) -> str:
+        """Validate and return the actor update mask mode."""
+
+        return validate_update_mode(mode=self.update_mode)
+
     def leaf_limit(self) -> int:
         """Return the number of leaves produced by one branched rollout tree.
 
@@ -242,6 +338,23 @@ class BranchingRolloutSettings:
         )
         return self.selector_mode
 
+    def selector_label_for_records(self) -> str:
+        """Return the selector label stored in branch metadata.
+
+        Args:
+            None.
+
+        Returns:
+            Stable selector label for this rollout mode.
+        """
+
+        mode = self.validated_rollout_mode()
+        if mode in {"baseline", "no_branching"}:
+            return "baseline"
+        if mode == "structured_baseline":
+            return "structured_baseline"
+        return self.validated_selector_mode()
+
     @staticmethod
     def sanitize_path_component(raw_name: str) -> str:
         """Normalize a free-form label into a filesystem-safe path component.
@@ -257,7 +370,9 @@ class BranchingRolloutSettings:
             'full_scale_run'
         """
 
-        collapsed_name = re.sub(pattern=r"[^A-Za-z0-9._-]+", repl="_", string=raw_name.strip())
+        collapsed_name = re.sub(
+            pattern=r"[^A-Za-z0-9._-]+", repl="_", string=raw_name.strip()
+        )
         return collapsed_name.strip("._") or "branching_dapo"
 
     def artifact_root_dir(self) -> Path:
@@ -282,7 +397,9 @@ class BranchingRolloutSettings:
             Per-run artifact directory.
         """
 
-        return self.artifact_root_dir() / self.sanitize_path_component(raw_name=run_name)
+        return self.artifact_root_dir() / self.sanitize_path_component(
+            raw_name=run_name
+        )
 
     def artifact_batch_dir(self, *, run_name: str, batch_name: str) -> Path:
         """Return the unique artifact directory for one rollout batch.
@@ -295,7 +412,10 @@ class BranchingRolloutSettings:
             Per-batch artifact directory.
         """
 
-        return self.artifact_run_dir(run_name=run_name) / self.sanitize_path_component(raw_name=batch_name)
+        return self.artifact_run_dir(run_name=run_name) / self.sanitize_path_component(
+            raw_name=batch_name
+        )
+
 
 @dataclass(frozen=True)
 class BranchAdvantageSettings:
@@ -332,5 +452,7 @@ class BranchAdvantageSettings:
             alpha=float(payload.get("branching_alpha", 0.5)),
             epsilon=float(payload.get("branching_epsilon", 1e-6)),
             normalize_inter_by_std=bool(payload.get("norm_adv_by_std_in_grpo", True)),
-            normalize_intra_by_std=bool(payload.get("branching_intra_norm_by_std", True)),
+            normalize_intra_by_std=bool(
+                payload.get("branching_intra_norm_by_std", True)
+            ),
         )

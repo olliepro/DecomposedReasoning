@@ -4,8 +4,12 @@
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import uuid
+from dataclasses import dataclass
+from pathlib import Path
 from pprint import pprint
 from typing import Any
 
@@ -13,7 +17,13 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from branching_dapo.advantage import (
+    BranchSegmentAdvantage,
+    compute_branch_segment_advantages,
+)
+from branching_dapo.config_types import BranchingRolloutSettings
 from branching_dapo.runtime_metrics import consume_runtime_metrics
+from branching_dapo.update_masking import build_steer_only_response_mask
 from verl import DataProto
 from verl.protocol import DataProtoConfig, pad_dataproto_to_divisor, unpad_dataproto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
@@ -37,12 +47,109 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 
+REWARD_COMPONENT_KEYS = ("structure_reward", "answer_reward")
+BLOCK_METRIC_KEYS = (
+    ("exec", "exec_block_count", "exec_block_word_count"),
+    ("steer", "steer_block_count", "steer_block_word_count"),
+)
+
+
+@dataclass(frozen=True)
+class ActorUpdateMaskState:
+    """Original actor-update tensors restored after a masked update."""
+
+    response_mask: torch.Tensor
+    advantages: torch.Tensor | None
+
+
+REPEAT_BLOCK_KINDS = ("exec", "steer")
+
+
+def _finite_numeric_values(*, values: object) -> np.ndarray:
+    """Return finite float values from reward-extra arrays."""
+
+    numeric_values: list[float] = []
+    for raw_value in np.asarray(values, dtype=object).reshape(-1):
+        if raw_value is None:
+            continue
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(numeric_value):
+            numeric_values.append(numeric_value)
+    return np.asarray(numeric_values, dtype=np.float64)
+
+
+def _finite_numeric_values_by_index(*, values: object) -> list[float | None]:
+    """Return finite float values while preserving reward-extra row positions."""
+
+    numeric_values: list[float | None] = []
+    for raw_value in np.asarray(values, dtype=object).reshape(-1):
+        if raw_value is None:
+            numeric_values.append(None)
+            continue
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError):
+            numeric_values.append(None)
+            continue
+        if np.isfinite(numeric_value):
+            numeric_values.append(numeric_value)
+        else:
+            numeric_values.append(None)
+    return numeric_values
+
+
+def _string_values_by_index(*, values: object) -> list[str | None]:
+    """Return non-empty string values while preserving reward-extra positions."""
+
+    string_values: list[str | None] = []
+    for raw_value in np.asarray(values, dtype=object).reshape(-1):
+        if raw_value is None:
+            string_values.append(None)
+            continue
+        normalized_text = " ".join(str(raw_value).strip().split())
+        if normalized_text and normalized_text.lower() not in {"none", "nan"}:
+            string_values.append(normalized_text)
+        else:
+            string_values.append(None)
+    return string_values
+
+
+def _normalized_answer_text(*, value: object) -> str | None:
+    """Return a whitespace-normalized answer string for diversity metrics."""
+
+    if value is None:
+        return None
+    normalized_text = " ".join(str(value).strip().split())
+    if not normalized_text:
+        return None
+    return normalized_text
+
+
+def _prompt_uid_from_branch_uid(*, value: object) -> str | None:
+    """Extract prompt uid from serialized branch metadata."""
+
+    if value is None:
+        return None
+    branch_payload = json.loads(str(value))
+    prompt_uid = branch_payload.get("prompt_uid")
+    if prompt_uid is None:
+        return None
+    prompt_uid_text = str(prompt_uid).strip()
+    if not prompt_uid_text:
+        return None
+    return prompt_uid_text
+
 
 class BranchingRayPPOTrainer(RayPPOTrainer):
     """Repo-local PPO trainer that preserves upstream behavior and logs branching metrics."""
 
     @staticmethod
-    def _hybrid_fsdp_dispatch_info(*, world_size: int, fsdp_size: int) -> tuple[list[int], list[bool]] | None:
+    def _hybrid_fsdp_dispatch_info(
+        *, world_size: int, fsdp_size: int
+    ) -> tuple[list[int], list[bool]] | None:
         """Return corrected dispatch/collect info for hybrid-sharded FSDP workers.
 
         Args:
@@ -57,7 +164,9 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
 
         if fsdp_size <= 1 or fsdp_size >= world_size:
             return None
-        assert world_size % fsdp_size == 0, f"world_size={world_size} must be divisible by fsdp_size={fsdp_size}"
+        assert (
+            world_size % fsdp_size == 0
+        ), f"world_size={world_size} must be divisible by fsdp_size={fsdp_size}"
         dispatch_ranks = [rank // fsdp_size for rank in range(world_size)]
         collect_mask = [rank % fsdp_size == 0 for rank in range(world_size)]
         return dispatch_ranks, collect_mask
@@ -82,7 +191,9 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
 
         if worker_group is None:
             return
-        dispatch_info = self._hybrid_fsdp_dispatch_info(world_size=worker_group.world_size, fsdp_size=fsdp_size)
+        dispatch_info = self._hybrid_fsdp_dispatch_info(
+            world_size=worker_group.world_size, fsdp_size=fsdp_size
+        )
         if dispatch_info is None:
             return
         dispatch_ranks, collect_mask = dispatch_info
@@ -129,7 +240,9 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
         """
 
         experiment_name = str(self.config.trainer.experiment_name)
-        return os.environ.get("BRANCHING_FIT_DEBUG") == "1" or experiment_name.startswith("debug_fit_")
+        return os.environ.get(
+            "BRANCHING_FIT_DEBUG"
+        ) == "1" or experiment_name.startswith("debug_fit_")
 
     def _fit_debug(self, *, message: str) -> None:
         """Emit a flushed fit-loop debug marker when debug tracing is enabled.
@@ -170,6 +283,36 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
 
         batch.meta_info[DataProtoConfig.auto_padding_key] = True
 
+    def _stage_padding_divisor(self, *, stage_name: str) -> int:
+        """Return the global batch divisor required before distributed dispatch."""
+
+        actor_dp_size = self._actor_dp_size()
+        if stage_name == "update_actor":
+            mini_batch_size = self._actor_update_mini_batch_size()
+            return math.lcm(actor_dp_size, mini_batch_size)
+        if stage_name == "update_critic":
+            mini_batch_size = self._critic_update_mini_batch_size()
+            return math.lcm(actor_dp_size, mini_batch_size)
+        return actor_dp_size
+
+    def _actor_update_mini_batch_size(self) -> int:
+        """Return the global PPO mini-batch size used by verl's actor update."""
+
+        actor_config = self.config.actor_rollout_ref.actor
+        rollout_config = self.config.actor_rollout_ref.rollout
+        mini_batch_size = int(actor_config.ppo_mini_batch_size) * int(rollout_config.n)
+        assert mini_batch_size > 0
+        return mini_batch_size
+
+    def _critic_update_mini_batch_size(self) -> int:
+        """Return the global PPO mini-batch size used by verl's critic update."""
+
+        critic_config = self.config.critic
+        rollout_config = self.config.actor_rollout_ref.rollout
+        mini_batch_size = int(critic_config.ppo_mini_batch_size) * int(rollout_config.n)
+        assert mini_batch_size > 0
+        return mini_batch_size
+
     def _pad_for_actor_dp(
         self,
         *,
@@ -189,12 +332,21 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
         """
 
         actor_dp_size = self._actor_dp_size()
-        padded_batch, pad_size = pad_dataproto_to_divisor(data=batch, size_divisor=actor_dp_size)
+        padding_divisor = self._stage_padding_divisor(stage_name=stage_name)
+        padded_batch, pad_size = pad_dataproto_to_divisor(
+            data=batch, size_divisor=padding_divisor
+        )
         if pad_size == 0:
             return padded_batch, pad_size
         metrics[f"trainer/{stage_name}_pad_size"] = pad_size
         metrics[f"trainer/{stage_name}_padded_batch_size"] = len(padded_batch)
-        self._fit_debug(message=f"pad_{stage_name} batch_size={len(batch)} pad_size={pad_size} dp_size={actor_dp_size}")
+        metrics[f"trainer/{stage_name}_pad_divisor"] = padding_divisor
+        self._fit_debug(
+            message=(
+                f"pad_{stage_name} batch_size={len(batch)} pad_size={pad_size} "
+                f"dp_size={actor_dp_size} divisor={padding_divisor}"
+            )
+        )
         return padded_batch, pad_size
 
     @staticmethod
@@ -231,9 +383,13 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
 
         del batch
         del metrics
-        return bool(rollout_corr_config and rollout_corr_config.get("bypass_mode", False))
+        return bool(
+            rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+        )
 
-    def _should_balance_branching_batch(self, *, batch: DataProto, metrics: dict[str, float | int | object]) -> bool:
+    def _should_balance_branching_batch(
+        self, *, batch: DataProto, metrics: dict[str, float | int | object]
+    ) -> bool:
         """Return whether sequence-length balancing is valid for the realized batch.
 
         Args:
@@ -252,7 +408,9 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
         metrics["trainer/balance_batch_skipped_ragged"] = 1
         metrics["trainer/ragged_batch_size"] = len(batch)
         metrics["trainer/ragged_batch_dp_size"] = dp_size
-        self._fit_debug(message=f"skip_balance_batch batch_size={len(batch)} dp_size={dp_size}")
+        self._fit_debug(
+            message=f"skip_balance_batch batch_size={len(batch)} dp_size={dp_size}"
+        )
         return False
 
     @staticmethod
@@ -267,7 +425,11 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
         """
 
         flattened_values: list[float] = []
-        for value in metric_values if isinstance(metric_values, (list, tuple)) else [metric_values]:
+        for value in (
+            metric_values
+            if isinstance(metric_values, (list, tuple))
+            else [metric_values]
+        ):
             if isinstance(value, torch.Tensor):
                 value = value.detach().cpu().numpy()
             array_value = np.asarray(value)
@@ -297,7 +459,9 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
             try:
                 reduced_value = reduce_metrics({metric_name: metric_value})[metric_name]
             except (TypeError, ValueError):
-                flattened_values = self._flatten_numeric_metric_values(metric_values=metric_value)
+                flattened_values = self._flatten_numeric_metric_values(
+                    metric_values=metric_value
+                )
                 if not flattened_values:
                     skipped_metric_names.append(metric_name)
                     continue
@@ -310,7 +474,9 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
             metrics[metric_name] = reduced_value
         if skipped_metric_names:
             metrics["trainer/skipped_worker_metric_count"] = len(skipped_metric_names)
-            self._fit_debug(message=f"skip_worker_metrics names={','.join(skipped_metric_names)}")
+            self._fit_debug(
+                message=f"skip_worker_metrics names={','.join(skipped_metric_names)}"
+            )
 
     def _compute_advantages(self, *, batch: DataProto) -> DataProto:
         """Compute advantages while preserving the trainer's rollout-group uid.
@@ -332,24 +498,177 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
                 gamma=self.config.algorithm.gamma,
                 lam=self.config.algorithm.lam,
                 num_repeat=self.config.actor_rollout_ref.rollout.n,
-                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                norm_adv_by_std_in_grpo=self.config.algorithm.get(
+                    "norm_adv_by_std_in_grpo", True
+                ),
                 config=self.config.algorithm,
             )
 
         original_uid = batch.non_tensor_batch["uid"]
         batch.non_tensor_batch["uid"] = batch.non_tensor_batch["branch_uid"]
         try:
-            return compute_advantage(
+            updated_batch = compute_advantage(
                 batch,
                 adv_estimator=self.config.algorithm.adv_estimator,
                 gamma=self.config.algorithm.gamma,
                 lam=self.config.algorithm.lam,
                 num_repeat=self.config.actor_rollout_ref.rollout.n,
-                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                norm_adv_by_std_in_grpo=self.config.algorithm.get(
+                    "norm_adv_by_std_in_grpo", True
+                ),
                 config=self.config.algorithm,
             )
         finally:
             batch.non_tensor_batch["uid"] = original_uid
+        updated_batch.non_tensor_batch["uid"] = original_uid
+        self._persist_branch_segment_advantages(batch=updated_batch)
+        return updated_batch
+
+    def _persist_branch_segment_advantages(self, *, batch: DataProto) -> None:
+        """Persist final combined token advantage summaries for the tree viewer."""
+
+        if "advantages" not in batch.batch.keys():
+            return
+        if "branch_uid" not in batch.non_tensor_batch:
+            return
+        prompt_contexts = self._advantage_prompt_contexts(batch=batch)
+        if not prompt_contexts:
+            return
+        segments = compute_branch_segment_advantages(
+            advantages=batch.batch["advantages"],
+            response_mask=batch.batch["response_mask"],
+            index=batch.non_tensor_batch["branch_uid"],
+        )
+        if not segments:
+            return
+        from branching_eval.event_db import EventDatabase
+
+        rows_by_db_path: dict[Path, list[dict[str, object]]] = {}
+        for segment in segments:
+            context_row = prompt_contexts.get(segment.prompt_uid)
+            if context_row is None:
+                continue
+            db_path, event_context = context_row
+            rows_by_db_path.setdefault(db_path, []).append(
+                self._node_advantage_row(
+                    segment=segment,
+                    event_context=event_context,
+                )
+            )
+        for db_path, rows in rows_by_db_path.items():
+            db = EventDatabase(path=db_path)
+            updated_at_event_index = db.last_event_index()
+            db.upsert_node_advantage_rows(
+                rows=[
+                    {**row, "updated_at_event_index": updated_at_event_index}
+                    for row in rows
+                ]
+            )
+
+    def _advantage_prompt_contexts(
+        self, *, batch: DataProto
+    ) -> dict[str, tuple[Path, dict[str, object]]]:
+        """Return prompt uid to artifact DB and event-context mapping."""
+
+        db_paths = batch.non_tensor_batch.get("tree_events_db_path")
+        reward_scores = batch.non_tensor_batch.get("reward_scores")
+        if db_paths is None or reward_scores is None:
+            return {}
+        assert len(db_paths) == len(reward_scores), (
+            "tree_events_db_path and reward_scores must align: "
+            f"{len(db_paths)} != {len(reward_scores)}"
+        )
+        contexts: dict[str, tuple[Path, dict[str, object]]] = {}
+        for raw_db_path, raw_scores in zip(db_paths, reward_scores, strict=True):
+            scores = dict(raw_scores)
+            metadata = scores.get("branch_metadata")
+            event_context = scores.get("event_context")
+            if not isinstance(metadata, dict) or not isinstance(event_context, dict):
+                continue
+            prompt_uid = str(metadata.get("prompt_uid") or "")
+            if prompt_uid:
+                contexts[prompt_uid] = (Path(str(raw_db_path)), event_context)
+        return contexts
+
+    def _node_advantage_row(
+        self,
+        *,
+        segment: BranchSegmentAdvantage,
+        event_context: dict[str, object],
+    ) -> dict[str, object]:
+        """Return one typed SQLite row for a segment advantage."""
+
+        return {
+            "doc_id": int(event_context["doc_id"]),
+            "doc_attempt": int(event_context["doc_attempt"]),
+            "task_name": str(event_context["task_name"]),
+            "model_id": str(event_context["model_id"]),
+            "selector_mode": str(event_context["selector_mode"]),
+            "prompt_uid": segment.prompt_uid,
+            "branch_tree_id": segment.branch_tree_id,
+            "parent_node_id": segment.parent_node_id,
+            "child_node_id": segment.child_node_id,
+            "branch_depth": segment.branch_depth,
+            "token_start": segment.token_start,
+            "token_end": segment.token_end,
+            "mean_combined_advantage": segment.mean_combined_advantage,
+            "token_count": segment.token_count,
+            "leaf_count": segment.leaf_count,
+        }
+
+    def _apply_actor_update_mask(
+        self, *, batch: DataProto, metrics: dict[str, float | int | object]
+    ) -> ActorUpdateMaskState | None:
+        """Temporarily narrow `response_mask` for the actor update."""
+
+        update_mode = BranchingRolloutSettings.from_config(
+            config=self.config
+        ).validated_update_mode()
+        metrics["actor/update_mode_steer_only"] = (
+            1.0 if update_mode == "steer_only" else 0.0
+        )
+        if update_mode == "all":
+            return None
+        steer_mask, stats = build_steer_only_response_mask(
+            responses=batch.batch["responses"],
+            response_mask=batch.batch["response_mask"],
+            tokenizer=self.tokenizer,
+            steer_phase_token_spans=self._steer_phase_token_span_rows(batch=batch),
+        )
+        metrics.update(stats.as_metrics(prefix="actor/update_mask"))
+        selected_token_ratio = (
+            stats.selected_token_count / stats.response_token_count
+            if stats.response_token_count
+            else 0.0
+        )
+        gradient_scale = math.sqrt(selected_token_ratio)
+        metrics["actor/update_mask/loss_scale"] = gradient_scale
+        metrics["actor/update_mask/gradient_scale"] = gradient_scale
+        full_response_mask = batch.batch["response_mask"]
+        full_advantages = (
+            batch.batch["advantages"] if "advantages" in batch.batch.keys() else None
+        )
+        batch.batch["response_mask"] = steer_mask
+        if full_advantages is not None:
+            batch.batch["advantages"] = full_advantages * gradient_scale
+        return ActorUpdateMaskState(
+            response_mask=full_response_mask, advantages=full_advantages
+        )
+
+    @staticmethod
+    def _steer_phase_token_span_rows(*, batch: DataProto) -> list[object] | None:
+        """Return per-row steer-phase token spans from rollout reward metadata."""
+
+        reward_scores = batch.non_tensor_batch.get("reward_scores")
+        if reward_scores is None:
+            return None
+        span_rows: list[object] = []
+        for reward_score in np.asarray(reward_scores, dtype=object).reshape(-1):
+            assert isinstance(
+                reward_score, dict
+            ), "reward_scores rows must be dictionaries"
+            span_rows.append(reward_score.get("steer_phase_token_spans", ()))
+        return span_rows
 
     def _collect_image_seqlens(self, *, batch: DataProto) -> list[int]:
         """Collect image sequence lengths from an optional multimodal batch payload.
@@ -381,9 +700,9 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
             None.
         """
 
-        assert self.config.algorithm.adv_estimator != AdvantageEstimator.REMAX, (
-            "REMAX is unsupported for ragged branching rollouts."
-        )
+        assert (
+            self.config.algorithm.adv_estimator != AdvantageEstimator.REMAX
+        ), "REMAX is unsupported for ragged branching rollouts."
 
     @staticmethod
     def _snapshot_non_tensor_batch(*, batch: DataProto) -> dict[str, np.ndarray]:
@@ -399,6 +718,25 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
         return {key: value.copy() for key, value in batch.non_tensor_batch.items()}
 
     @staticmethod
+    def _repeat_generation_batch(
+        *, generation_batch: DataProto, repeat_times: int
+    ) -> DataProto:
+        """Repeat prompts for grouped rollout generation using VERL semantics.
+
+        Args:
+            generation_batch: Prompt-only batch passed to the rollout manager.
+            repeat_times: Number of response samples requested per source prompt.
+
+        Returns:
+            Interleaved repeated generation batch.
+        """
+
+        assert repeat_times >= 1, f"rollout.n must be positive, got {repeat_times}"
+        if repeat_times == 1:
+            return generation_batch
+        return generation_batch.repeat(repeat_times=repeat_times, interleave=True)
+
+    @staticmethod
     def _build_uid_index(*, uid_values: np.ndarray) -> dict[str, int]:
         """Build a stable lookup from source uid to source prompt row index.
 
@@ -412,7 +750,9 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
         uid_index: dict[str, int] = {}
         for item_index, uid_value in enumerate(uid_values):
             uid_string = str(uid_value)
-            assert uid_string not in uid_index, f"Duplicate source uid encountered: {uid_string}"
+            assert (
+                uid_string not in uid_index
+            ), f"Duplicate source uid encountered: {uid_string}"
             uid_index[uid_string] = item_index
         return uid_index
 
@@ -434,18 +774,27 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
             Training batch aligned to realized rollout leaves.
         """
 
-        assert len(generation_batch) > 0, "Generation batch must contain at least one realized leaf."
-        assert "uid" in generation_batch.non_tensor_batch, "Generation batch must preserve source uid values."
+        assert (
+            len(generation_batch) > 0
+        ), "Generation batch must contain at least one realized leaf."
+        assert (
+            "uid" in generation_batch.non_tensor_batch
+        ), "Generation batch must preserve source uid values."
         uid_index = BranchingRayPPOTrainer._build_uid_index(
             uid_values=source_non_tensor_batch["uid"]
         )
         selected_indices = np.array(
-            [uid_index[str(uid_value)] for uid_value in generation_batch.non_tensor_batch["uid"]],
+            [
+                uid_index[str(uid_value)]
+                for uid_value in generation_batch.non_tensor_batch["uid"]
+            ],
             dtype=np.int64,
         )
         if source_batch.batch is not None and generation_batch.batch is not None:
             missing_batch_keys = [
-                key for key in source_batch.batch.keys() if key not in generation_batch.batch.keys()
+                key
+                for key in source_batch.batch.keys()
+                if key not in generation_batch.batch.keys()
             ]
             if missing_batch_keys:
                 aligned_source = source_batch.select_idxs(selected_indices).select(
@@ -476,6 +825,195 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
         shadow_keys = set(batch.batch.keys()) & set(batch.non_tensor_batch.keys())
         for key in shadow_keys:
             batch.non_tensor_batch.pop(key, None)
+
+    @staticmethod
+    def _reward_component_metrics(
+        *, reward_extra_infos_dict: dict[str, object]
+    ) -> dict[str, float]:
+        """Reduce reward component arrays into scalar logger metrics."""
+
+        metrics: dict[str, float] = {}
+        for component_key in REWARD_COMPONENT_KEYS:
+            raw_values = reward_extra_infos_dict.get(component_key)
+            if raw_values is None:
+                continue
+            numeric_values = _finite_numeric_values(values=raw_values)
+            if numeric_values.size == 0:
+                continue
+            metric_prefix = f"reward/{component_key}"
+            metrics[f"{metric_prefix}/mean"] = float(np.mean(numeric_values))
+            metrics[f"{metric_prefix}/max"] = float(np.max(numeric_values))
+            metrics[f"{metric_prefix}/min"] = float(np.min(numeric_values))
+        return metrics
+
+    @staticmethod
+    def _answer_diversity_metrics(
+        *, reward_extra_infos_dict: dict[str, object]
+    ) -> dict[str, float]:
+        """Reduce answer diversity and prompt-level zero-answer-reward metrics."""
+
+        metrics: dict[str, float] = {}
+        raw_predictions = reward_extra_infos_dict.get("pred")
+        if raw_predictions is not None:
+            given_answers: list[str] = []
+            for raw_prediction in np.asarray(raw_predictions, dtype=object).reshape(-1):
+                normalized_answer = _normalized_answer_text(value=raw_prediction)
+                if normalized_answer is not None:
+                    given_answers.append(normalized_answer)
+            answer_count = len(given_answers)
+            unique_answer_count = len(set(given_answers))
+            metrics["answer/given_answer_count"] = float(answer_count)
+            metrics["answer/unique_given_answer_count"] = float(unique_answer_count)
+            metrics["answer/unique_given_answer_ratio"] = (
+                float(unique_answer_count / answer_count) if answer_count else 0.0
+            )
+
+        raw_branch_uids = reward_extra_infos_dict.get("branch_uid")
+        raw_answer_rewards = reward_extra_infos_dict.get("answer_reward")
+        if raw_branch_uids is None or raw_answer_rewards is None:
+            return metrics
+
+        prompt_rewards: dict[str, list[float]] = {}
+        branch_uids = np.asarray(raw_branch_uids, dtype=object).reshape(-1)
+        answer_rewards = _finite_numeric_values_by_index(values=raw_answer_rewards)
+        for raw_branch_uid, answer_reward in zip(
+            branch_uids.tolist(), answer_rewards, strict=False
+        ):
+            if answer_reward is None:
+                continue
+            prompt_uid = _prompt_uid_from_branch_uid(value=raw_branch_uid)
+            if prompt_uid is None:
+                continue
+            prompt_rewards.setdefault(prompt_uid, []).append(answer_reward)
+        if not prompt_rewards:
+            return metrics
+
+        prompt_count = len(prompt_rewards)
+        prompt_pass_rates = [
+            float(np.mean(rewards)) for rewards in prompt_rewards.values() if rewards
+        ]
+        zero_reward_prompt_count = sum(
+            1
+            for rewards in prompt_rewards.values()
+            if rewards and all(reward == 0.0 for reward in rewards)
+        )
+        metrics["answer/prompt_count"] = float(prompt_count)
+        metrics["answer/problem_pass_rate_mean"] = float(np.mean(prompt_pass_rates))
+        metrics["answer/problem_pass_rate_max"] = float(np.max(prompt_pass_rates))
+        metrics["answer/problem_pass_rate_min"] = float(np.min(prompt_pass_rates))
+        metrics["answer/prompts_zero_answer_reward_all_rollouts_count"] = float(
+            zero_reward_prompt_count
+        )
+        metrics["answer/prompts_zero_answer_reward_all_rollouts_ratio"] = float(
+            zero_reward_prompt_count / prompt_count
+        )
+        return metrics
+
+    @staticmethod
+    def _block_structure_metrics(
+        *, reward_extra_infos_dict: dict[str, object]
+    ) -> dict[str, float]:
+        """Reduce steer/exec block counts and lengths into scalar metrics."""
+
+        metrics: dict[str, float] = {}
+        for block_name, count_key, word_count_key in BLOCK_METRIC_KEYS:
+            raw_counts = reward_extra_infos_dict.get(count_key)
+            raw_word_counts = reward_extra_infos_dict.get(word_count_key)
+            if raw_counts is None or raw_word_counts is None:
+                continue
+            block_counts = _finite_numeric_values(values=raw_counts)
+            block_word_counts = _finite_numeric_values(values=raw_word_counts)
+            if block_counts.size == 0 or block_word_counts.size == 0:
+                continue
+            total_blocks = float(np.sum(block_counts))
+            total_words = float(np.sum(block_word_counts))
+            metric_prefix = f"blocks/{block_name}"
+            metrics[f"{metric_prefix}/num_blocks_total"] = total_blocks
+            metrics[f"{metric_prefix}/num_blocks_per_leaf"] = float(
+                np.mean(block_counts)
+            )
+            metrics[f"{metric_prefix}/words_total"] = total_words
+            metrics[f"{metric_prefix}/words_per_leaf"] = float(
+                np.mean(block_word_counts)
+            )
+            metrics[f"{metric_prefix}/avg_words_per_block"] = (
+                total_words / total_blocks if total_blocks else 0.0
+            )
+        return metrics
+
+    @staticmethod
+    def _repetition_metrics(
+        *, reward_extra_infos_dict: dict[str, object]
+    ) -> dict[str, float]:
+        """Reduce repeat-loop forced-close metadata into scalar metrics."""
+
+        raw_forced = reward_extra_infos_dict.get("repeat_forced_think_close")
+        if raw_forced is None:
+            return {}
+        forced_values = _finite_numeric_values_by_index(values=raw_forced)
+        forced_flags = [value is not None and value > 0.5 for value in forced_values]
+        leaf_count = len(forced_flags)
+        if leaf_count == 0:
+            return {}
+
+        forced_count = sum(forced_flags)
+        metrics: dict[str, float] = {
+            "repetition/leaf_count": float(leaf_count),
+            "repetition/forced_close_count": float(forced_count),
+            "repetition/forced_close_ratio": float(forced_count / leaf_count),
+        }
+        kind_values = _string_values_by_index(
+            values=reward_extra_infos_dict.get("repeat_block_kind", [])
+        )
+        count_values = _finite_numeric_values_by_index(
+            values=reward_extra_infos_dict.get("repeat_block_count", [])
+        )
+        similarity_values = _finite_numeric_values_by_index(
+            values=reward_extra_infos_dict.get("repeat_last_similarity_ratio", [])
+        )
+
+        for block_kind in REPEAT_BLOCK_KINDS:
+            indices = [
+                index
+                for index, kind_value in enumerate(kind_values)
+                if index < leaf_count
+                and forced_flags[index]
+                and kind_value == block_kind
+            ]
+            metric_prefix = f"repetition/{block_kind}"
+            metrics[f"{metric_prefix}/forced_close_count"] = float(len(indices))
+            metrics[f"{metric_prefix}/forced_close_ratio"] = float(
+                len(indices) / leaf_count
+            )
+            repeated_counts: list[float] = []
+            for index in indices:
+                if index >= len(count_values):
+                    continue
+                count_value = count_values[index]
+                if count_value is not None:
+                    repeated_counts.append(count_value)
+            similarities: list[float] = []
+            for index in indices:
+                if index >= len(similarity_values):
+                    continue
+                similarity_value = similarity_values[index]
+                if similarity_value is not None:
+                    similarities.append(similarity_value)
+            if repeated_counts:
+                metrics[f"{metric_prefix}/repeated_blocks_mean"] = float(
+                    np.mean(repeated_counts)
+                )
+                metrics[f"{metric_prefix}/repeated_blocks_max"] = float(
+                    np.max(repeated_counts)
+                )
+            if similarities:
+                metrics[f"{metric_prefix}/last_similarity_mean"] = float(
+                    np.mean(similarities)
+                )
+                metrics[f"{metric_prefix}/last_similarity_max"] = float(
+                    np.max(similarities)
+                )
+        return metrics
 
     def fit(self) -> None:
         """Run PPO training while merging repo-local branching metrics into logger output."""
@@ -509,7 +1047,11 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
             rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
             rollout_skip.wrap_generate_sequences()
 
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        progress_bar = tqdm(
+            total=self.total_training_steps,
+            initial=self.global_steps,
+            desc="Training Progress",
+        )
         self.global_steps += 1
         last_val_metrics = None
         self.max_steps_duration = 0
@@ -536,11 +1078,19 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
                         else curr_step_profile
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
-                batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-                batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                batch.meta_info["temperature"] = (
+                    self.config.actor_rollout_ref.rollout.temperature
+                )
+                batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                )
                 source_non_tensor_batch = self._snapshot_non_tensor_batch(batch=batch)
 
                 gen_batch = self._get_gen_batch(batch)
+                gen_batch = self._repeat_generation_batch(
+                    generation_batch=gen_batch,
+                    repeat_times=int(self.config.actor_rollout_ref.rollout.n),
+                )
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -548,7 +1098,9 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        gen_batch_output = (
+                            self.async_rollout_manager.generate_sequences(gen_batch)
+                        )
                         self._fit_debug(message="generate_sequences_complete")
                         self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
@@ -563,11 +1115,17 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-                    if self._should_balance_branching_batch(batch=batch, metrics=metrics):
+                    if self._should_balance_branching_batch(
+                        batch=batch, metrics=metrics
+                    ):
                         self._balance_batch(batch, metrics=metrics)
 
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                    batch.meta_info["images_seqlens"] = self._collect_image_seqlens(batch=batch)
+                    batch.meta_info["global_token_num"] = torch.sum(
+                        batch.batch["attention_mask"], dim=-1
+                    ).tolist()
+                    batch.meta_info["images_seqlens"] = self._collect_image_seqlens(
+                        batch=batch
+                    )
                     self._drop_shadowing_non_tensor_keys(batch=batch)
 
                     with marked_timer("reward", timing_raw, color="yellow"):
@@ -580,14 +1138,20 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
 
                     self._mark_batch_auto_padding(batch=batch)
 
-                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                    bypass_recomputing_logprobs = self._should_bypass_old_log_prob_recompute(
-                        batch=batch,
-                        metrics=metrics,
-                        rollout_corr_config=rollout_corr_config,
+                    rollout_corr_config = self.config.algorithm.get(
+                        "rollout_correction", None
+                    )
+                    bypass_recomputing_logprobs = (
+                        self._should_bypass_old_log_prob_recompute(
+                            batch=batch,
+                            metrics=metrics,
+                            rollout_corr_config=rollout_corr_config,
+                        )
                     )
                     if bypass_recomputing_logprobs:
-                        from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+                        from verl.trainer.ppo.rollout_corr_helper import (
+                            apply_bypass_mode,
+                        )
 
                         apply_bypass_mode(
                             batch=batch,
@@ -597,12 +1161,16 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
                     else:
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             self._fit_debug(message="old_log_prob_start")
-                            padded_batch, old_log_prob_pad_size = self._pad_for_actor_dp(
-                                batch=batch,
-                                metrics=metrics,
-                                stage_name="old_log_prob",
+                            padded_batch, old_log_prob_pad_size = (
+                                self._pad_for_actor_dp(
+                                    batch=batch,
+                                    metrics=metrics,
+                                    stage_name="old_log_prob",
+                                )
                             )
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(padded_batch)
+                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(
+                                padded_batch
+                            )
                             old_log_prob = self._unpad_output_batch(
                                 batch=old_log_prob,
                                 pad_size=old_log_prob_pad_size,
@@ -624,27 +1192,42 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
                                 }
                             )
                             old_log_prob.batch.pop("entropys")
-                            if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
-                                router_mode = getattr(self.config.actor_rollout_ref.actor.router_replay, "mode", "disabled")
+                            if (
+                                "routed_experts" in batch.batch
+                                and "routed_experts" in old_log_prob.batch
+                            ):
+                                router_mode = getattr(
+                                    self.config.actor_rollout_ref.actor.router_replay,
+                                    "mode",
+                                    "disabled",
+                                )
                                 if router_mode == "R2":
                                     batch.batch.pop("routed_experts")
                                 else:
                                     old_log_prob.batch.pop("routed_experts")
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
-                                from verl.utils.debug.metrics import calculate_debug_metrics
+                                from verl.utils.debug.metrics import (
+                                    calculate_debug_metrics,
+                                )
 
                                 metrics.update(calculate_debug_metrics(batch))
 
-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+                    assert (
+                        "old_log_probs" in batch.batch
+                    ), f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
-                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                        with marked_timer(
+                            str(Role.RefPolicy), timing_raw, color="olive"
+                        ):
                             self._fit_debug(message="ref_log_prob_start")
-                            padded_batch, ref_log_prob_pad_size = self._pad_for_actor_dp(
-                                batch=batch,
-                                metrics=metrics,
-                                stage_name="ref_log_prob",
+                            padded_batch, ref_log_prob_pad_size = (
+                                self._pad_for_actor_dp(
+                                    batch=batch,
+                                    metrics=metrics,
+                                    stage_name="ref_log_prob",
+                                )
                             )
                             ref_log_prob = self._compute_ref_log_prob(padded_batch)
                             ref_log_prob = self._unpad_output_batch(
@@ -662,14 +1245,21 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
                                 stage_name="values",
                             )
                             values = self._compute_values(padded_batch)
-                            values = self._unpad_output_batch(batch=values, pad_size=values_pad_size)
+                            values = self._unpad_output_batch(
+                                batch=values, pad_size=values_pad_size
+                            )
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         self._fit_debug(message="advantage_start")
                         batch.batch["token_level_scores"] = reward_tensor
                         if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({key: np.array(value) for key, value in reward_extra_infos_dict.items()})
+                            batch.non_tensor_batch.update(
+                                {
+                                    key: np.array(value)
+                                    for key, value in reward_extra_infos_dict.items()
+                                }
+                            )
 
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
@@ -679,16 +1269,24 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
                             )
                             metrics.update(kl_metrics)
                         else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                            batch.batch["token_level_rewards"] = batch.batch[
+                                "token_level_scores"
+                            ]
 
                         if (
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch
                             and not bypass_recomputing_logprobs
                         ):
-                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+                            from verl.trainer.ppo.rollout_corr_helper import (
+                                compute_rollout_correction_and_add_to_batch,
+                            )
 
-                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                            batch, is_metrics = (
+                                compute_rollout_correction_and_add_to_batch(
+                                    batch, rollout_corr_config
+                                )
+                            )
                             metrics.update(is_metrics)
 
                         batch = self._compute_advantages(batch=batch)
@@ -704,18 +1302,36 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
                             critic_output = self._update_critic(padded_batch)
                             if critic_pad_size:
                                 metrics["trainer/update_critic_used_padded_batch"] = 1
-                        self._reduce_worker_metrics(worker_metrics=critic_output.meta_info["metrics"], metrics=metrics)
+                        self._reduce_worker_metrics(
+                            worker_metrics=critic_output.meta_info["metrics"],
+                            metrics=metrics,
+                        )
 
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            padded_batch, actor_pad_size = self._pad_for_actor_dp(
-                                batch=batch,
-                                metrics=metrics,
-                                stage_name="update_actor",
+                            update_mask_state = self._apply_actor_update_mask(
+                                batch=batch, metrics=metrics
                             )
-                            actor_output = self._update_actor(padded_batch)
-                            if actor_pad_size:
-                                metrics["trainer/update_actor_used_padded_batch"] = 1
+                            try:
+                                padded_batch, actor_pad_size = self._pad_for_actor_dp(
+                                    batch=batch,
+                                    metrics=metrics,
+                                    stage_name="update_actor",
+                                )
+                                actor_output = self._update_actor(padded_batch)
+                                if actor_pad_size:
+                                    metrics[
+                                        "trainer/update_actor_used_padded_batch"
+                                    ] = 1
+                            finally:
+                                if update_mask_state is not None:
+                                    batch.batch["response_mask"] = (
+                                        update_mask_state.response_mask
+                                    )
+                                    if update_mask_state.advantages is not None:
+                                        batch.batch["advantages"] = (
+                                            update_mask_state.advantages
+                                        )
                         self._fit_debug(message="update_actor_complete")
 
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -728,21 +1344,39 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
                             or esi_close_to_expiration
                         ):
                             if esi_close_to_expiration:
-                                print("Force saving checkpoint: ESI instance expiration approaching.")
-                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                print(
+                                    "Force saving checkpoint: ESI instance expiration approaching."
+                                )
+                            with marked_timer(
+                                "save_checkpoint", timing_raw, color="green"
+                            ):
                                 self._save_checkpoint()
 
-                        with marked_timer("update_weights", timing_raw, color="red"):
-                            self.checkpoint_manager.update_weights(self.global_steps)
-                        self._fit_debug(message="update_weights_complete")
-                        self._reduce_worker_metrics(worker_metrics=actor_output.meta_info["metrics"], metrics=metrics)
+                        if is_last_step:
+                            metrics["trainer/skipped_final_update_weights"] = 1
+                            self._fit_debug(message="skip_final_update_weights")
+                        else:
+                            with marked_timer(
+                                "update_weights", timing_raw, color="red"
+                            ):
+                                self.checkpoint_manager.update_weights(
+                                    self.global_steps
+                                )
+                            self._fit_debug(message="update_weights_complete")
+                        self._reduce_worker_metrics(
+                            worker_metrics=actor_output.meta_info["metrics"],
+                            metrics=metrics,
+                        )
 
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                        self._log_rollout_data(
+                            batch, reward_extra_infos_dict, timing_raw, rollout_data_dir
+                        )
 
                 if self.config.trainer.test_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
+                    is_last_step
+                    or self.global_steps % self.config.trainer.test_freq == 0
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics = self._validate()
@@ -766,9 +1400,35 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
 
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
-                metrics.update({"training/global_step": self.global_steps, "training/epoch": epoch})
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                metrics.update(
+                    {"training/global_step": self.global_steps, "training/epoch": epoch}
+                )
+                metrics.update(
+                    compute_data_metrics(batch=batch, use_critic=self.use_critic)
+                )
+                metrics.update(
+                    self._reward_component_metrics(
+                        reward_extra_infos_dict=reward_extra_infos_dict
+                    )
+                )
+                metrics.update(
+                    self._answer_diversity_metrics(
+                        reward_extra_infos_dict=reward_extra_infos_dict
+                    )
+                )
+                metrics.update(
+                    self._block_structure_metrics(
+                        reward_extra_infos_dict=reward_extra_infos_dict
+                    )
+                )
+                metrics.update(
+                    self._repetition_metrics(
+                        reward_extra_infos_dict=reward_extra_infos_dict
+                    )
+                )
+                metrics.update(
+                    compute_timing_metrics(batch=batch, timing_raw=timing_raw)
+                )
                 metrics.update(
                     compute_throughout_metrics(
                         batch=batch,
@@ -777,7 +1437,11 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
                     )
                 )
                 gradient_norm = metrics.get("actor/grad_norm", None)
-                metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+                metrics.update(
+                    compute_variance_proxy_metrics(
+                        batch=batch, gradient_norm=gradient_norm
+                    )
+                )
                 metrics.update(consume_runtime_metrics())
 
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
@@ -792,7 +1456,8 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
 
                 if (
                     hasattr(self.config.actor_rollout_ref.actor, "profiler")
-                    and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
+                    and self.config.actor_rollout_ref.actor.profiler.tool
+                    == "torch_memory"
                 ):
                     self.actor_rollout_wg.dump_memory_snapshot(
                         tag=f"post_update_step{self.global_steps}",
@@ -801,7 +1466,9 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
 
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
-                        self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                        self.actor_rollout_wg.async_calls_finalize_fn_exec(
+                            blocking=True
+                        )
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return

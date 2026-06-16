@@ -158,6 +158,10 @@ Common ones:
   - `cluster_across` or `random`.
 - `BRANCHING_ALPHA`
   - Interpolation weight for intra-branch advantage.
+- `EPSILON_GREEDY_PROB`
+  - Probability that an eligible steer trigger which does not create true
+    branches still uses one-candidate epsilon-greedy selector exploration.
+  - Compatible with branching; set to `0` to disable inline exploration.
 - `EXPERIMENT_NAME`
   - W&B and checkpoint naming.
 - `CACHE_ROOT`

@@ -19,7 +19,9 @@ from datasets import Dataset, IterableDataset
 from peft import LoraConfig as PeftLoraConfig
 from peft import TaskType
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
+    AutoModelForImageTextToText,
     AutoTokenizer,
     GenerationConfig,
     PreTrainedModel,
@@ -632,14 +634,26 @@ def load_model(
     Returns:
         Loaded model ready for process-local CUDA placement.
     """
+    pretrained_config = AutoConfig.from_pretrained(
+        pretrained_model_name_or_path=config.model_name_or_path,
+        trust_remote_code=True,
+    )
+    model_type = str(getattr(pretrained_config, "model_type", ""))
+    image_text_model_types = {"qwen3_vl", "qwen3_5"}
+    model_class = (
+        AutoModelForImageTextToText
+        if model_type in image_text_model_types
+        else AutoModelForCausalLM
+    )
     model_kwargs: dict[str, Any] = {
         "pretrained_model_name_or_path": config.model_name_or_path,
+        "config": pretrained_config,
         "dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         "trust_remote_code": True,
     }
     if torch.cuda.is_available():
         model_kwargs["attn_implementation"] = "flash_attention_2"
-    model = AutoModelForCausalLM.from_pretrained(
+    model = model_class.from_pretrained(
         **model_kwargs,
     )
     if model.generation_config is not None:
@@ -651,6 +665,8 @@ def load_model(
         token_id = getattr(tokenizer, token_key)
         if token_id is not None:
             setattr(model.config, token_key, int(token_id))
+            if hasattr(model.config, "text_config"):
+                setattr(model.config.text_config, token_key, int(token_id))
             if hasattr(model, "generation_config"):
                 setattr(model.generation_config, token_key, int(token_id))
     return model

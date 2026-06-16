@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 import aiohttp
 import json
-from dataclasses import dataclass
-from typing import Any, Union, cast
+from dataclasses import dataclass, replace
+from typing import Any, Mapping, Union, cast
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from token_metrics import canonicalize_top_logprobs
+
+DEFAULT_ASYNC_SESSION_KEY = "__default__"
+DEFAULT_KEEPALIVE_TIMEOUT_SECONDS = 60.0
+CHAT_EOS_TEXT_MARKERS = ("<|im_end|>", "<|endoftext|>")
 
 
 @dataclass(frozen=True)
@@ -58,6 +62,15 @@ class GenerationChoice:
 
 
 @dataclass(frozen=True)
+class _ChatEosMatch:
+    """First chat EOS marker found in a generated choice."""
+
+    marker: str
+    token_index: int | None
+    text_index: int | None
+
+
+@dataclass(frozen=True)
 class ChatMessage:
     """One chat message payload for `/v1/chat/completions`.
 
@@ -73,6 +86,152 @@ class ChatMessage:
     content: str
 
 
+def generation_choice_has_chat_eos(*, choice: GenerationChoice) -> bool:
+    """Return whether a choice includes a generated chat EOS marker."""
+
+    return _first_chat_eos_match(choice=choice) is not None
+
+
+def truncate_choice_at_chat_eos(*, choice: GenerationChoice) -> GenerationChoice:
+    """Drop generated chat EOS and any suffix from one vLLM choice.
+
+    vLLM can return `finish_reason="stop"` with `stop_reason=None` while the
+    generated token stream contains the model EOS token. The branching harness
+    must treat that token as terminal and must not append it to the next prompt.
+    """
+
+    eos_match = _first_chat_eos_match(choice=choice)
+    if eos_match is None:
+        return choice
+    token_index = eos_match.token_index
+    truncated_tokens = choice.tokens
+    truncated_token_ids = choice.token_ids
+    if token_index is not None:
+        truncated_tokens = choice.tokens[:token_index]
+        if choice.token_ids is not None:
+            truncated_token_ids = choice.token_ids[:token_index]
+    elif eos_match.text_index is not None:
+        truncated_token_ids = None
+    return replace(
+        choice,
+        text=_choice_text_before_chat_eos(choice=choice, eos_match=eos_match),
+        stop_reason=eos_match.marker,
+        tokens=truncated_tokens,
+        token_ids=truncated_token_ids,
+    )
+
+
+def _first_chat_eos_match(*, choice: GenerationChoice) -> _ChatEosMatch | None:
+    """Find the first generated chat EOS marker in token or text space."""
+
+    token_match = _first_chat_eos_token_match(tokens=choice.tokens)
+    text_match = _first_chat_eos_text_match(text=str(choice.text))
+    if token_match is None:
+        return text_match
+    return token_match
+
+
+def _first_chat_eos_token_match(
+    *, tokens: tuple[ParsedToken, ...]
+) -> _ChatEosMatch | None:
+    """Find EOS in parsed generated-token text.
+
+    vLLM can split a marker such as ``<|im_end|>`` across several logprob token
+    strings. When that happens we must still truncate in token space so
+    downstream rollout state never has token traces without token IDs.
+    """
+
+    generated_text = ""
+    best_match: _ChatEosMatch | None = None
+    for token_index, parsed_token in enumerate(tokens):
+        marker = _matched_chat_eos_marker(text=parsed_token.token)
+        if marker is not None:
+            return _ChatEosMatch(
+                marker=marker,
+                token_index=token_index,
+                text_index=None,
+            )
+        token_start = len(generated_text)
+        generated_text += parsed_token.token
+        for marker in CHAT_EOS_TEXT_MARKERS:
+            marker_index = generated_text.find(marker)
+            if marker_index < 0:
+                continue
+            if (
+                best_match is not None
+                and marker_index >= (best_match.text_index or 0)
+            ):
+                continue
+            start_token_index = _token_index_at_text_offset(
+                tokens=tokens[: token_index + 1],
+                text_offset=marker_index,
+            )
+            if start_token_index is None:
+                start_token_index = token_index if marker_index >= token_start else 0
+            best_match = _ChatEosMatch(
+                marker=marker,
+                token_index=start_token_index,
+                text_index=marker_index,
+            )
+    if best_match is not None:
+        return replace(best_match, text_index=None)
+    return None
+
+
+def _first_chat_eos_text_match(*, text: str) -> _ChatEosMatch | None:
+    """Find EOS marker text in the rendered choice text."""
+
+    best_match: _ChatEosMatch | None = None
+    for marker in CHAT_EOS_TEXT_MARKERS:
+        text_index = text.find(marker)
+        if text_index < 0:
+            continue
+        if best_match is None or text_index < (best_match.text_index or 0):
+            best_match = _ChatEosMatch(
+                marker=marker,
+                token_index=None,
+                text_index=text_index,
+            )
+    return best_match
+
+
+def _token_index_at_text_offset(
+    *, tokens: tuple[ParsedToken, ...], text_offset: int
+) -> int | None:
+    """Return the parsed-token index containing a generated-text offset."""
+
+    assert text_offset >= 0, "text_offset must be non-negative"
+    current_offset = 0
+    for token_index, parsed_token in enumerate(tokens):
+        next_offset = current_offset + len(parsed_token.token)
+        if current_offset <= text_offset < next_offset:
+            return token_index
+        current_offset = next_offset
+    return None
+
+
+def _matched_chat_eos_marker(*, text: str) -> str | None:
+    """Return the chat EOS marker represented by one generated token."""
+
+    normalized = str(text).strip().lower()
+    for marker in CHAT_EOS_TEXT_MARKERS:
+        if normalized == marker.lower():
+            return marker
+    return None
+
+
+def _choice_text_before_chat_eos(
+    *, choice: GenerationChoice, eos_match: _ChatEosMatch
+) -> str:
+    """Return rendered choice text before the first chat EOS marker."""
+
+    if eos_match.text_index is not None:
+        return str(choice.text)[: eos_match.text_index]
+    if eos_match.token_index is not None and choice.tokens:
+        return "".join(token.token for token in choice.tokens[: eos_match.token_index])
+    return str(choice.text)
+
+
 ChatTemplateKwargs = dict[str, Union[bool, int, float, str, None]]
 ASYNC_POST_MAX_RETRIES = 10
 ASYNC_POST_MAX_ATTEMPTS = ASYNC_POST_MAX_RETRIES + 1
@@ -82,6 +241,45 @@ ASYNC_POST_RETRY_MAX_DELAY_SECONDS = 8.0
 
 class VllmRequestError(RuntimeError):
     """Request error returned by vLLM OpenAI-compatible server."""
+
+
+def is_retryable_vllm_request_error(*, error: BaseException) -> bool:
+    """Return whether a vLLM request failure can be retried safely.
+
+    Args:
+        error: Request exception raised after HTTP-layer retries.
+
+    Returns:
+        True for transient transport/server availability failures.
+
+    Example:
+        >>> is_retryable_vllm_request_error(error=VllmRequestError("Server disconnected"))
+        True
+    """
+
+    if not isinstance(error, VllmRequestError):
+        return False
+    message = str(error).lower()
+    retryable_markers = (
+        "408",
+        "409",
+        "425",
+        "429",
+        "500",
+        "connector is closed",
+        "server disconnected",
+        "connection closed",
+        "connection reset",
+        "incomplete choices",
+        "invalid json response",
+        "temporarily unavailable",
+        "timeout",
+        "timed out",
+        "502",
+        "503",
+        "504",
+    )
+    return any(marker in message for marker in retryable_markers)
 
 
 def is_prompt_token_ids_unsupported_error(*, error: BaseException) -> bool:
@@ -128,10 +326,21 @@ def is_retryable_async_transport_error(*, error: BaseException) -> bool:
 
     if isinstance(
         error,
-        (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError),
+        (
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientPayloadError,
+            asyncio.TimeoutError,
+        ),
     ):
         return True
-    return isinstance(error, RuntimeError) and str(error) == "Connection closed."
+    if not isinstance(error, RuntimeError):
+        return False
+    message = str(error).lower()
+    return message in {
+        "connection closed.",
+        "connector is closed.",
+        "session is closed",
+    }
 
 
 def async_post_retry_delay_seconds(*, retry_index: int) -> float:
@@ -151,6 +360,27 @@ def async_post_retry_delay_seconds(*, retry_index: int) -> float:
     assert retry_index >= 0, "retry_index must be non-negative"
     delay_seconds = ASYNC_POST_RETRY_BASE_DELAY_SECONDS * (2**retry_index)
     return min(delay_seconds, ASYNC_POST_RETRY_MAX_DELAY_SECONDS)
+
+
+def async_post_max_attempts_for_payload(*, payload: Mapping[str, Any]) -> int:
+    """Return transport retry attempts for one async POST payload.
+
+    Args:
+        payload: JSON payload about to be posted to vLLM.
+
+    Returns:
+        Maximum transport attempts. Multi-choice generation payloads return one
+        attempt so higher-level generation code can split the failed batch.
+
+    Example:
+        >>> async_post_max_attempts_for_payload(payload={"n": 10})
+        1
+    """
+
+    raw_choice_count = payload.get("n", 1)
+    if isinstance(raw_choice_count, int) and raw_choice_count > 1:
+        return 1
+    return ASYNC_POST_MAX_ATTEMPTS
 
 
 def normalize_vllm_base_url(*, base_url: str) -> str:
@@ -195,9 +425,12 @@ class VllmClient:
     def __init__(self, *, base_url: str, timeout_seconds: float | None = None) -> None:
         self.base_url = normalize_vllm_base_url(base_url=base_url)
         self.timeout_seconds = timeout_seconds
+        self.supports_async_session_keys = True
         self.supports_prompt_token_ids: bool | None = None
         self._async_session: aiohttp.ClientSession | None = None
         self._async_session_loop_id: int | None = None
+        self._async_sessions_by_key: dict[str, aiohttp.ClientSession] = {}
+        self._async_session_loop_ids_by_key: dict[str, int] = {}
         self._async_session_lock: asyncio.Lock | None = None
         self._async_session_lock_loop_id: int | None = None
 
@@ -226,7 +459,16 @@ class VllmClient:
             Fresh `aiohttp.ClientSession` for async vLLM requests.
         """
 
-        return aiohttp.ClientSession(timeout=self._async_timeout())
+        connector_kwargs: dict[str, Any] = {
+            "force_close": False,
+            "limit": 0,
+            "keepalive_timeout": DEFAULT_KEEPALIVE_TIMEOUT_SECONDS,
+        }
+        connector = aiohttp.TCPConnector(**connector_kwargs)
+        return aiohttp.ClientSession(
+            connector=connector,
+            timeout=self._async_timeout(),
+        )
 
     def _get_async_session_lock(self) -> asyncio.Lock:
         """Return the lifecycle lock for the current event loop.
@@ -247,18 +489,44 @@ class VllmClient:
         self._async_session_lock_loop_id = loop_id
         return lock
 
+    def _normalize_async_session_key(self, *, session_key: str | None) -> str:
+        """Return stable cache key for one async HTTP session.
+
+        Args:
+            session_key: Optional caller-provided logical stream key.
+
+        Returns:
+            Non-empty key used for session cache lookup.
+        """
+
+        if session_key is None or session_key == "":
+            return DEFAULT_ASYNC_SESSION_KEY
+        return session_key
+
     def _take_async_session(
-        self, *, expected_session: aiohttp.ClientSession | None = None
+        self,
+        *,
+        expected_session: aiohttp.ClientSession | None = None,
+        session_key: str | None = None,
     ) -> aiohttp.ClientSession | None:
         """Detach the cached async session from this client.
 
         Args:
             expected_session: Optional session identity to require before detach.
+            session_key: Optional logical session key.
 
         Returns:
             Previously cached session, when present.
         """
 
+        normalized_key = self._normalize_async_session_key(session_key=session_key)
+        if normalized_key != DEFAULT_ASYNC_SESSION_KEY:
+            session = self._async_sessions_by_key.get(normalized_key)
+            if expected_session is not None and session is not expected_session:
+                return None
+            self._async_sessions_by_key.pop(normalized_key, None)
+            self._async_session_loop_ids_by_key.pop(normalized_key, None)
+            return session
         session = self._async_session
         if expected_session is not None and session is not expected_session:
             return None
@@ -283,40 +551,56 @@ class VllmClient:
         await session.close()
 
     async def _drop_async_session_unlocked(
-        self, *, expected_session: aiohttp.ClientSession | None = None
+        self,
+        *,
+        expected_session: aiohttp.ClientSession | None = None,
+        session_key: str | None = None,
     ) -> None:
         """Clear and close one cached async session without taking the lock.
 
         Args:
             expected_session: Optional session identity to require before drop.
+            session_key: Optional logical session key.
 
         Returns:
             None.
         """
 
-        session = self._take_async_session(expected_session=expected_session)
+        session = self._take_async_session(
+            expected_session=expected_session,
+            session_key=session_key,
+        )
         await self._close_session_async(session=session)
 
     async def _drop_async_session(
-        self, *, expected_session: aiohttp.ClientSession | None = None
+        self,
+        *,
+        expected_session: aiohttp.ClientSession | None = None,
+        session_key: str | None = None,
     ) -> None:
         """Clear and close the cached async session, if any.
 
         Args:
             expected_session: Optional session identity to require before drop.
+            session_key: Optional logical session key.
 
         Returns:
             None.
         """
 
         async with self._get_async_session_lock():
-            await self._drop_async_session_unlocked(expected_session=expected_session)
+            await self._drop_async_session_unlocked(
+                expected_session=expected_session,
+                session_key=session_key,
+            )
 
-    async def _get_async_session(self) -> aiohttp.ClientSession:
+    async def _get_async_session(
+        self, *, session_key: str | None = None
+    ) -> aiohttp.ClientSession:
         """Return one reusable async session for the active event loop.
 
         Args:
-            None.
+            session_key: Optional logical stream key for isolated reuse.
 
         Returns:
             Open `aiohttp.ClientSession` for reuse by async requests.
@@ -324,6 +608,24 @@ class VllmClient:
 
         loop_id = id(asyncio.get_running_loop())
         async with self._get_async_session_lock():
+            normalized_key = self._normalize_async_session_key(session_key=session_key)
+            if normalized_key != DEFAULT_ASYNC_SESSION_KEY:
+                session = self._async_sessions_by_key.get(normalized_key)
+                if session is not None and session.closed:
+                    self._take_async_session(session_key=normalized_key)
+                    session = None
+                cached_loop_id = self._async_session_loop_ids_by_key.get(normalized_key)
+                if session is not None and cached_loop_id == loop_id:
+                    return session
+                if session is not None:
+                    await self._drop_async_session_unlocked(
+                        expected_session=session,
+                        session_key=normalized_key,
+                    )
+                session = self._new_async_session()
+                self._async_sessions_by_key[normalized_key] = session
+                self._async_session_loop_ids_by_key[normalized_key] = loop_id
+                return session
             session = self._async_session
             if session is not None and session.closed:
                 self._take_async_session(expected_session=session)
@@ -349,6 +651,23 @@ class VllmClient:
 
         async with self._get_async_session_lock():
             await self._drop_async_session_unlocked()
+            keyed_sessions = tuple(self._async_sessions_by_key.values())
+            self._async_sessions_by_key.clear()
+            self._async_session_loop_ids_by_key.clear()
+        for session in keyed_sessions:
+            await self._close_session_async(session=session)
+
+    async def recreate_async_session(self, *, session_key: str | None = None) -> None:
+        """Drop one cached async session so the next request creates a new client.
+
+        Args:
+            session_key: Optional logical key for branch-isolated HTTP reuse.
+
+        Returns:
+            None.
+        """
+
+        await self._drop_async_session(session_key=session_key)
 
     async def _post_url_with_session_async(
         self,
@@ -356,6 +675,7 @@ class VllmClient:
         session: aiohttp.ClientSession,
         url: str,
         payload: dict[str, Any],
+        disable_timeout: bool = False,
     ) -> dict[str, Any]:
         """Execute one async JSON POST request with a specific session.
 
@@ -363,19 +683,33 @@ class VllmClient:
             session: Session used for this request attempt.
             url: Absolute request URL.
             payload: JSON payload.
+            disable_timeout: Whether this request should ignore session timeout.
 
         Returns:
             Parsed JSON payload from the response body.
         """
+        headers = {"Content-Type": "application/json"}
+        post_kwargs: dict[str, Any] = {}
+        if disable_timeout:
+            client_timeout_ctor = cast(Any, aiohttp.ClientTimeout)
+            post_kwargs["timeout"] = client_timeout_ctor(total=None)
         async with session.post(
             url=url,
             json=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
+            **post_kwargs,
         ) as response:
-            response_text = await response.text()
             if response.status >= 400:
+                response_text = await response.text()
                 raise VllmRequestError(response_text)
-        payload_obj = json.loads(response_text)
+            response_text = await response.text()
+        try:
+            payload_obj = json.loads(response_text)
+        except json.JSONDecodeError as json_error:
+            preview = response_text[:200].replace("\n", "\\n")
+            raise VllmRequestError(
+                f"invalid JSON response from vLLM: {preview}"
+            ) from json_error
         assert isinstance(payload_obj, dict), "response must be a JSON object"
         return payload_obj
 
@@ -388,6 +722,9 @@ class VllmClient:
         resolved_prompt_token_ids: tuple[int, ...] | None = None,
         temperature: float,
         top_p: float,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        presence_penalty: float | None = None,
         max_tokens: int,
         n: int,
         seed: int,
@@ -407,6 +744,9 @@ class VllmClient:
                 to avoid reparsing echoed prompt ids from the response.
             temperature: Sampling temperature.
             top_p: Nucleus sampling value.
+            top_k: Optional top-k sampling value.
+            min_p: Optional min-p sampling value.
+            presence_penalty: Optional presence penalty.
             max_tokens: Max generated tokens per choice.
             n: Number of choices.
             seed: Seed value.
@@ -426,6 +766,9 @@ class VllmClient:
             prompt_token_ids=prompt_token_ids,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
             max_tokens=max_tokens,
             n=n,
             seed=seed,
@@ -453,6 +796,9 @@ class VllmClient:
         messages: tuple[ChatMessage, ...],
         temperature: float,
         top_p: float,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        presence_penalty: float | None = None,
         max_tokens: int,
         n: int,
         seed: int,
@@ -469,6 +815,9 @@ class VllmClient:
             messages: Ordered chat messages.
             temperature: Sampling temperature.
             top_p: Nucleus sampling value.
+            top_k: Optional top-k sampling value.
+            min_p: Optional min-p sampling value.
+            presence_penalty: Optional presence penalty.
             max_tokens: Max generated tokens per choice.
             n: Number of choices.
             seed: Seed value.
@@ -488,6 +837,9 @@ class VllmClient:
             messages=messages,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
             max_tokens=max_tokens,
             n=n,
             seed=seed,
@@ -507,6 +859,9 @@ class VllmClient:
         messages: tuple[ChatMessage, ...],
         temperature: float,
         top_p: float,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        presence_penalty: float | None = None,
         max_tokens: int,
         n: int,
         seed: int,
@@ -523,6 +878,9 @@ class VllmClient:
             messages: Ordered chat messages.
             temperature: Sampling temperature.
             top_p: Nucleus sampling value.
+            top_k: Optional top-k sampling value.
+            min_p: Optional min-p sampling value.
+            presence_penalty: Optional presence penalty.
             max_tokens: Max generated tokens per choice.
             n: Number of choices.
             seed: Seed value.
@@ -542,6 +900,9 @@ class VllmClient:
             messages=messages,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
             max_tokens=max_tokens,
             n=n,
             seed=seed,
@@ -565,6 +926,9 @@ class VllmClient:
         resolved_prompt_token_ids: tuple[int, ...] | None = None,
         temperature: float,
         top_p: float,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        presence_penalty: float | None = None,
         max_tokens: int,
         n: int,
         seed: int,
@@ -573,6 +937,8 @@ class VllmClient:
         priority: int | None = None,
         repetition_penalty: float | None = None,
         parse_response_prompt_token_ids: bool = True,
+        session_key: str | None = None,
+        disable_request_timeout: bool = False,
     ) -> tuple[GenerationChoice, ...]:
         """Call `/v1/completions` asynchronously and parse choices.
 
@@ -584,6 +950,9 @@ class VllmClient:
                 to avoid reparsing echoed prompt ids from the response.
             temperature: Sampling temperature.
             top_p: Nucleus sampling value.
+            top_k: Optional top-k sampling value.
+            min_p: Optional min-p sampling value.
+            presence_penalty: Optional presence penalty.
             max_tokens: Max generated tokens per choice.
             n: Number of choices.
             seed: Seed value.
@@ -593,6 +962,8 @@ class VllmClient:
             repetition_penalty: Optional repetition penalty for generated tokens.
             parse_response_prompt_token_ids: Whether to parse echoed
                 `choice.prompt_token_ids` arrays from the response body.
+            session_key: Optional logical key for branch-isolated HTTP reuse.
+            disable_request_timeout: Disable HTTP timeout for this generation.
 
         Returns:
             Parsed generation choices.
@@ -604,6 +975,9 @@ class VllmClient:
             prompt_token_ids=prompt_token_ids,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
             max_tokens=max_tokens,
             n=n,
             seed=seed,
@@ -612,7 +986,12 @@ class VllmClient:
             priority=priority,
             repetition_penalty=repetition_penalty,
         )
-        response_payload = await self._post_async(path="/completions", payload=payload)
+        response_payload = await self._post_async(
+            path="/completions",
+            payload=payload,
+            session_key=session_key,
+            disable_timeout=disable_request_timeout,
+        )
         known_prompt_token_ids = (
             resolved_prompt_token_ids
             if resolved_prompt_token_ids is not None
@@ -739,20 +1118,32 @@ class VllmClient:
         return self._post_url(url=url, payload=payload)
 
     async def _post_async(
-        self, *, path: str, payload: dict[str, Any]
+        self,
+        *,
+        path: str,
+        payload: dict[str, Any],
+        session_key: str | None = None,
+        disable_timeout: bool = False,
     ) -> dict[str, Any]:
         """Execute async JSON POST request and parse JSON response.
 
         Args:
             path: API path relative to base URL.
             payload: JSON payload.
+            session_key: Optional logical key for branch-isolated HTTP reuse.
+            disable_timeout: Whether this request should ignore session timeout.
 
         Returns:
             Parsed JSON payload.
         """
 
         url = self.base_url + path
-        return await self._post_url_async(url=url, payload=payload)
+        return await self._post_url_async(
+            url=url,
+            payload=payload,
+            session_key=session_key,
+            disable_timeout=disable_timeout,
+        )
 
     def _post_root(self, *, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Execute JSON POST request against server root instead of base-url endpoint.
@@ -816,40 +1207,71 @@ class VllmClient:
             raise VllmRequestError(error_text) from http_error
         except urllib_error.URLError as url_error:
             raise VllmRequestError(str(url_error)) from url_error
-        payload_obj = json.loads(response_text)
+        try:
+            payload_obj = json.loads(response_text)
+        except json.JSONDecodeError as json_error:
+            preview = response_text[:200].replace("\n", "\\n")
+            raise VllmRequestError(
+                f"invalid JSON response from vLLM: {preview}"
+            ) from json_error
         assert isinstance(payload_obj, dict), "response must be a JSON object"
         return payload_obj
 
     async def _post_url_async(
-        self, *, url: str, payload: dict[str, Any]
+        self,
+        *,
+        url: str,
+        payload: dict[str, Any],
+        session_key: str | None = None,
+        disable_timeout: bool = False,
     ) -> dict[str, Any]:
         """Execute async JSON POST request to an explicit URL.
 
         Args:
             url: Absolute request URL.
             payload: JSON payload.
+            session_key: Optional logical key for branch-isolated HTTP reuse.
+            disable_timeout: Whether this request should ignore session timeout.
 
         Returns:
             Parsed JSON payload.
         """
 
-        for attempt_index in range(ASYNC_POST_MAX_ATTEMPTS):
-            session = await self._get_async_session()
+        normalized_session_key = self._normalize_async_session_key(
+            session_key=session_key
+        )
+        request_payload = dict(payload)
+        max_attempts = async_post_max_attempts_for_payload(payload=request_payload)
+        for attempt_index in range(max_attempts):
+            session = await self._get_async_session(session_key=normalized_session_key)
             try:
                 return await self._post_url_with_session_async(
                     session=session,
                     url=url,
-                    payload=payload,
+                    payload=request_payload,
+                    disable_timeout=disable_timeout,
                 )
+            except VllmRequestError:
+                await self._drop_async_session(
+                    expected_session=session,
+                    session_key=normalized_session_key,
+                )
+                raise
             except (
                 aiohttp.ClientConnectionError,
                 aiohttp.ClientPayloadError,
                 asyncio.TimeoutError,
                 RuntimeError,
             ) as transport_error:
-                if not is_retryable_async_transport_error(error=transport_error):
+                retryable = is_retryable_async_transport_error(error=transport_error)
+                will_retry = retryable and attempt_index + 1 < max_attempts
+                await self._drop_async_session(
+                    expected_session=session,
+                    session_key=normalized_session_key,
+                )
+                if not retryable:
                     raise
-                if attempt_index + 1 < ASYNC_POST_MAX_ATTEMPTS:
+                if will_retry:
                     delay_seconds = async_post_retry_delay_seconds(
                         retry_index=attempt_index
                     )
@@ -857,6 +1279,10 @@ class VllmClient:
                     continue
                 raise VllmRequestError(str(transport_error)) from transport_error
             except aiohttp.ClientError as client_error:
+                await self._drop_async_session(
+                    expected_session=session,
+                    session_key=normalized_session_key,
+                )
                 raise VllmRequestError(str(client_error)) from client_error
         raise AssertionError("async vLLM request retry loop exhausted unexpectedly")
 
@@ -868,6 +1294,9 @@ def build_completions_payload(
     prompt_token_ids: tuple[int, ...] | None,
     temperature: float,
     top_p: float,
+    top_k: int | None = None,
+    min_p: float | None = None,
+    presence_penalty: float | None = None,
     max_tokens: int,
     n: int,
     seed: int,
@@ -884,6 +1313,9 @@ def build_completions_payload(
         prompt_token_ids: Prompt IDs when using token-space prompting.
         temperature: Sampling temperature.
         top_p: Nucleus sampling value.
+        top_k: Optional top-k sampling value.
+        min_p: Optional min-p sampling value.
+        presence_penalty: Optional presence penalty.
         max_tokens: Max generated tokens.
         n: Number of choices.
         seed: Seed value.
@@ -922,6 +1354,12 @@ def build_completions_payload(
         payload["include_stop_str_in_output"] = True
     if priority is not None:
         payload["priority"] = int(priority)
+    if top_k is not None:
+        payload["top_k"] = int(top_k)
+    if min_p is not None:
+        payload["min_p"] = float(min_p)
+    if presence_penalty is not None:
+        payload["presence_penalty"] = float(presence_penalty)
     if repetition_penalty is not None:
         payload["repetition_penalty"] = float(repetition_penalty)
     return payload
@@ -933,6 +1371,9 @@ def build_chat_completions_payload(
     messages: tuple[ChatMessage, ...],
     temperature: float,
     top_p: float,
+    top_k: int | None = None,
+    min_p: float | None = None,
+    presence_penalty: float | None = None,
     max_tokens: int,
     n: int,
     seed: int,
@@ -949,6 +1390,9 @@ def build_chat_completions_payload(
         messages: Ordered chat messages.
         temperature: Sampling temperature.
         top_p: Nucleus sampling value.
+        top_k: Optional top-k sampling value.
+        min_p: Optional min-p sampling value.
+        presence_penalty: Optional presence penalty.
         max_tokens: Max generated tokens.
         n: Number of choices.
         seed: Seed value.
@@ -982,6 +1426,12 @@ def build_chat_completions_payload(
         payload["include_stop_str_in_output"] = True
     if priority is not None:
         payload["priority"] = int(priority)
+    if top_k is not None:
+        payload["top_k"] = int(top_k)
+    if min_p is not None:
+        payload["min_p"] = float(min_p)
+    if presence_penalty is not None:
+        payload["presence_penalty"] = float(presence_penalty)
     if repetition_penalty is not None:
         payload["repetition_penalty"] = float(repetition_penalty)
     if chat_template_kwargs is not None:
@@ -1184,7 +1634,7 @@ def _parse_one_completion_choice(
     text = str(choice.get("text", ""))
     finish_reason = str(choice.get("finish_reason", "unknown"))
     index = int(choice.get("index", 0))
-    return GenerationChoice(
+    parsed_choice = GenerationChoice(
         index=index,
         text=text,
         finish_reason=finish_reason,
@@ -1193,6 +1643,7 @@ def _parse_one_completion_choice(
         prompt_token_ids=prompt_token_ids,
         token_ids=token_ids,
     )
+    return truncate_choice_at_chat_eos(choice=parsed_choice)
 
 
 def _parse_one_chat_completion_choice(
@@ -1214,8 +1665,7 @@ def _parse_one_chat_completion_choice(
 
     message = choice.get("message", {})
     message_dict = cast(dict[str, Any], message) if isinstance(message, dict) else {}
-    content = message_dict.get("content", "")
-    text = content if isinstance(content, str) else str(content)
+    text = _parse_chat_message_text(message=message_dict)
     normalized_choice = dict(choice)
     normalized_choice["text"] = text
     return _parse_one_completion_choice(
@@ -1223,6 +1673,29 @@ def _parse_one_chat_completion_choice(
         fallback_prompt_token_ids=fallback_prompt_token_ids,
         parse_prompt_token_ids=parse_prompt_token_ids,
     )
+
+
+def _parse_chat_message_text(*, message: dict[str, Any]) -> str:
+    """Return assistant text from known vLLM chat message fields.
+
+    Args:
+        message: Chat completion message payload.
+
+    Returns:
+        Assistant text, preferring Qwen reasoning fields before content.
+
+    Example:
+        >>> _parse_chat_message_text(message={"reasoning": "abc", "content": ""})
+        'abc'
+    """
+
+    for key in ("reasoning", "reasoning_content", "content"):
+        value = message.get(key)
+        if isinstance(value, str):
+            return value
+        if value is not None:
+            return str(value)
+    return ""
 
 
 def _parse_choice_token_ids(*, choice: dict[str, Any]) -> tuple[int, ...] | None:

@@ -34,13 +34,26 @@ ensure_repo_paths()
 from branching_eval.artifact_store import ArtifactStore  # noqa: E402
 from branching_eval.branch_executor import BranchExecutor  # noqa: E402
 from branching_eval.config_types import BranchingConfig, DecodingConfig  # noqa: E402
-from branching_eval.selector_types import SelectorMode  # noqa: E402
+from branching_eval.event_types import EventContext  # noqa: E402
+from branching_eval.selector_types import (  # noqa: E402
+    SelectionOutcome,
+    SelectorMode,
+    SelectorParams,
+)
+from branching_eval.tree_types import BranchTree, LeafRollout, TreeNode  # noqa: E402
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager  # noqa: E402
 from verl.protocol import DataProto  # noqa: E402
 from verl.utils.ray_utils import auto_await  # noqa: E402
-from verl.utils.tokenizer import hf_tokenizer, normalize_token_ids, set_pad_token_id  # noqa: E402
+from verl.utils.tokenizer import (
+    hf_tokenizer,
+    normalize_token_ids,
+    set_pad_token_id,
+)  # noqa: E402
 from verl.utils.model import compute_position_id_with_mask  # noqa: E402
 from vllm_client import VllmClient  # noqa: E402
+
+QWEN_THINK_ASSISTANT_PREFIX = "<think>\n"
+REWARD_SCORE_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -96,7 +109,13 @@ class InstrumentedBranchExecutor(BranchExecutor):
         self.candidate_pool_resolutions += 1
         return pool
 
-    async def _resolve_selection_outcomes_async(self, *, pool):
+    async def _resolve_selection_outcomes_async(
+        self,
+        *,
+        pool,
+        selector_params: SelectorParams | None = None,
+        selector_modes: tuple[SelectorMode, ...] | None = None,
+    ) -> tuple[SelectionOutcome, ...]:
         """Resolve selector outcomes and capture cluster-count diagnostics.
 
         Args:
@@ -106,12 +125,21 @@ class InstrumentedBranchExecutor(BranchExecutor):
             Selection outcomes in requested-selector order.
         """
 
-        outcomes = await super()._resolve_selection_outcomes_async(pool=pool)
-        active_selection = next((item for item in outcomes if item.selector_mode == self.active_selector), None)
+        outcomes = await super()._resolve_selection_outcomes_async(
+            pool=pool,
+            selector_params=selector_params,
+            selector_modes=selector_modes,
+        )
+        active_selection = next(
+            (item for item in outcomes if item.selector_mode == self.active_selector),
+            None,
+        )
         if active_selection is None or active_selection.cluster_by_candidate_id is None:
             self.cluster_counts.append(0.0)
             return outcomes
-        cluster_count = float(len(set(active_selection.cluster_by_candidate_id.values())))
+        cluster_count = float(
+            len(set(active_selection.cluster_by_candidate_id.values()))
+        )
         self.cluster_counts.append(cluster_count)
         return outcomes
 
@@ -125,27 +153,69 @@ class InstrumentedBranchExecutor(BranchExecutor):
             Numeric branching metrics for one prompt group.
         """
 
-        cluster_count_mean = float(np.mean(self.cluster_counts)) if self.cluster_counts else 0.0
+        cluster_count_mean = (
+            float(np.mean(self.cluster_counts)) if self.cluster_counts else 0.0
+        )
         return {
             "branching/branch_point_count": float(self.candidate_pool_resolutions),
             "branching/cluster_count_mean": cluster_count_mean,
         }
 
 
+def _compact_preview(*, text: str, max_chars: int = 200) -> str:
+    """Return a compact single-field text preview for event payloads."""
+
+    normalized = text.replace("\r\n", "\n")
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[: max_chars - 1]}..."
+
+
+def _golden_answer_text(*, reward_model: dict[str, object]) -> str:
+    """Return a compact display answer from VERL reward-model metadata."""
+
+    ground_truth = reward_model.get("ground_truth")
+    if isinstance(ground_truth, list):
+        values = [str(item) for item in ground_truth if str(item).strip()]
+        assert values, "reward_model.ground_truth list must not be empty"
+        return values[0]
+    if ground_truth is None:
+        return ""
+    return str(ground_truth)
+
+
 class BranchingAgentLoopManager(AgentLoopManager):
     """Shared-branch rollout manager that returns all realized leaves per prompt."""
 
-    def __init__(self, config, worker_group=None, rollout_resource_pool=None, reward_loop_worker_handles=None):
-        super().__init__(config, worker_group, rollout_resource_pool, reward_loop_worker_handles)
+    def __init__(
+        self,
+        config,
+        worker_group=None,
+        rollout_resource_pool=None,
+        teacher_model_manager=None,
+        reward_loop_worker_handles=None,
+    ):
+        super().__init__(
+            config,
+            worker_group,
+            rollout_resource_pool,
+            teacher_model_manager,
+            reward_loop_worker_handles,
+        )  # pyright: ignore[reportArgumentType]
         self.settings = BranchingRolloutSettings.from_config(config=self.config)
+        self.settings.validated_rollout_mode()
+        self.settings.validated_selector_mode()
         self.settings.cache_root.mkdir(parents=True, exist_ok=True)
         self.branch_task_semaphore: asyncio.Semaphore | None = None
+        self.branch_task_semaphore_loop: asyncio.AbstractEventLoop | None = None
         self.branch_task_semaphore_loop_id: int | None = None
         self.artifact_run_scope = self._build_run_scope()
         self.artifact_run_scope.run_dir.mkdir(parents=True, exist_ok=True)
         self.batch_counter = 0
         trust_remote_code = bool(self.config.data.get("trust_remote_code", False))
-        self.tokenizer = hf_tokenizer(self.model_config.path, trust_remote_code=trust_remote_code)
+        self.tokenizer = hf_tokenizer(
+            self.model_config.path, trust_remote_code=trust_remote_code
+        )
         set_pad_token_id(self.tokenizer)
         self.doc_counter = 0
         self.served_model_name = str(self.model_config.path)
@@ -165,15 +235,16 @@ class BranchingAgentLoopManager(AgentLoopManager):
             changes to avoid cross-loop binding errors on step 2+.
         """
 
-        running_loop_id = id(asyncio.get_running_loop())
+        running_loop = asyncio.get_running_loop()
         if (
             self.branch_task_semaphore is None
-            or self.branch_task_semaphore_loop_id != running_loop_id
+            or getattr(self, "branch_task_semaphore_loop", None) is not running_loop
         ):
             self.branch_task_semaphore = asyncio.Semaphore(
                 self.settings.max_concurrent_branches
             )
-            self.branch_task_semaphore_loop_id = running_loop_id
+            self.branch_task_semaphore_loop = running_loop
+            self.branch_task_semaphore_loop_id = id(running_loop)
         return self.branch_task_semaphore
 
     def _build_run_scope(self) -> ArtifactBatchScope:
@@ -186,7 +257,9 @@ class BranchingAgentLoopManager(AgentLoopManager):
             Run-level artifact scope with a unique directory and run id.
         """
 
-        experiment_name = str(getattr(self.config.trainer, "experiment_name", "branching_dapo"))
+        experiment_name = str(
+            getattr(self.config.trainer, "experiment_name", "branching_dapo")
+        )
         timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         run_name = f"{experiment_name}_{timestamp}"
         run_dir = self.settings.artifact_run_dir(run_name=run_name)
@@ -254,10 +327,44 @@ class BranchingAgentLoopManager(AgentLoopManager):
 
         self.agent_loop_workers = []
 
+    def _build_branching_config(self) -> BranchingConfig:
+        """Build the effective branching config for the rollout mode.
+
+        Args:
+            None.
+
+        Returns:
+            Branching config passed to the eval branch executor.
+        """
+
+        mode = self.settings.validated_rollout_mode()
+        branch_prob = (
+            self.settings.epsilon_greedy_prob
+            if mode == "epsilon_greedy"
+            else self.settings.branch_prob
+        )
+        branch_fanout = 1 if mode == "epsilon_greedy" else self.settings.branch_fanout
+        return BranchingConfig(
+            branch_prob=branch_prob,
+            max_branch_points_per_rollout=self.settings.max_branch_points_per_rollout,
+            max_concurrent_branches=self.settings.max_concurrent_branches,
+            num_candidates=self.settings.num_candidates,
+            branch_fanout=branch_fanout,
+            max_clusters=self.settings.max_clusters,
+            candidate_span_tokens=self.settings.candidate_span_tokens,
+            max_steer_tokens=self.settings.max_steer_tokens,
+            steer_repetition_penalty=self.settings.steer_repetition_penalty,
+            epsilon_greedy_prob=self.settings.epsilon_greedy_prob,
+            entropy_threshold=self.settings.entropy_threshold,
+            entropy_profile_name=self.settings.entropy_profile_name,
+        )
+
     def _build_executor(
         self,
         *,
         prompt_text: str,
+        prompt_token_ids: list[int] | None = None,
+        initial_assistant_prefix: str = "",
         doc_id: int,
         artifact_store: ArtifactStore,
     ) -> InstrumentedBranchExecutor:
@@ -274,27 +381,39 @@ class BranchingAgentLoopManager(AgentLoopManager):
 
         server_address = self.server_addresses[doc_id % len(self.server_addresses)]
         client = VllmClient(base_url=server_address)
-        branching = BranchingConfig(
-            branch_prob=self.settings.branch_prob,
-            max_branch_points_per_rollout=self.settings.max_branch_points_per_rollout,
-            max_concurrent_branches=self.settings.max_concurrent_branches,
-            num_candidates=self.settings.num_candidates,
-            branch_fanout=self.settings.branch_fanout,
-            max_clusters=self.settings.max_clusters,
-            candidate_span_tokens=self.settings.candidate_span_tokens,
-            max_steer_tokens=self.settings.max_steer_tokens,
-            steer_repetition_penalty=self.settings.steer_repetition_penalty,
-            entropy_threshold=self.settings.entropy_threshold,
-            entropy_profile_name=self.settings.entropy_profile_name,
+        branching = self._build_branching_config()
+        presence_penalty_value = getattr(self.rollout_config, "presence_penalty", None)
+        repetition_penalty_value = getattr(
+            self.rollout_config, "repetition_penalty", None
         )
+        max_model_len_value = getattr(self.rollout_config, "max_model_len", None)
         decoding = DecodingConfig(
             temperature=float(self.rollout_config.temperature),
+            steer_temperature=self.settings.steer_temperature,
+            initial_assistant_prefix=initial_assistant_prefix,
             top_p=float(self.rollout_config.top_p),
+            steer_top_p=self.settings.steer_top_p,
+            presence_penalty=(
+                None
+                if presence_penalty_value is None
+                else float(presence_penalty_value)
+            ),
+            repetition_penalty=(
+                None
+                if repetition_penalty_value is None
+                else float(repetition_penalty_value)
+            ),
             max_gen_toks=int(self.rollout_config.response_length),
-            top_logprobs=20,
+            max_model_len=(
+                None if max_model_len_value is None else int(max_model_len_value)
+            ),
+            top_logprobs=self.settings.top_logprobs,
             decode_chunk_tokens=min(512, int(self.rollout_config.response_length)),
         )
         selector_mode = cast(SelectorMode, self.settings.validated_selector_mode())
+        allow_true_branching = (
+            self.settings.validated_rollout_mode() != "epsilon_greedy"
+        )
         return InstrumentedBranchExecutor(
             client=client,
             cluster_client=None,
@@ -311,6 +430,10 @@ class BranchingAgentLoopManager(AgentLoopManager):
             trigger_entropy_enabled=self.settings.trigger_entropy_enabled,
             env_paths=self.settings.env_paths,
             branch_task_semaphore=self._ensure_branch_task_semaphore(),
+            allow_true_branching=allow_true_branching,
+            initial_prompt_token_ids=(
+                tuple(prompt_token_ids) if prompt_token_ids is not None else None
+            ),
         )
 
     def _tokenize_prompt(self, raw_prompt: list[dict[str, str]]) -> list[int]:
@@ -326,12 +449,50 @@ class BranchingAgentLoopManager(AgentLoopManager):
         tokenized_prompt = self.tokenizer.apply_chat_template(
             raw_prompt,
             add_generation_prompt=True,
+            enable_thinking=True,
             tokenize=True,
         )
-        return normalize_token_ids(tokenized_output=tokenized_prompt)
+        return self._truncate_prompt_ids(
+            prompt_ids=normalize_token_ids(tokenized_output=tokenized_prompt)
+        )
+
+    def _truncate_prompt_ids(self, *, prompt_ids: list[int]) -> list[int]:
+        """Left-truncate prompt ids to the rollout prompt budget."""
+
+        prompt_length = int(self.rollout_config.prompt_length)
+        if len(prompt_ids) <= prompt_length:
+            return prompt_ids
+        return prompt_ids[-prompt_length:]
+
+    def _initial_assistant_prefix(self, *, prompt_ids: list[int]) -> str:
+        """Return assistant prefill text already present at the prompt tail.
+
+        Args:
+            prompt_ids: Tokenized chat-template prompt ids.
+
+        Returns:
+            Prefill text to mirror in executor state and reward validation.
+        """
+
+        think_prefix_ids = normalize_token_ids(
+            tokenized_output=self.tokenizer.encode(
+                QWEN_THINK_ASSISTANT_PREFIX,
+                add_special_tokens=False,
+            )
+        )
+        if not think_prefix_ids:
+            return ""
+        if prompt_ids[-len(think_prefix_ids) :] == think_prefix_ids:
+            return QWEN_THINK_ASSISTANT_PREFIX
+        return ""
 
     def _build_branch_records(
-        self, *, prompt_group: PromptGroup, prompt_ids: list[int], tree
+        self,
+        *,
+        prompt_group: PromptGroup,
+        prompt_ids: list[int],
+        initial_assistant_prefix: str,
+        tree: BranchTree,
     ) -> list[LeafBatchRecord]:
         """Build branch-aware rollout records from one completed branch tree.
 
@@ -350,18 +511,199 @@ class BranchingAgentLoopManager(AgentLoopManager):
                 tree=tree,
                 leaf=leaf,
                 prompt_uid=prompt_group.prompt_uid,
-                selector_mode=self.settings.selector_mode,
+                selector_mode=self.settings.selector_label_for_records(),
+                prompt_token_count=len(prompt_ids),
             )
+            reward_scores = build_reward_scores(
+                branch_index=branch_index,
+                initial_assistant_prefix=initial_assistant_prefix,
+                logical_response_text=leaf.text,
+                steer_phase_token_spans=leaf.steer_phase_token_spans,
+                repeat_stop_reason=leaf.repeat_stop_reason,
+                repeat_block_kind=leaf.repeat_block_kind,
+                repeat_block_count=leaf.repeat_block_count,
+                repeat_last_similarity_ratio=leaf.repeat_last_similarity_ratio,
+            )
+            reward_scores["event_context"] = {
+                "doc_id": tree.doc_id,
+                "doc_attempt": tree.doc_attempt,
+                "task_name": tree.task_name,
+                "model_id": tree.model_id,
+                "selector_mode": tree.selector_mode,
+            }
+            leaf_runtime: dict[str, object] = {
+                "leaf_id": leaf.leaf_id,
+                "node_id": leaf.node_id,
+                "length_tokens_total": leaf.length_tokens_total,
+                "length_tokens_exec": leaf.length_tokens_exec,
+                "stop_reason": leaf.stop_reason,
+                "text": leaf.text,
+                "text_preview": _compact_preview(text=leaf.text),
+                "steer_phase_token_spans": [
+                    [span_start, span_end]
+                    for span_start, span_end in leaf.steer_phase_token_spans
+                ],
+            }
+            if leaf.repeat_stop_reason is not None:
+                leaf_runtime["repeat_stop_reason"] = leaf.repeat_stop_reason
+            if leaf.repeat_block_kind is not None:
+                leaf_runtime["repeat_block_kind"] = leaf.repeat_block_kind
+            if leaf.repeat_block_count is not None:
+                leaf_runtime["repeat_block_count"] = leaf.repeat_block_count
+            if leaf.repeat_last_similarity_ratio is not None:
+                leaf_runtime["repeat_last_similarity_ratio"] = (
+                    leaf.repeat_last_similarity_ratio
+                )
+            reward_scores["leaf_runtime"] = leaf_runtime
             branch_records.append(
                 LeafBatchRecord(
                     prompt_ids=prompt_ids,
                     response_ids=list(leaf.token_ids),
-                    response_logprobs=[token.logprob for token in leaf.tokens] if leaf.tokens else None,
-                    reward_scores=build_reward_scores(branch_index=branch_index),
+                    response_logprobs=(
+                        [token.logprob for token in leaf.tokens]
+                        if leaf.tokens
+                        else None
+                    ),
+                    reward_scores=reward_scores,
                     branch_index=branch_index,
                 )
             )
         return branch_records
+
+    def _tree_from_standard_leaves(
+        self,
+        *,
+        prompt_text: str,
+        doc_id: int,
+        leaves: list[LeafRollout],
+    ) -> BranchTree:
+        """Build a metadata tree for plain non-branching rollouts.
+
+        Args:
+            prompt_text: Plain-text prompt used by the executor.
+            doc_id: Stable prompt-group document id.
+            leaves: Standard rollout leaves returned by the executor.
+
+        Returns:
+            Minimal branch tree whose leaves can reuse branch metadata packing.
+        """
+
+        tree = BranchTree(
+            doc_id=doc_id,
+            doc_attempt=0,
+            run_id=self.artifact_run_scope.run_id,
+            task_name="branching_dapo_train",
+            model_id="branching_dapo",
+            selector_mode=self.settings.selector_label_for_records(),
+            root_prompt=prompt_text,
+        )
+        tree.add_node(
+            node=TreeNode(
+                node_id="node_root",
+                parent_node_id=None,
+                prompt_text=prompt_text,
+                assistant_prefix="",
+                prompt_token_ids=None,
+                branch_points_used=0,
+            )
+        )
+        tree.leaves.extend(leaves)
+        return tree
+
+    async def _run_rollout_tree(
+        self,
+        *,
+        executor: InstrumentedBranchExecutor,
+        prompt_text: str,
+        doc_id: int,
+        rollout_count: int,
+    ) -> BranchTree:
+        """Run the configured rollout mode and return a tree-shaped payload.
+
+        Args:
+            executor: Configured branch executor.
+            prompt_text: Plain-text prompt used by the executor.
+            doc_id: Stable prompt-group document id.
+            rollout_count: Number of independent paths for baseline-like modes.
+
+        Returns:
+            Branch tree containing all realized leaves.
+        """
+
+        mode = self.settings.validated_rollout_mode()
+        selector_label = self.settings.selector_label_for_records()
+        if mode in {"baseline", "no_branching"}:
+            executor.set_event_context(
+                doc_id=doc_id,
+                doc_attempt=0,
+                task_name="branching_dapo_train",
+                model_id="branching_dapo",
+                selector_mode=selector_label,
+            )
+            leaves = await executor.run_standard_rollouts_async(
+                rollout_count=rollout_count
+            )
+            return self._tree_from_standard_leaves(
+                prompt_text=prompt_text,
+                doc_id=doc_id,
+                leaves=list(leaves),
+            )
+        if mode == "structured_baseline":
+            executor.set_event_context(
+                doc_id=doc_id,
+                doc_attempt=0,
+                task_name="branching_dapo_train",
+                model_id="branching_dapo",
+                selector_mode=selector_label,
+            )
+            return await executor.run_structured_rollouts_async(
+                rollout_count=rollout_count
+            )
+        if mode == "epsilon_greedy":
+            executor.set_event_context(
+                doc_id=doc_id,
+                doc_attempt=0,
+                task_name="branching_dapo_train",
+                model_id="branching_dapo",
+                selector_mode=selector_label,
+            )
+            return await executor.run_epsilon_greedy_rollouts_async(
+                rollout_count=rollout_count
+            )
+        return await executor.run_branching_rollouts_async(
+            doc_id=doc_id,
+            doc_attempt=0,
+            task_name="branching_dapo_train",
+            model_id="branching_dapo",
+        )
+
+    def _max_possible_leaf_count(self, *, rollout_count: int) -> int:
+        """Return the expected maximum leaf count for metrics.
+
+        Args:
+            rollout_count: Source repeated-prompt group size.
+
+        Returns:
+            Maximum realizable leaves for the configured rollout mode.
+        """
+
+        if self.settings.validated_rollout_mode() == "branching":
+            return self.settings.leaf_limit()
+        return rollout_count
+
+    def _expected_prompt_group_size(self) -> int:
+        """Return the repeated prompt count expected in each prompt group.
+
+        Args:
+            None.
+
+        Returns:
+            Configured number of rollout samples per source prompt.
+        """
+
+        group_size = int(getattr(self.rollout_config, "n", 1))
+        assert group_size >= 1, f"rollout.n must be positive, got {group_size}"
+        return group_size
 
     async def _generate_prompt_group(
         self,
@@ -381,28 +723,42 @@ class BranchingAgentLoopManager(AgentLoopManager):
 
         prompt_text = extract_prompt_text(raw_prompt=prompt_group.raw_prompt)
         prompt_ids = self._tokenize_prompt(raw_prompt=prompt_group.raw_prompt)
+        initial_assistant_prefix = self._initial_assistant_prefix(prompt_ids=prompt_ids)
         doc_id = self.doc_counter
         self.doc_counter += 1
+        selector_label = self.settings.selector_label_for_records()
+        self._append_prompt_logged_event(
+            artifact_store=artifact_store,
+            prompt_group=prompt_group,
+            doc_id=doc_id,
+            prompt_text=prompt_text,
+            selector_mode=selector_label,
+        )
         executor = self._build_executor(
             prompt_text=prompt_text,
+            prompt_token_ids=prompt_ids,
+            initial_assistant_prefix=initial_assistant_prefix,
             doc_id=doc_id,
             artifact_store=artifact_store,
         )
-        tree = await executor.run_branching_rollouts_async(
+        tree = await self._run_rollout_tree(
+            executor=executor,
+            prompt_text=prompt_text,
             doc_id=doc_id,
-            doc_attempt=0,
-            task_name="branching_dapo_train",
-            model_id="branching_dapo",
+            rollout_count=prompt_group.group_size,
         )
         branch_records = self._build_branch_records(
             prompt_group=prompt_group,
             prompt_ids=prompt_ids,
+            initial_assistant_prefix=initial_assistant_prefix,
             tree=tree,
         )
-        max_possible_leaf_count = self.settings.leaf_limit()
-        assert len(branch_records) <= max_possible_leaf_count, (
-            "Branch tree exceeded the configured branching leaf capacity."
+        max_possible_leaf_count = self._max_possible_leaf_count(
+            rollout_count=prompt_group.group_size
         )
+        assert (
+            len(branch_records) <= max_possible_leaf_count
+        ), "Branch tree exceeded the configured branching leaf capacity."
         realized_leaf_count = len(branch_records)
         group_metrics = {
             **summarize_rollout_records(records=branch_records),
@@ -418,10 +774,48 @@ class BranchingAgentLoopManager(AgentLoopManager):
                 else 0.0
             ),
             "branching/prompt_group_count": 1.0,
+            "branching/epsilon_greedy_prob": float(self.settings.epsilon_greedy_prob),
+            "branching/epsilon_greedy_enabled": float(
+                self.settings.epsilon_greedy_prob > 0.0
+            ),
         }
         return PromptGroupGeneration(records=branch_records, metrics=group_metrics)
 
-    def _pad_prompt_ids(self, prompt_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _append_prompt_logged_event(
+        self,
+        *,
+        artifact_store: ArtifactStore,
+        prompt_group: PromptGroup,
+        doc_id: int,
+        prompt_text: str,
+        selector_mode: str,
+    ) -> None:
+        """Append the graph-visible RL prompt event before generation starts."""
+
+        golden_answer = _golden_answer_text(reward_model=prompt_group.reward_model)
+        artifact_store.append_event(
+            context=EventContext(
+                run_id=artifact_store.run_id,
+                doc_id=doc_id,
+                doc_attempt=0,
+                task_name="branching_dapo_train",
+                model_id="branching_dapo",
+                selector_mode=selector_mode,
+            ),
+            event_type="prompt_logged",
+            payload={
+                "node_id": "node_root",
+                "prompt_text": prompt_text,
+                "prompt_char_count": len(prompt_text),
+                "golden_answer": golden_answer,
+                "golden_answer_source": "reward_model.ground_truth",
+                "text_preview": golden_answer,
+            },
+        )
+
+    def _pad_prompt_ids(
+        self, prompt_ids: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Left-pad one prompt token sequence to rollout prompt length.
 
         Args:
@@ -431,10 +825,12 @@ class BranchingAgentLoopManager(AgentLoopManager):
             Tuple of padded prompt ids and prompt attention mask.
         """
 
-        assert len(prompt_ids) <= self.rollout_config.prompt_length, "Prompt exceeds rollout prompt_length."
+        assert (
+            len(prompt_ids) <= self.rollout_config.prompt_length
+        ), "Prompt exceeds rollout prompt_length."
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
-            {"input_ids": prompt_ids},
+            {"input_ids": [prompt_ids]},
             padding="max_length",
             max_length=self.rollout_config.prompt_length,
             return_tensors="pt",
@@ -460,12 +856,21 @@ class BranchingAgentLoopManager(AgentLoopManager):
             Padded response ids, attention mask, response mask, and logprobs.
         """
 
-        assert len(response_ids) <= self.rollout_config.response_length, "Response exceeds rollout response_length."
+        response_length = int(self.rollout_config.response_length)
+        if len(response_ids) > response_length:
+            response_ids = response_ids[:response_length]
+            if response_logprobs is not None:
+                response_logprobs = response_logprobs[:response_length]
+        if response_logprobs is not None and len(response_logprobs) > response_length:
+            response_logprobs = response_logprobs[:response_length]
+        assert (
+            len(response_ids) <= response_length
+        ), "Response exceeds rollout response_length."
         self.tokenizer.padding_side = "right"
         response_output = self.tokenizer.pad(
-            {"input_ids": response_ids},
+            {"input_ids": [response_ids]},
             padding="max_length",
-            max_length=self.rollout_config.response_length,
+            max_length=response_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -477,11 +882,20 @@ class BranchingAgentLoopManager(AgentLoopManager):
         response_mask = response_attention_mask.clone()
         logprobs_tensor = None
         if response_logprobs is not None:
-            pad_size = self.rollout_config.response_length - len(response_logprobs)
-            logprobs_tensor = torch.tensor(response_logprobs + [0.0] * pad_size).unsqueeze(0)
-        return response_ids_tensor, response_attention_mask, response_mask, logprobs_tensor
+            pad_size = response_length - len(response_logprobs)
+            logprobs_tensor = torch.tensor(
+                response_logprobs + [0.0] * pad_size
+            ).unsqueeze(0)
+        return (
+            response_ids_tensor,
+            response_attention_mask,
+            response_mask,
+            logprobs_tensor,
+        )
 
-    def _aggregate_group_metrics(self, generations: list[PromptGroupGeneration]) -> dict[str, float]:
+    def _aggregate_group_metrics(
+        self, generations: list[PromptGroupGeneration]
+    ) -> dict[str, float]:
         """Aggregate prompt-group metrics across a rollout batch.
 
         Args:
@@ -513,8 +927,12 @@ class BranchingAgentLoopManager(AgentLoopManager):
         metric_keys = {key for generation in generations for key in generation.metrics}
         aggregated: dict[str, float] = {}
         for metric_key in metric_keys:
-            values = [generation.metrics.get(metric_key, 0.0) for generation in generations]
-            aggregated[metric_key] = float(sum(values)) if metric_key in sum_keys else float(np.mean(values))
+            values = [
+                generation.metrics.get(metric_key, 0.0) for generation in generations
+            ]
+            aggregated[metric_key] = (
+                float(sum(values)) if metric_key in sum_keys else float(np.mean(values))
+            )
         return aggregated
 
     def _build_non_tensor_batch(
@@ -522,12 +940,14 @@ class BranchingAgentLoopManager(AgentLoopManager):
         *,
         outputs: list[LeafBatchRecord],
         prompt_group_by_uid: dict[str, PromptGroup],
+        tree_events_db_path: Path,
     ) -> dict[str, np.ndarray]:
         """Build non-tensor rollout payloads needed by reward computation.
 
         Args:
             outputs: Realized leaf rollout records for this batch.
             prompt_group_by_uid: Prompt-group lookup keyed by prompt uid.
+            tree_events_db_path: Batch-scoped SQLite event DB path.
 
         Returns:
             Non-tensor batch payload aligned with `outputs`.
@@ -542,11 +962,13 @@ class BranchingAgentLoopManager(AgentLoopManager):
         for output in outputs:
             prompt_uid = output.branch_index.prompt_uid
             prompt_group = prompt_group_by_uid[prompt_uid]
+            extra_info = dict(prompt_group.extra_info)
+            extra_info["rollout_reward_scores"] = output.reward_scores
             reward_scores.append(output.reward_scores)
             prompt_uid_values.append(prompt_uid)
             raw_prompts.append(prompt_group.raw_prompt)
             data_sources.append(prompt_group.data_source)
-            extra_infos.append(prompt_group.extra_info)
+            extra_infos.append(extra_info)
             reward_models.append(prompt_group.reward_model)
         return {
             "__num_turns__": np.array([1] * len(outputs), dtype=np.int32),
@@ -556,9 +978,14 @@ class BranchingAgentLoopManager(AgentLoopManager):
             "data_source": np.array(data_sources, dtype=object),
             "extra_info": np.array(extra_infos, dtype=object),
             "reward_model": np.array(reward_models, dtype=object),
+            "tree_events_db_path": np.array(
+                [str(tree_events_db_path)] * len(outputs), dtype=object
+            ),
         }
 
-    async def _attach_reward_outputs(self, *, data: DataProto) -> DataProto:
+    async def _attach_reward_outputs(
+        self, *, data: DataProto, artifact_store: ArtifactStore
+    ) -> DataProto:
         """Populate `rm_scores` and reward metadata using the async reward loop.
 
         Args:
@@ -572,27 +999,161 @@ class BranchingAgentLoopManager(AgentLoopManager):
             return data
         reward_results = await asyncio.gather(
             *[
-                random.choice(self.reward_loop_worker_handles).compute_score.remote(data[row_index : row_index + 1])
+                self._compute_reward_score_with_timeout(
+                    row_data=cast(DataProto, data[row_index : row_index + 1]),
+                    row_index=row_index,
+                )
                 for row_index in range(len(data))
             ]
         )
         prompt_length = data.batch["prompts"].size(1)
-        valid_response_length = data.batch["attention_mask"][:, prompt_length:].sum(dim=1) - 1
+        valid_response_length = (
+            data.batch["attention_mask"][:, prompt_length:].sum(dim=1) - 1
+        )
         rm_scores = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
-        rm_scores[torch.arange(rm_scores.size(0)), valid_response_length] = torch.tensor(
-            [float(result["reward_score"]) for result in reward_results],
-            dtype=torch.float32,
+        reward_values: list[float] = []
+        reward_extra_infos: list[dict[str, object]] = []
+        for result in reward_results:
+            raw_score = result["reward_score"]
+            assert isinstance(raw_score, (int, float))
+            reward_values.append(float(raw_score))
+            raw_extra_info = result.get("reward_extra_info", {})
+            assert isinstance(raw_extra_info, dict)
+            reward_extra_infos.append(cast(dict[str, object], dict(raw_extra_info)))
+        rm_scores[torch.arange(rm_scores.size(0)), valid_response_length] = (
+            torch.tensor(
+                reward_values,
+                dtype=torch.float32,
+            )
         )
         data.batch["rm_scores"] = rm_scores
-        reward_extra_infos = [dict(result.get("reward_extra_info", {})) for result in reward_results]
-        reward_extra_keys = list(reward_extra_infos[0].keys()) if reward_extra_infos else []
+        self._append_leaf_score_events(
+            data=data,
+            artifact_store=artifact_store,
+            reward_results=reward_results,
+            reward_extra_infos=reward_extra_infos,
+        )
+        reward_extra_keys = sorted(
+            {key for reward_info in reward_extra_infos for key in reward_info}
+        )
         for reward_extra_key in reward_extra_keys:
             data.non_tensor_batch[reward_extra_key] = np.array(
-                [reward_info.get(reward_extra_key) for reward_info in reward_extra_infos],
+                [
+                    reward_info.get(reward_extra_key)
+                    for reward_info in reward_extra_infos
+                ],
                 dtype=object,
             )
         data.meta_info["reward_extra_keys"] = reward_extra_keys
         return data
+
+    async def _compute_reward_score_with_timeout(
+        self, *, row_data: DataProto, row_index: int
+    ) -> dict[str, object]:
+        """Return one reward-loop result, falling back to zero on timeout."""
+
+        assert self.reward_loop_worker_handles is not None
+        reward_ref = random.choice(
+            self.reward_loop_worker_handles
+        ).compute_score.remote(row_data)
+        try:
+            result = await asyncio.wait_for(
+                reward_ref,
+                timeout=REWARD_SCORE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            return {
+                "reward_score": 0.0,
+                "reward_extra_info": {
+                    "acc": False,
+                    "answer_acc": False,
+                    "format_valid": False,
+                    "reward_error": "timeout",
+                    "reward_timeout": True,
+                    "reward_timeout_seconds": REWARD_SCORE_TIMEOUT_SECONDS,
+                    "reward_timeout_row_index": row_index,
+                },
+            }
+        assert isinstance(result, dict)
+        return result
+
+    def _append_leaf_score_events(
+        self,
+        *,
+        data: DataProto,
+        artifact_store: ArtifactStore,
+        reward_results: list[dict[str, object]],
+        reward_extra_infos: list[dict[str, object]],
+    ) -> None:
+        """Append graph-visible leaf score events for the rollout artifact DB."""
+
+        reward_scores = data.non_tensor_batch.get("reward_scores")
+        if reward_scores is None:
+            return
+        assert len(reward_scores) == len(reward_results) == len(reward_extra_infos)
+        for raw_scores, result, reward_info in zip(
+            reward_scores,
+            reward_results,
+            reward_extra_infos,
+        ):
+            scores = dict(raw_scores)
+            artifact_store.append_event(
+                context=self._leaf_score_event_context(
+                    artifact_store=artifact_store,
+                    reward_scores=scores,
+                ),
+                event_type="leaf_scored",
+                payload=self._leaf_score_event_payload(
+                    reward_scores=scores,
+                    reward_result=result,
+                    reward_info=reward_info,
+                ),
+            )
+        artifact_store.flush_events()
+
+    def _leaf_score_event_context(
+        self, *, artifact_store: ArtifactStore, reward_scores: dict[str, object]
+    ) -> EventContext:
+        """Return event labels for a scored rollout leaf."""
+
+        event_context = reward_scores.get("event_context")
+        assert isinstance(event_context, dict), "reward_scores missing event_context"
+        return EventContext(
+            run_id=artifact_store.run_id,
+            doc_id=int(event_context["doc_id"]),
+            doc_attempt=int(event_context["doc_attempt"]),
+            task_name=str(event_context["task_name"]),
+            model_id=str(event_context["model_id"]),
+            selector_mode=str(event_context["selector_mode"]),
+        )
+
+    def _leaf_score_event_payload(
+        self,
+        *,
+        reward_scores: dict[str, object],
+        reward_result: dict[str, object],
+        reward_info: dict[str, object],
+    ) -> dict[str, object]:
+        """Return canonical `leaf_scored` payload from reward-loop output."""
+
+        leaf_runtime = reward_scores.get("leaf_runtime")
+        assert isinstance(leaf_runtime, dict), "reward_scores missing leaf_runtime"
+        raw_reward_score = reward_result["reward_score"]
+        assert isinstance(raw_reward_score, (int, float))
+        reward_score = float(raw_reward_score)
+        task_metrics = dict(reward_info)
+        task_metrics["score"] = reward_score
+        return {
+            "leaf_id": str(leaf_runtime["leaf_id"]),
+            "node_id": str(leaf_runtime["node_id"]),
+            "verification": 1 if bool(reward_info.get("acc")) else 0,
+            "length_tokens_total": leaf_runtime.get("length_tokens_total"),
+            "length_tokens_exec": leaf_runtime.get("length_tokens_exec"),
+            "stop_reason": str(leaf_runtime.get("stop_reason") or ""),
+            "task_metrics": task_metrics,
+            "text": str(leaf_runtime.get("text") or ""),
+            "text_preview": str(leaf_runtime.get("text_preview") or ""),
+        }
 
     def _build_dataproto(
         self,
@@ -600,6 +1161,7 @@ class BranchingAgentLoopManager(AgentLoopManager):
         elapsed_seconds: float,
         batch_metrics: dict[str, float],
         prompt_group_by_uid: dict[str, PromptGroup],
+        artifact_store: ArtifactStore,
     ) -> DataProto:
         """Pack branch rollout outputs into the DataProto structure expected by `verl`.
 
@@ -607,6 +1169,7 @@ class BranchingAgentLoopManager(AgentLoopManager):
             outputs: Unpadded leaf batch records.
             elapsed_seconds: Wall-clock generation time in seconds.
             prompt_group_by_uid: Prompt-group lookup used to restore reward inputs.
+            artifact_store: Batch-scoped artifact store that owns the SQLite DB.
 
         Returns:
             DataProto batch ready for union with the trainer batch.
@@ -621,13 +1184,24 @@ class BranchingAgentLoopManager(AgentLoopManager):
         position_ids = []
         rollout_log_probs = []
         for output in outputs:
-            padded_prompt_ids, prompt_attention_mask = self._pad_prompt_ids(prompt_ids=output.prompt_ids)
-            padded_response_ids, response_attention_mask, response_mask, response_logprobs = self._pad_response_ids(
+            padded_prompt_ids, prompt_attention_mask = self._pad_prompt_ids(
+                prompt_ids=output.prompt_ids
+            )
+            (
+                padded_response_ids,
+                response_attention_mask,
+                response_mask,
+                response_logprobs,
+            ) = self._pad_response_ids(
                 response_ids=output.response_ids,
                 response_logprobs=output.response_logprobs,
             )
-            attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
-            sample_input_ids = torch.cat([padded_prompt_ids, padded_response_ids], dim=1)
+            attention_mask = torch.cat(
+                [prompt_attention_mask, response_attention_mask], dim=1
+            )
+            sample_input_ids = torch.cat(
+                [padded_prompt_ids, padded_response_ids], dim=1
+            )
             sample_position_ids = compute_position_id_with_mask(attention_mask)
             prompt_tensors.append(padded_prompt_ids)
             response_tensors.append(padded_response_ids)
@@ -654,6 +1228,7 @@ class BranchingAgentLoopManager(AgentLoopManager):
         non_tensor_batch = self._build_non_tensor_batch(
             outputs=outputs,
             prompt_group_by_uid=prompt_group_by_uid,
+            tree_events_db_path=artifact_store.tree_events_db_path,
         )
         timing_metrics = {
             "branching/generate_sequences/mean": elapsed_seconds,
@@ -682,7 +1257,7 @@ class BranchingAgentLoopManager(AgentLoopManager):
         artifact_store = self._build_batch_artifact_store(prompts=prompts)
         prompt_groups = build_prompt_groups(
             non_tensor_batch=prompts.non_tensor_batch,
-            expected_group_size=1,
+            expected_group_size=self._expected_prompt_group_size(),
         )
         generations = await asyncio.gather(
             *[
@@ -693,14 +1268,22 @@ class BranchingAgentLoopManager(AgentLoopManager):
                 for prompt_group in prompt_groups
             ]
         )
-        outputs = [record for generation in generations for record in generation.records]
+        outputs = [
+            record for generation in generations for record in generation.records
+        ]
         batch_metrics = self._aggregate_group_metrics(generations=generations)
         elapsed_seconds = time.perf_counter() - start_time
-        prompt_group_by_uid = {prompt_group.prompt_uid: prompt_group for prompt_group in prompt_groups}
+        prompt_group_by_uid = {
+            prompt_group.prompt_uid: prompt_group for prompt_group in prompt_groups
+        }
         data = self._build_dataproto(
             outputs=outputs,
             elapsed_seconds=elapsed_seconds,
             batch_metrics=batch_metrics,
             prompt_group_by_uid=prompt_group_by_uid,
+            artifact_store=artifact_store,
         )
-        return await self._attach_reward_outputs(data=data)
+        return await self._attach_reward_outputs(
+            data=data,
+            artifact_store=artifact_store,
+        )

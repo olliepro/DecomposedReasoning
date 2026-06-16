@@ -187,6 +187,13 @@ def assert_catalog_and_prompt_routing() -> None:
         catalog["sampling_defaults"]["first_new_steer_should_match_variant_exactly"]
         is False
     )
+    steer_token_limit = catalog["sampling_defaults"]["steer_token_limit"]
+    assert steer_token_limit == 15
+    encoding = tiktoken.get_encoding("cl100k_base")
+    for spec in interventions:
+        for variant in spec["variants"]:
+            assert not variant.strip().lower().startswith("count")
+            assert len(encoding.encode(variant)) <= steer_token_limit
     prompts_dir = (
         REPO_DIR / "augmentation" / "steer_exec_augmentation_bundle" / "prompts"
     )
@@ -224,6 +231,7 @@ def assert_relaxed_first_steer_validation() -> None:
         enforce_first_steer_exact=True,
         token_counter=token_counter,
         exec_token_limit=512,
+        steer_token_limit=15,
     )
     _, relaxed_errors = validate_generated_window(
         obj=raw_window,
@@ -232,9 +240,30 @@ def assert_relaxed_first_steer_validation() -> None:
         enforce_first_steer_exact=False,
         token_counter=token_counter,
         exec_token_limit=512,
+        steer_token_limit=15,
     )
     assert strict_errors
     assert not relaxed_errors
+
+    too_long_window = {
+        "blocks": [
+            {
+                "type": "steer",
+                "text": "Сколько раз встречается звук «л» в этом слове?",
+            },
+            {"type": "exec", "text": "This intentionally short exec is valid."},
+        ]
+    }
+    _, cap_errors = validate_generated_window(
+        obj=too_long_window,
+        requested_pairs=1,
+        required_first_steer="Run a side calc",
+        enforce_first_steer_exact=False,
+        token_counter=token_counter,
+        exec_token_limit=512,
+        steer_token_limit=15,
+    )
+    assert any("steer block index" in error for error in cap_errors)
 
 
 def assert_source_filtering(rows: list[dict[str, object]]) -> None:

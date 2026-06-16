@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
         "--resume-run-dir",
         type=Path,
         default=None,
-        help="Existing run dir to resume from using tree_events.jsonl state.",
+        help="Existing run dir to resume from using tree_events.sqlite state.",
     )
     parser.add_argument(
         "--selector",

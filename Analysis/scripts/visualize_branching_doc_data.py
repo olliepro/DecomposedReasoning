@@ -25,7 +25,6 @@ except ModuleNotFoundError:
     )
 
 VISIBLE_RUNTIME_EVENT_TYPES = {
-    "trigger_fired",
     "trigger_skipped_max_branch_points",
     "candidate_pool_resolved",
     "selector_applied",
@@ -119,6 +118,25 @@ def node_detail_payloads_for_attempt(
             "leaves": layout.leaf_rows_by_node.get(node_id, []),
         }
     return payloads
+
+
+def node_detail_payload_for_attempt(
+    *,
+    state: AttemptState,
+    node_id: str,
+    detail_base_url: str = "",
+) -> dict[str, Any] | None:
+    """Build one lazy-loaded node detail payload for a doc attempt."""
+
+    layout = build_attempt_layout(state=state, detail_base_url=detail_base_url)
+    for summary in layout.node_summaries:
+        if str(summary["node_id"]) == node_id:
+            return {
+                "node": summary,
+                "events": layout.node_events.get(node_id, []),
+                "leaves": layout.leaf_rows_by_node.get(node_id, []),
+            }
+    return None
 
 
 def build_attempt_layout(

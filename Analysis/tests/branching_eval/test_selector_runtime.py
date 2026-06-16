@@ -12,11 +12,15 @@ import branching_eval.selector_runtime as selector_runtime_module
 from candidate_clustering import DedupItem
 from branching_eval.embedding_selection import (
     OPENAI_EMBEDDING_DIMENSIONS,
+    OPENROUTER_EMBEDDING_API_URL,
+    OPENROUTER_EMBEDDING_MODEL,
     _openai_embedding_batch_async,
+    _openai_embedding_retry_delay_seconds,
     cleaned_candidate_groups,
     greedy_diverse_indices,
     normalized_embedding_matrix,
     openai_diverse_topk_random_ids_async,
+    openai_embeddings_by_text_async,
 )
 from branching_eval.selector_runtime import (
     select_candidates_all_modes,
@@ -368,8 +372,10 @@ def test_openai_diverse_topk_random_dedupes_and_samples_from_shortlist(
         model,
         openai_api_key,
         output_dimensions,
+        api_url=None,
+        provider_label=None,
     ):
-        _ = session, model, openai_api_key
+        _ = session, model, openai_api_key, api_url, provider_label
         assert output_dimensions == OPENAI_EMBEDDING_DIMENSIONS
         seen_batches.append(tuple(texts))
         vectors = {
@@ -438,6 +444,35 @@ def test_selector_runtime_openai_mode_omits_raw_embeddings(monkeypatch) -> None:
     assert outcomes[0].shortlist_candidate_ids == (0, 2)
 
 
+def test_selector_runtime_embedding_mode_accepts_openrouter_only(monkeypatch) -> None:
+    """Embedding-backed selection should work when only OpenRouter is configured."""
+
+    pool = duplicate_candidate_pool_fixture()
+    seen_kwargs: dict[str, object] = {}
+
+    def fake_selector(**kwargs: object) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        seen_kwargs.update(kwargs)
+        return (0, 2), (0, 2)
+
+    monkeypatch.setattr(
+        "branching_eval.selector_runtime.openai_diverse_topk_random_ids",
+        fake_selector,
+    )
+
+    outcomes = select_candidates_all_modes(
+        pool=pool,
+        selector_params=SelectorParams(branch_fanout=2, max_clusters=4),
+        selector_modes=("embed_diverse_topk_random",),
+        rng=random.Random(0),
+        openrouter_api_key="test-openrouter-key",
+        openai_api_key=None,
+    )
+
+    assert outcomes[0].selected_candidate_ids == (0, 2)
+    assert seen_kwargs["openai_api_key"] is None
+    assert seen_kwargs["openrouter_api_key"] == "test-openrouter-key"
+
+
 def test_openai_diverse_topk_random_uses_provided_http_session(monkeypatch) -> None:
     """OpenAI selector should reuse the provided HTTP session for batch fetches."""
 
@@ -452,8 +487,10 @@ def test_openai_diverse_topk_random_uses_provided_http_session(monkeypatch) -> N
         model,
         openai_api_key,
         output_dimensions,
+        api_url=None,
+        provider_label=None,
     ):
-        _ = texts, model, openai_api_key, output_dimensions
+        _ = texts, model, openai_api_key, output_dimensions, api_url, provider_label
         seen_sessions.append(session)
         return [_padded_vector(x=1.0, y=0.0) for _ in texts]
 
@@ -473,6 +510,150 @@ def test_openai_diverse_topk_random_uses_provided_http_session(monkeypatch) -> N
     )
 
     assert seen_sessions == [sentinel_session]
+
+
+def test_openai_embeddings_coalesce_concurrent_requests(monkeypatch) -> None:
+    """Concurrent embedding callers sharing a session should use one deduped batch."""
+
+    seen_batches: list[tuple[str, ...]] = []
+    sentinel_session = object()
+    vectors = {
+        "alpha": _padded_vector(x=1.0, y=0.0),
+        "beta": _padded_vector(x=0.0, y=1.0),
+        "gamma": _padded_vector(x=-1.0, y=0.0),
+    }
+
+    async def fake_batch(  # type: ignore[no-untyped-def]
+        *,
+        session,
+        texts,
+        model,
+        openai_api_key,
+        output_dimensions,
+        api_url=None,
+        provider_label=None,
+    ):
+        _ = session, model, openai_api_key, output_dimensions, api_url, provider_label
+        seen_batches.append(tuple(texts))
+        return [vectors[text] for text in texts]
+
+    async def run_calls() -> (
+        tuple[dict[str, tuple[float, ...]], dict[str, tuple[float, ...]]]
+    ):
+        first, second = await asyncio.gather(
+            openai_embeddings_by_text_async(
+                texts=("alpha", "beta"),
+                openai_api_key="test-openai-key",
+                session=sentinel_session,  # type: ignore[arg-type]
+            ),
+            openai_embeddings_by_text_async(
+                texts=("beta", "gamma"),
+                openai_api_key="test-openai-key",
+                session=sentinel_session,  # type: ignore[arg-type]
+            ),
+        )
+        return first, second
+
+    monkeypatch.setattr(
+        "branching_eval.embedding_selection._openai_embedding_batch_async",
+        fake_batch,
+    )
+
+    first, second = asyncio.run(run_calls())
+
+    assert seen_batches == [("alpha", "beta", "gamma")]
+    assert first == {"alpha": vectors["alpha"], "beta": vectors["beta"]}
+    assert second == {"beta": vectors["beta"], "gamma": vectors["gamma"]}
+
+
+def test_openai_embeddings_can_use_openrouter_as_primary(monkeypatch) -> None:
+    """Embedding fetches should use OpenRouter directly when no OpenAI key exists."""
+
+    seen_calls: list[tuple[str, str, str, str]] = []
+    sentinel_session = object()
+    vector = _padded_vector(x=1.0, y=0.0)
+
+    async def fake_batch(  # type: ignore[no-untyped-def]
+        *,
+        session,
+        texts,
+        model,
+        openai_api_key,
+        output_dimensions,
+        api_url=None,
+        provider_label=None,
+    ):
+        _ = session, texts, output_dimensions
+        assert isinstance(provider_label, str)
+        assert isinstance(api_url, str)
+        seen_calls.append((provider_label, api_url, model, openai_api_key))
+        return [vector]
+
+    monkeypatch.setattr(
+        "branching_eval.embedding_selection._openai_embedding_batch_async",
+        fake_batch,
+    )
+
+    embeddings = asyncio.run(
+        openai_embeddings_by_text_async(
+            texts=("alpha",),
+            openai_api_key=None,
+            openrouter_api_key="test-openrouter-key",
+            session=sentinel_session,  # type: ignore[arg-type]
+        )
+    )
+
+    assert embeddings == {"alpha": vector}
+    assert seen_calls == [
+        (
+            "OpenRouter",
+            OPENROUTER_EMBEDDING_API_URL,
+            OPENROUTER_EMBEDDING_MODEL,
+            "test-openrouter-key",
+        )
+    ]
+
+
+def test_openai_embeddings_fall_back_to_openrouter(monkeypatch) -> None:
+    """OpenAI embedding failures should retry through OpenRouter when configured."""
+
+    seen_providers: list[str] = []
+    sentinel_session = object()
+    vector = _padded_vector(x=0.0, y=1.0)
+
+    async def fake_batch(  # type: ignore[no-untyped-def]
+        *,
+        session,
+        texts,
+        model,
+        openai_api_key,
+        output_dimensions,
+        api_url=None,
+        provider_label=None,
+    ):
+        _ = session, texts, model, openai_api_key, output_dimensions, api_url
+        assert isinstance(provider_label, str)
+        seen_providers.append(provider_label)
+        if provider_label == "OpenAI":
+            raise RuntimeError("OpenAI embedding error 500 after 5 attempts")
+        return [vector]
+
+    monkeypatch.setattr(
+        "branching_eval.embedding_selection._openai_embedding_batch_async",
+        fake_batch,
+    )
+
+    embeddings = asyncio.run(
+        openai_embeddings_by_text_async(
+            texts=("alpha",),
+            openai_api_key="test-openai-key",
+            openrouter_api_key="test-openrouter-key",
+            session=sentinel_session,  # type: ignore[arg-type]
+        )
+    )
+
+    assert embeddings == {"alpha": vector}
+    assert seen_providers == ["OpenAI", "OpenRouter"]
 
 
 class FakeEmbeddingResponse:
@@ -577,8 +758,51 @@ def test_openai_embedding_batch_retries_transient_http_error(monkeypatch) -> Non
     )
 
     assert session.calls == 2
-    assert sleep_delays == [1.0]
+    assert sleep_delays == [5.0]
     assert vectors == [(1.0, 0.0)]
+
+
+def test_openai_embedding_batch_retries_cloudflare_520(monkeypatch) -> None:
+    """OpenAI embedding batches should retry Cloudflare 520 edge failures."""
+
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
+
+    monkeypatch.setattr("branching_eval.embedding_selection.asyncio.sleep", fake_sleep)
+    session = FakeEmbeddingSession(
+        responses=[
+            FakeEmbeddingResponse(status=520, body="unknown edge error"),
+            FakeEmbeddingResponse(
+                status=200,
+                body=_embedding_response_body(values=(0.0, 1.0)),
+            ),
+        ]
+    )
+
+    vectors = asyncio.run(
+        _openai_embedding_batch_async(
+            session=session,  # type: ignore[arg-type]
+            texts=("alpha",),
+            model="text-embedding-3-small",
+            openai_api_key="test-openai-key",
+            output_dimensions=2,
+        )
+    )
+
+    assert session.calls == 2
+    assert sleep_delays == [5.0]
+    assert vectors == [(0.0, 1.0)]
+
+
+def test_openai_embedding_retry_delay_schedule() -> None:
+    """OpenAI embedding retries should use the long transient-failure schedule."""
+
+    assert [
+        _openai_embedding_retry_delay_seconds(attempt_number=attempt_number)
+        for attempt_number in range(1, 5)
+    ] == [5.0, 10.0, 20.0, 40.0]
 
 
 def test_openai_embedding_batch_does_not_retry_auth_error(monkeypatch) -> None:
