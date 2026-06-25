@@ -34,6 +34,25 @@ class UpdateMaskStats:
         }
 
 
+@dataclass(frozen=True)
+class ExcludedSpanMaskStats:
+    """Summary of tokens removed from an actor-update response mask."""
+
+    excluded_token_count: int
+    response_token_count: int
+
+    def as_metrics(self, *, prefix: str) -> dict[str, float]:
+        """Return scalar metrics for logger payloads."""
+
+        excluded = float(self.excluded_token_count)
+        total = float(self.response_token_count)
+        return {
+            f"{prefix}/excluded_tokens": excluded,
+            f"{prefix}/response_tokens": total,
+            f"{prefix}/excluded_token_ratio": excluded / total if total else 0.0,
+        }
+
+
 def validate_update_mode(*, mode: str) -> str:
     """Validate and return the configured actor update mode."""
 
@@ -156,6 +175,38 @@ def build_steer_only_response_mask(
         response_token_count == 0 or selected_token_count > 0
     ), "steer_only update mode found no complete <steer>...</steer> content tokens."
     return steer_mask, stats
+
+
+def exclude_response_token_spans(
+    *, response_mask: torch.Tensor, span_rows: Sequence[object] | None
+) -> tuple[torch.Tensor, ExcludedSpanMaskStats]:
+    """Return `response_mask` with serialized token spans set to zero."""
+
+    response_token_count = int(response_mask.sum().item())
+    if span_rows is None:
+        return response_mask, ExcludedSpanMaskStats(
+            excluded_token_count=0,
+            response_token_count=response_token_count,
+        )
+    assert (
+        len(span_rows) == response_mask.shape[0]
+    ), "excluded span row count must match response batch size"
+    masked = response_mask.clone()
+    excluded_token_count = 0
+    response_width = response_mask.shape[1]
+    for row_index, raw_spans in enumerate(span_rows):
+        for span_start, span_end in _coerce_span_row(value=raw_spans):
+            bounded_start = min(max(span_start, 0), response_width)
+            bounded_end = min(max(span_end, bounded_start), response_width)
+            if bounded_end <= bounded_start:
+                continue
+            row_slice = masked[row_index, bounded_start:bounded_end]
+            excluded_token_count += int(row_slice.sum().item())
+            masked[row_index, bounded_start:bounded_end] = 0
+    return masked, ExcludedSpanMaskStats(
+        excluded_token_count=excluded_token_count,
+        response_token_count=response_token_count,
+    )
 
 
 def _finalize_mask(

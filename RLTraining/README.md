@@ -64,6 +64,13 @@ These are the operator-facing shell entrypoints.
   - Resolves the SFT checkpoint, RL dataset path, rollout parameters, and Hydra overrides.
 - [`run_branching_alpha_sweep.sh`](./scripts/run_branching_alpha_sweep.sh)
   - Runs the same launcher three times with `alpha in {0.25, 0.5, 0.75}`.
+- [`submit_qwen35_smoke_matrix.sh`](./scripts/submit_qwen35_smoke_matrix.sh)
+  - Thin compatibility wrapper around `python -m branching_dapo.run_specs submit-qwen35-matrix`.
+  - Use this for Qwen3.5 matrix submissions so per-mode run shape is resolved in one typed place.
+- [`run_specs.py`](./branching_dapo/run_specs.py)
+  - Typed Qwen3.5 launch-spec resolver.
+  - Owns Slurm resources, common training shape, decode settings, per-mode rollout defaults, and the exact environment passed to `sbatch`.
+  - Writes a `run_spec.json` manifest for each submitted mode before `sbatch`.
 
 ### `slurm/`
 
@@ -91,13 +98,21 @@ This is upstream code. Treat it as vendor code.
 
 The branching RL stack is intentionally flat:
 
-1. `sbatch RLTraining/slurm/branching_dapo_train.sbatch`
-2. [`run_branching_dapo_olmo3.sh`](./scripts/run_branching_dapo_olmo3.sh)
-3. `python -m branching_dapo.main_ppo_branching`
-4. [`BranchingTaskRunner`](./branching_dapo/task_runner.py)
-5. [`BranchingRayPPOTrainer`](./branching_dapo/trainer.py)
-6. [`BranchingAgentLoopManager`](./branching_dapo/agent_loop_manager.py)
-7. `Analysis/branching_eval` branch executor and selector logic
+For current Qwen3.5 matrix runs:
+
+1. [`submit_qwen35_smoke_matrix.sh`](./scripts/submit_qwen35_smoke_matrix.sh)
+2. `python -m branching_dapo.run_specs submit-qwen35-matrix`
+3. [`branching_dapo_qwen35_smoke.sbatch`](./slurm/branching_dapo_qwen35_smoke.sbatch)
+4. [`run_branching_dapo_qwen35_smoke.sh`](./scripts/run_branching_dapo_qwen35_smoke.sh)
+5. [`run_branching_dapo_olmo3.sh`](./scripts/run_branching_dapo_olmo3.sh)
+6. `python -m branching_dapo.main_ppo_branching`
+7. [`BranchingTaskRunner`](./branching_dapo/task_runner.py)
+8. [`BranchingRayPPOTrainer`](./branching_dapo/trainer.py)
+9. [`BranchingAgentLoopManager`](./branching_dapo/agent_loop_manager.py)
+10. `Analysis/branching_eval` branch executor and selector logic
+
+For older OLMo-3/manual runs, call `branching_dapo_train.sbatch` or
+`run_branching_dapo_olmo3.sh` directly.
 
 The key design choice is that rollout branching happens before PPO sees the batch, but the output shape is kept compatible with standard `verl` repeated-prompt rollouts.
 
@@ -137,12 +152,45 @@ A = alpha * A_intra + (1 - alpha) * A_inter
 ### Main outputs
 
 - Checkpoints under `CACHE_ROOT/checkpoints/<experiment_name>`
-- Branching artifacts and selector caches under `CACHE_ROOT`
+- Branching artifacts and selector caches under `CACHE_ROOT`; completed
+  per-step SQLite tree logs persist every `PERSISTENT_LOG_INTERVAL_STEPS`
+  training steps by default, while current and failed steps remain available.
 - Standard trainer logs plus branching-specific runtime metrics in W&B and console output
 
 ## Main Environment Knobs
 
-The shell launcher is parameterized through environment variables.
+Qwen3.5 matrix submissions are still parameterized through environment variables,
+but they are resolved by the typed `run_specs.py` layer before Slurm sees them.
+That layer writes two copies of the resolved spec:
+
+- `CACHE_ROOT/submissions/<submission_id>/<mode>/run_spec.json`
+- `CACHE_ROOT/checkpoints/<experiment_name>/run_spec.json` once the Slurm job starts
+
+Set `PERSISTENT_LOG_INTERVAL_STEPS=N` to keep completed
+`batch_####_step_######/tree_events.sqlite` logs every `N` trainer steps.
+Use `1` to preserve every step.
+
+Dry-run a matrix without submitting jobs:
+
+```bash
+SMOKE_ROLLOUT_MODES="branching structured_baseline" \
+RUN_LABEL="gs50_branch_all_lr2e6_branchp10_steer30" \
+TRAIN_PROMPT_BSZ=8 \
+MAX_PROMPT_LENGTH=1024 \
+MAX_RESPONSE_LENGTH=16384 \
+N_RESP_PER_PROMPT=16 \
+ACTOR_LR=2e-6 \
+BRANCHING_SELECTOR_MODE=embed_diverse_topk_random \
+BRANCHING_BRANCH_PROB=0.10 \
+bash RLTraining/scripts/submit_qwen35_smoke_matrix.sh --dry-run
+```
+
+Run `sbatch --test-only` for the resolved matrix:
+
+```bash
+PARTITION=quad TIME_LIMIT=72:00:00 \
+bash RLTraining/scripts/submit_qwen35_smoke_matrix.sh --test-only
+```
 
 Common ones:
 
@@ -166,6 +214,12 @@ Common ones:
   - W&B and checkpoint naming.
 - `CACHE_ROOT`
   - Root for caches, branch artifacts, and trainer outputs.
+- `SMOKE_ROLLOUT_MODES`
+  - Space-separated Qwen3.5 matrix modes.
+  - Defaults to `branching no_branching structured_baseline epsilon_greedy`.
+- `BRANCHING_*`, `BASELINE_*`, `EPSILON_*`
+  - Mode-specific overrides consumed by `run_specs.py`.
+  - Prefer these over setting one global value when only one matrix mode should change.
 
 ## Common Edit Points
 
@@ -179,6 +233,8 @@ If you need to change RL behavior, start here:
   - [`reward_fn.py`](./branching_dapo/reward_fn.py)
 - Change launch defaults for OLMo-3:
   - [`run_branching_dapo_olmo3.sh`](./scripts/run_branching_dapo_olmo3.sh)
+- Change Qwen3.5 matrix launch defaults or mode semantics:
+  - [`run_specs.py`](./branching_dapo/run_specs.py)
 - Change cluster resource shape:
   - [`branching_dapo_train.sbatch`](./slurm/branching_dapo_train.sbatch)
 - Change selector or branching execution semantics:

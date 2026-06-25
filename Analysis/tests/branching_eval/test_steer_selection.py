@@ -48,16 +48,13 @@ def build_executor(tmp_path: Path, *, branch_fanout: int = 2) -> BranchExecutor:
             num_candidates=100,
             branch_fanout=branch_fanout,
             max_clusters=4,
-            candidate_span_tokens=3,
             max_steer_tokens=3,
-            entropy_threshold=0.2,
         ),
         artifact_store=store,
         requested_selectors=("random",),
         active_selector="random",
         seed=7,
         trigger_steer_enabled=True,
-        trigger_entropy_enabled=False,
         env_paths=(),
     )
 
@@ -101,24 +98,38 @@ def steer_pool(*, trigger_type: str) -> CandidatePoolRecord:
 
 
 def test_steer_selection_deduplicates_and_backfills(tmp_path: Path) -> None:
-    """Steer selection should dedupe by text and backfill without replacement."""
+    """Steer selection should prefer unique text then backfill from the pool."""
 
-    executor = build_executor(tmp_path=tmp_path, branch_fanout=2)
+    executor = build_executor(tmp_path=tmp_path, branch_fanout=3)
     selected = executor._selected_ids_for_branch(
         pool=steer_pool(trigger_type="steer_boundary"),
         selected_ids=(0, 1),
     )
-    assert selected == (0, 2)
+    assert selected == (0, 2, 1)
 
 
-def test_steer_selection_ignores_repeated_ids_without_replacement(
+def test_steer_selection_repeats_ids_only_after_pool_is_exhausted(
     tmp_path: Path,
 ) -> None:
-    """Steer selection should never include repeated candidate IDs."""
+    """Steer selection should keep full fanout even when the pool is too small."""
 
-    executor = build_executor(tmp_path=tmp_path, branch_fanout=2)
+    executor = build_executor(tmp_path=tmp_path, branch_fanout=4)
     selected = executor._selected_ids_for_branch(
         pool=steer_pool(trigger_type="steer_boundary"),
         selected_ids=(1, 1, 1),
     )
-    assert selected == (1, 2)
+    assert selected == (1, 2, 0, 0)
+
+
+def test_embedding_steer_selection_backfills_after_dedup(tmp_path: Path) -> None:
+    """Embedding-backed steer selection should also fill full branch fanout."""
+
+    executor = build_executor(tmp_path=tmp_path, branch_fanout=3)
+    executor.active_selector = "embed_diverse_topk_random"
+
+    selected = executor._selected_ids_for_branch(
+        pool=steer_pool(trigger_type="steer_boundary"),
+        selected_ids=(0, 1),
+    )
+
+    assert selected == (0, 2, 1)

@@ -31,9 +31,7 @@ OPENAI_EMBEDDING_DIMENSIONS = 128
 OPENAI_EMBEDDING_MAX_ATTEMPTS = 5
 OPENAI_EMBEDDING_RETRY_BASE_DELAY_SECONDS = 5.0
 OPENAI_EMBEDDING_RETRY_MAX_DELAY_SECONDS = 40.0
-OPENAI_EMBEDDING_RETRY_STATUS_CODES = frozenset(
-    {408, 409, 425, 429}
-)
+OPENAI_EMBEDDING_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429})
 OPENAI_EMBEDDING_ERROR_BODY_MAX_CHARS = 2000
 OPENAI_EMBEDDING_COALESCE_DELAY_SECONDS = 0.002
 
@@ -743,9 +741,8 @@ def _should_retry_openai_embedding_status(
     assert attempt_number >= 1, "attempt_number must be one-based"
     is_transient_server_error = 500 <= status_code <= 599
     return (
-        (status_code in OPENAI_EMBEDDING_RETRY_STATUS_CODES or is_transient_server_error)
-        and attempt_number < OPENAI_EMBEDDING_MAX_ATTEMPTS
-    )
+        status_code in OPENAI_EMBEDDING_RETRY_STATUS_CODES or is_transient_server_error
+    ) and attempt_number < OPENAI_EMBEDDING_MAX_ATTEMPTS
 
 
 def _openai_embedding_retry_delay_seconds(*, attempt_number: int) -> float:

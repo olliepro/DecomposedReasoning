@@ -28,7 +28,6 @@ from sft_training.train import build_sample
 from sft_training.train import load_tokenizer
 from sft_training.train import uses_trl_assistant_only_loss
 
-
 SFTTRAINING_ROOT = Path(__file__).resolve().parents[1]
 DECOMPOSITION_ROOT = Path(__file__).resolve().parents[2]
 MERGED_DATASET_PATH = (
@@ -104,7 +103,9 @@ def test_all_masked_rows_have_matching_generated_steer_texts(
         mask_targets = extract_mask_targets(row=row)
         assert mask_targets is not None
         assistant_content = str(row["messages"][-1]["content"])
-        normalized_targets = mask_targets.validated(content_length=len(assistant_content))
+        normalized_targets = mask_targets.validated(
+            content_length=len(assistant_content)
+        )
         extracted_steers = tuple(
             assistant_content[span.start : span.end].removesuffix("</steer>")
             for span in normalized_targets.final_string_char_ranges

@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +24,10 @@ from branching_dapo.advantage import (
 )
 from branching_dapo.config_types import BranchingRolloutSettings
 from branching_dapo.runtime_metrics import consume_runtime_metrics
-from branching_dapo.update_masking import build_steer_only_response_mask
+from branching_dapo.update_masking import (
+    build_steer_only_response_mask,
+    exclude_response_token_spans,
+)
 from verl import DataProto
 from verl.protocol import DataProtoConfig, pad_dataproto_to_divisor, unpad_dataproto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
@@ -536,7 +540,7 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
             return
         segments = compute_branch_segment_advantages(
             advantages=batch.batch["advantages"],
-            response_mask=batch.batch["response_mask"],
+            response_mask=self._policy_response_mask(batch=batch),
             index=batch.non_tensor_batch["branch_uid"],
         )
         if not segments:
@@ -565,6 +569,48 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
                 ]
             )
 
+    def _prune_nonpersistent_branching_logs(
+        self, *, batch: DataProto, global_step: int
+    ) -> dict[str, int]:
+        """Remove completed per-step tree logs that are outside the retention interval."""
+
+        settings = BranchingRolloutSettings.from_config(config=self.config)
+        metrics = {
+            "branching/artifacts/persistent_log_interval_steps": (
+                settings.persistent_log_interval_steps
+            )
+        }
+        if settings.should_persist_step_logs(global_step=global_step):
+            metrics["branching/artifacts/persisted_step_logs"] = 1
+            metrics["branching/artifacts/pruned_step_log_dirs"] = 0
+            return metrics
+
+        pruned_count = 0
+        for batch_dir in self._tree_event_batch_dirs(batch=batch):
+            if not batch_dir.exists():
+                continue
+            shutil.rmtree(batch_dir)
+            pruned_count += 1
+        metrics["branching/artifacts/persisted_step_logs"] = 0
+        metrics["branching/artifacts/pruned_step_log_dirs"] = pruned_count
+        return metrics
+
+    @staticmethod
+    def _tree_event_batch_dirs(*, batch: DataProto) -> list[Path]:
+        """Return unique batch directories that contain rollout tree event DBs."""
+
+        db_paths = batch.non_tensor_batch.get("tree_events_db_path")
+        if db_paths is None:
+            return []
+        batch_dirs: dict[str, Path] = {}
+        for raw_db_path in np.asarray(db_paths, dtype=object).reshape(-1):
+            db_path = Path(str(raw_db_path))
+            assert (
+                db_path.name == "tree_events.sqlite"
+            ), f"Expected tree_events.sqlite path, got {db_path}"
+            batch_dirs[str(db_path.parent)] = db_path.parent
+        return sorted(batch_dirs.values(), key=str)
+
     def _advantage_prompt_contexts(
         self, *, batch: DataProto
     ) -> dict[str, tuple[Path, dict[str, object]]]:
@@ -579,7 +625,7 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
             f"{len(db_paths)} != {len(reward_scores)}"
         )
         contexts: dict[str, tuple[Path, dict[str, object]]] = {}
-        for raw_db_path, raw_scores in zip(db_paths, reward_scores, strict=True):
+        for raw_db_path, raw_scores in zip(db_paths, reward_scores):
             scores = dict(raw_scores)
             metadata = scores.get("branch_metadata")
             event_context = scores.get("event_context")
@@ -627,11 +673,25 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
         metrics["actor/update_mode_steer_only"] = (
             1.0 if update_mode == "steer_only" else 0.0
         )
+        full_response_mask = batch.batch["response_mask"]
+        policy_response_mask, excluded_stats = exclude_response_token_spans(
+            response_mask=full_response_mask,
+            span_rows=self._off_policy_token_span_rows(batch=batch),
+        )
+        metrics.update(excluded_stats.as_metrics(prefix="actor/off_policy_mask"))
+        full_advantages = (
+            batch.batch["advantages"] if "advantages" in batch.batch.keys() else None
+        )
         if update_mode == "all":
-            return None
+            if excluded_stats.excluded_token_count <= 0:
+                return None
+            batch.batch["response_mask"] = policy_response_mask
+            return ActorUpdateMaskState(
+                response_mask=full_response_mask, advantages=full_advantages
+            )
         steer_mask, stats = build_steer_only_response_mask(
             responses=batch.batch["responses"],
-            response_mask=batch.batch["response_mask"],
+            response_mask=policy_response_mask,
             tokenizer=self.tokenizer,
             steer_phase_token_spans=self._steer_phase_token_span_rows(batch=batch),
         )
@@ -644,16 +704,21 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
         gradient_scale = math.sqrt(selected_token_ratio)
         metrics["actor/update_mask/loss_scale"] = gradient_scale
         metrics["actor/update_mask/gradient_scale"] = gradient_scale
-        full_response_mask = batch.batch["response_mask"]
-        full_advantages = (
-            batch.batch["advantages"] if "advantages" in batch.batch.keys() else None
-        )
         batch.batch["response_mask"] = steer_mask
         if full_advantages is not None:
             batch.batch["advantages"] = full_advantages * gradient_scale
         return ActorUpdateMaskState(
             response_mask=full_response_mask, advantages=full_advantages
         )
+
+    def _policy_response_mask(self, *, batch: DataProto) -> torch.Tensor:
+        """Return response mask with rollout-injected spans excluded."""
+
+        policy_response_mask, _ = exclude_response_token_spans(
+            response_mask=batch.batch["response_mask"],
+            span_rows=self._off_policy_token_span_rows(batch=batch),
+        )
+        return policy_response_mask
 
     @staticmethod
     def _steer_phase_token_span_rows(*, batch: DataProto) -> list[object] | None:
@@ -668,6 +733,21 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
                 reward_score, dict
             ), "reward_scores rows must be dictionaries"
             span_rows.append(reward_score.get("steer_phase_token_spans", ()))
+        return span_rows
+
+    @staticmethod
+    def _off_policy_token_span_rows(*, batch: DataProto) -> list[object] | None:
+        """Return per-row rollout-injected token spans from reward metadata."""
+
+        reward_scores = batch.non_tensor_batch.get("reward_scores")
+        if reward_scores is None:
+            return None
+        span_rows: list[object] = []
+        for reward_score in np.asarray(reward_scores, dtype=object).reshape(-1):
+            assert isinstance(
+                reward_score, dict
+            ), "reward_scores rows must be dictionaries"
+            span_rows.append(reward_score.get("off_policy_token_spans", ()))
         return span_rows
 
     def _collect_image_seqlens(self, *, batch: DataProto) -> list[int]:
@@ -876,9 +956,7 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
         prompt_rewards: dict[str, list[float]] = {}
         branch_uids = np.asarray(raw_branch_uids, dtype=object).reshape(-1)
         answer_rewards = _finite_numeric_values_by_index(values=raw_answer_rewards)
-        for raw_branch_uid, answer_reward in zip(
-            branch_uids.tolist(), answer_rewards, strict=False
-        ):
+        for raw_branch_uid, answer_reward in zip(branch_uids.tolist(), answer_rewards):
             if answer_reward is None:
                 continue
             prompt_uid = _prompt_uid_from_branch_uid(value=raw_branch_uid)
@@ -1443,6 +1521,11 @@ class BranchingRayPPOTrainer(RayPPOTrainer):
                     )
                 )
                 metrics.update(consume_runtime_metrics())
+                metrics.update(
+                    self._prune_nonpersistent_branching_logs(
+                        batch=batch, global_step=self.global_steps
+                    )
+                )
 
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)

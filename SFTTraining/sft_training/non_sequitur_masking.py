@@ -385,9 +385,11 @@ def ensure_final_eos_supervised(
         assistant_masks
     ), "Assistant mask must align with input ids."
     supervised_masks = [int(value) for value in assistant_masks]
-    eos_token_id = tokenizer.eos_token_id
-    if eos_token_id is None or not input_ids:
+    eos_token_id_raw = tokenizer.eos_token_id
+    if eos_token_id_raw is None or not input_ids:
         return supervised_masks
+    assert isinstance(eos_token_id_raw, int), "Tokenizer EOS token id must be scalar."
+    eos_token_id = eos_token_id_raw
     if int(input_ids[-1]) == int(eos_token_id):
         supervised_masks[-1] = 1
     return supervised_masks

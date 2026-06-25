@@ -290,7 +290,9 @@ def managed_vllm_server(
         )
         server = RunningVllmServer(
             model_spec=model_spec,
-            model_name_for_generation=resolve_generation_model_name(model_spec=model_spec),
+            model_name_for_generation=resolve_generation_model_name(
+                model_spec=model_spec
+            ),
             base_url=model_spec.base_url,
             port=None,
             command=(),

@@ -23,6 +23,7 @@ from branching_eval.metrics_types import (
     DocDiagnostics,
     LengthSummary,
 )
+from branching_eval.request_runtime import serialize_choice_for_vllm_event
 from branching_eval.run_matrix import (
     build_doc_execution_plans,
     recompute_outputs_from_events,
@@ -127,16 +128,13 @@ def build_executor(
             num_candidates=4,
             branch_fanout=2,
             max_clusters=2,
-            candidate_span_tokens=3,
             max_steer_tokens=3,
-            entropy_threshold=0.2,
         ),
         artifact_store=store,
         requested_selectors=("random",),
         active_selector="random",
         seed=7,
         trigger_steer_enabled=False,
-        trigger_entropy_enabled=False,
         env_paths=(),
         enable_request_priorities=enable_request_priorities,
     )
@@ -224,7 +222,13 @@ def test_vllm_response_serialization_is_compact(tmp_path: Path) -> None:
         token_ids=(123,),
     )
 
-    payload = executor._serialize_choice_for_vllm_event(choice=choice)
+    payload = serialize_choice_for_vllm_event(
+        choice=choice,
+        compact_text_preview=lambda text, max_chars: BranchExecutor._compact_text_preview(
+            text=text,
+            max_chars=max_chars,
+        ),
+    )
     token_rows = payload["tokens"]
     assert isinstance(token_rows, list)
     assert len(token_rows) == 1
@@ -281,7 +285,17 @@ def test_vllm_response_event_log_compacts_and_hydrates_tokens(tmp_path: Path) ->
             "status": "ok",
             "latency_seconds": 0.5,
             "choice_count": 1,
-            "choices": [executor._serialize_choice_for_vllm_event(choice=choice)],
+            "choices": [
+                serialize_choice_for_vllm_event(
+                    choice=choice,
+                    compact_text_preview=(
+                        lambda text, max_chars: BranchExecutor._compact_text_preview(
+                            text=text,
+                            max_chars=max_chars,
+                        )
+                    ),
+                )
+            ],
         },
     )
     executor.artifact_store.flush_events()

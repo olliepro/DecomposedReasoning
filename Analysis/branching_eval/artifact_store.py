@@ -27,7 +27,7 @@ from branching_eval.event_types import (
 )
 from branching_eval.metrics_types import AggregateDiagnostics, DocDiagnostics
 from branching_eval.tree_types import BranchTree
-from io_utils import append_jsonl, write_json
+from io_utils import write_json
 
 
 @dataclass(frozen=True)
@@ -291,18 +291,22 @@ class ArtifactStore:
         rows = self.read_event_rows()
         return [parse_event_row(row=row) for row in rows]
 
-    def append_doc_diagnostics(self, *, diagnostics: DocDiagnostics) -> None:
-        """Append one per-doc diagnostics row.
+    def append_doc_diagnostics(
+        self, *, context: EventContext, diagnostics: DocDiagnostics
+    ) -> EventEnvelope:
+        """Append one per-doc diagnostics event row.
 
         Args:
+            context: Event context for the document.
             diagnostics: Per-doc diagnostic dataclass.
 
         Returns:
-            None.
+            Event envelope that was written.
         """
 
-        append_jsonl(
-            path=self.run_dir / "doc_diagnostics.jsonl",
+        return self.append_event(
+            context=context,
+            event_type="doc_diagnostics_recorded",
             payload=asdict(diagnostics),
         )
 

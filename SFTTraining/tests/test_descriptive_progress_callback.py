@@ -65,7 +65,9 @@ def test_callback_updates_description_and_postfix(tmp_path: Path) -> None:
         per_device_train_batch_size=2,
         gradient_accumulation_steps=3,
     )
-    state = TrainerState(global_step=5, max_steps=50, epoch=1.2, is_world_process_zero=True)
+    state = TrainerState(
+        global_step=5, max_steps=50, epoch=1.2, is_world_process_zero=True
+    )
     control = TrainerControl()
     callback = DescriptiveProgressCallback(train_dataset_size=100, total_epochs=8)
     callback_any = cast(Any, callback)

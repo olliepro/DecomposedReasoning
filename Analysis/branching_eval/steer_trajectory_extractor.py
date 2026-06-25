@@ -462,7 +462,9 @@ def summarize_response_rows(
                 timestamp_utc=str(row["timestamp_utc"]),
                 node=node_key_from_row(row=row, node_id=node_id),
                 request_id=str(payload.get("request_id", "")),
-                steer_text=str(first_choice.get("text", "")),
+                steer_text=str(
+                    first_choice.get("text", first_choice.get("text_preview", ""))
+                ),
             )
         )
     return tuple(summaries)

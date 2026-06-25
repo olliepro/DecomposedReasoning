@@ -26,7 +26,7 @@ from branching_eval.config_types import (
 from branching_eval.lm_eval_adapter import DocRecord
 from branching_eval.run_matrix import (
     requested_selectors_for_spec,
-    run_doc_rollouts,
+    run_doc_rollouts_async,
     runtime_branching_for_spec,
     selector_modes_for_executor,
     run_experiment_matrix,
@@ -274,7 +274,6 @@ def test_run_matrix_smoke_writes_expected_artifacts(
                 model_id="non_sft",
                 checkpoint_or_repo="fake/checkpoint",
                 trigger_steer_default=True,
-                trigger_entropy_default=True,
             ),
         ),
         serve=ServeConfig(),
@@ -287,10 +286,7 @@ def test_run_matrix_smoke_writes_expected_artifacts(
             num_candidates=4,
             branch_fanout=2,
             max_clusters=2,
-            candidate_span_tokens=2,
             max_steer_tokens=2,
-            entropy_threshold=-1.0,
-            entropy_profile_name="aime24_default",
         ),
         artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
         run_matrix=RunMatrixConfig(
@@ -321,10 +317,11 @@ def test_run_matrix_smoke_writes_expected_artifacts(
     assert len(run_dirs) == 2
     for run_dir in run_dirs:
         assert (run_dir / "run_manifest.json").exists()
-        assert (run_dir / "doc_diagnostics.jsonl").exists()
         assert (run_dir / "lm_eval_aggregates.json").exists()
         assert (run_dir / "variance_diagnostics.json").exists()
         assert (run_dir / "length_diagnostics.json").exists()
+        events = ArtifactStore(run_dir=run_dir).read_event_rows()
+        assert any(row["event_type"] == "doc_diagnostics_recorded" for row in events)
         payload = json.loads(
             (run_dir / "run_manifest.json").read_text(encoding="utf-8")
         )
@@ -344,7 +341,6 @@ def test_run_matrix_smoke_writes_structured_baseline_artifacts(
                 model_id="non_sft",
                 checkpoint_or_repo="fake/checkpoint",
                 trigger_steer_default=True,
-                trigger_entropy_default=False,
             ),
         ),
         serve=ServeConfig(),
@@ -357,10 +353,7 @@ def test_run_matrix_smoke_writes_structured_baseline_artifacts(
             num_candidates=4,
             branch_fanout=2,
             max_clusters=2,
-            candidate_span_tokens=2,
             max_steer_tokens=2,
-            entropy_threshold=-1.0,
-            entropy_profile_name="aime24_default",
         ),
         artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
         run_matrix=RunMatrixConfig(
@@ -392,13 +385,13 @@ def test_run_matrix_smoke_writes_structured_baseline_artifacts(
     run_dir = run_dirs[0]
     manifest = json.loads((run_dir / "run_manifest.json").read_text())
     assert manifest["selector_mode"] == "structured_baseline"
-    assert (run_dir / "doc_diagnostics.jsonl").exists()
     events = ArtifactStore(run_dir=run_dir).read_event_rows()
     assert any(
         row["event_type"] == "run_started"
         and row["payload"]["mode"] == "structured_baseline"
         for row in events
     )
+    assert any(row["event_type"] == "doc_diagnostics_recorded" for row in events)
     assert sum(1 for row in events if row["event_type"] == "leaf_scored") == 2
 
 
@@ -414,14 +407,13 @@ def test_baseline_scores_leaves_before_all_rollouts_finish(
                 model_id="non_sft",
                 checkpoint_or_repo="fake/checkpoint",
                 trigger_steer_default=False,
-                trigger_entropy_default=False,
             ),
         ),
         serve=ServeConfig(),
         decoding=DecodingConfig(
             temperature=0.6, top_p=0.95, max_gen_toks=4, top_logprobs=5
         ),
-        branching=BranchingConfig(entropy_profile_name="aime24_default"),
+        branching=BranchingConfig(),
         artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
         run_matrix=RunMatrixConfig(
             include_baselines=True,
@@ -475,7 +467,6 @@ def test_structured_baseline_scores_leaves_before_all_rollouts_finish(
                 model_id="non_sft",
                 checkpoint_or_repo="fake/checkpoint",
                 trigger_steer_default=True,
-                trigger_entropy_default=False,
             ),
         ),
         serve=ServeConfig(),
@@ -488,10 +479,7 @@ def test_structured_baseline_scores_leaves_before_all_rollouts_finish(
             num_candidates=4,
             branch_fanout=2,
             max_clusters=2,
-            candidate_span_tokens=2,
             max_steer_tokens=2,
-            entropy_threshold=-1.0,
-            entropy_profile_name="aime24_default",
         ),
         artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
         run_matrix=RunMatrixConfig(
@@ -546,7 +534,6 @@ def test_run_matrix_smoke_writes_epsilon_greedy_artifacts(
                 model_id="non_sft",
                 checkpoint_or_repo="fake/checkpoint",
                 trigger_steer_default=True,
-                trigger_entropy_default=True,
             ),
         ),
         serve=ServeConfig(),
@@ -560,10 +547,7 @@ def test_run_matrix_smoke_writes_epsilon_greedy_artifacts(
             num_candidates=4,
             branch_fanout=4,
             max_clusters=2,
-            candidate_span_tokens=2,
             max_steer_tokens=2,
-            entropy_threshold=-1.0,
-            entropy_profile_name="aime24_default",
         ),
         artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
         run_matrix=RunMatrixConfig(
@@ -618,7 +602,7 @@ def test_run_matrix_smoke_writes_epsilon_greedy_artifacts(
     run_dir = run_dirs[0]
     assert "epsilon_greedy" in run_dir.name
     manifest = json.loads((run_dir / "run_manifest.json").read_text())
-    assert manifest["selector_mode"] == "embed_diverse_topk_random"
+    assert manifest["selector_mode"] == "epsilon_greedy"
     events = ArtifactStore(run_dir=run_dir).read_event_rows()
     assert any(
         row["event_type"] == "run_started"
@@ -654,7 +638,6 @@ def test_selector_modes_for_executor_uses_active_only_for_epsilon_mode() -> None
         seed=77,
         baseline_rollouts=2,
         trigger_steer=False,
-        trigger_entropy=True,
     )
 
     selectors = selector_modes_for_executor(
@@ -677,7 +660,6 @@ def test_runtime_branching_for_spec_sets_single_path_epsilon_behavior() -> None:
         seed=77,
         baseline_rollouts=2,
         trigger_steer=False,
-        trigger_entropy=True,
     )
     branching = BranchingConfig(
         branch_prob=0.0, branch_fanout=4, epsilon_greedy_prob=0.2
@@ -706,7 +688,9 @@ def test_sync_doc_rollouts_disable_true_branching_for_epsilon_mode(
         def set_event_context(self, **kwargs: object) -> None:
             _ = kwargs
 
-        def run_epsilon_greedy_rollouts(self, *, rollout_count: int) -> object:
+        async def run_epsilon_greedy_rollouts_async(
+            self, *, rollout_count: int
+        ) -> object:
             _ = rollout_count
             return SimpleNamespace(leaves=())
 
@@ -725,23 +709,24 @@ def test_sync_doc_rollouts_disable_true_branching_for_epsilon_mode(
         seed=77,
         baseline_rollouts=1,
         trigger_steer=True,
-        trigger_entropy=False,
     )
 
-    _ = run_doc_rollouts(
-        config=config,
-        spec=spec,
-        client=cast(VllmClient, object()),
-        cluster_client=None,
-        model_name_for_generation="model",
-        cluster_model_name_for_generation=None,
-        prompt_text="Solve.",
-        doc_id=0,
-        doc_attempt=0,
-        task_name="aime24",
-        model_id="model",
-        resolved_branching=config.branching,
-        store=ArtifactStore(run_dir=tmp_path / "run", run_id="run"),
+    _ = asyncio.run(
+        run_doc_rollouts_async(
+            config=config,
+            spec=spec,
+            client=cast(VllmClient, object()),
+            cluster_client=None,
+            model_name_for_generation="model",
+            cluster_model_name_for_generation=None,
+            prompt_text="Solve.",
+            doc_id=0,
+            doc_attempt=0,
+            task_name="aime24",
+            model_id="model",
+            resolved_branching=config.branching,
+            store=ArtifactStore(run_dir=tmp_path / "run", run_id="run"),
+        )
     )
 
     assert captured_kwargs["allow_true_branching"] is False
@@ -759,7 +744,6 @@ def test_branching_scores_leaves_before_rollout_finished(
                 model_id="non_sft",
                 checkpoint_or_repo="fake/checkpoint",
                 trigger_steer_default=True,
-                trigger_entropy_default=True,
             ),
         ),
         serve=ServeConfig(),
@@ -772,10 +756,7 @@ def test_branching_scores_leaves_before_rollout_finished(
             num_candidates=4,
             branch_fanout=2,
             max_clusters=2,
-            candidate_span_tokens=2,
             max_steer_tokens=2,
-            entropy_threshold=-1.0,
-            entropy_profile_name="aime24_default",
         ),
         artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
         run_matrix=RunMatrixConfig(
@@ -852,7 +833,6 @@ def test_run_matrix_caps_doc_async_concurrency_to_five(
                 model_id="non_sft",
                 checkpoint_or_repo="fake/checkpoint",
                 trigger_steer_default=True,
-                trigger_entropy_default=True,
             ),
         ),
         serve=ServeConfig(),
@@ -865,10 +845,7 @@ def test_run_matrix_caps_doc_async_concurrency_to_five(
             num_candidates=4,
             branch_fanout=2,
             max_clusters=2,
-            candidate_span_tokens=2,
             max_steer_tokens=2,
-            entropy_threshold=-1.0,
-            entropy_profile_name="aime24_default",
         ),
         artifacts=ArtifactConfig(output_root=tmp_path / "runs"),
         run_matrix=RunMatrixConfig(

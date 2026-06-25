@@ -39,10 +39,15 @@ DEFAULT_SYSTEM_PROMPT = (
     "Solve the math problem. Put your reasoning in one <think>...</think> "
     "block made of alternating non-empty <steer>...</steer> and "
     "<exec>...</exec> blocks, starting with <steer>. Use <steer> blocks for "
-    "guidance: choose the next step, track assumptions, or decide what to "
-    "verify. Use <exec> blocks to precisely carry out the chosen guidance "
-    "with calculations and deductions. After </think>, give the final answer "
-    "as \\boxed{...} with no extra prose."
+    "guidance: guide thinking, make executive decisions, choose subproblems, "
+    "slow down, enumerate, verify, or backtrack. Examples: Guide thinking: "
+    '"Try applying ___." Make decisions: "Name the dog \'___\'." Choose '
+    'subproblems: "Consider a<=3." Slow down: "Use a more precise method." '
+    'Enumerate: "List 5 options and choose one." Verify: '
+    '"Double Check that calculation." Backtrack: "Abandon this approach." '
+    "Use <exec> blocks to precisely carry out the chosen guidance with "
+    "calculations and deductions. After </think>, give the final answer as "
+    "\\boxed{...} with no extra prose."
 )
 CHAT_ROLE_PREFIX_PATTERN = re.compile(r"^\s*(?:user|human|assistant)\s*:\s*", re.I)
 

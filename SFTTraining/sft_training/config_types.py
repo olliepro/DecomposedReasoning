@@ -105,6 +105,8 @@ class RunConfig:
     Args:
         run_name: W&B and checkpoint run name.
         model_name_or_path: Base model identifier.
+        added_tokens: Extra tokenizer vocabulary entries added as ordinary
+            non-special tokens before model embedding resize.
         dataset_path: Path to transformed JSONL dataset.
         output_dir: Output directory for checkpoints/logs.
         deepspeed_config_path: Optional path to deepspeed config JSON.
@@ -114,6 +116,8 @@ class RunConfig:
         seed: Random seed for split/training.
         num_train_epochs: Number of training epochs.
         learning_rate: Optimizer learning rate.
+        lr_scheduler_type: Trainer scheduler type; defaults to keeping LR
+            stable after warmup.
         max_seq_length: Max sequence length for SFT.
         per_device_train_batch_size: Train micro-batch size per GPU.
         per_device_eval_batch_size: Eval micro-batch size per GPU.
@@ -159,6 +163,7 @@ class RunConfig:
     seed: int = 42
     num_train_epochs: int = 8
     learning_rate: float = 1e-5
+    lr_scheduler_type: str = "constant_with_warmup"
     max_seq_length: int = 8192
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
@@ -180,6 +185,7 @@ class RunConfig:
     packing_strategy: Literal["bfd", "wrapped"] = "bfd"
     padding_free: bool = False
     eval_packing: bool | None = None
+    added_tokens: tuple[str, ...] = ()
     lora: LoraConfig | None = None
     lm_eval: LmEvalConfig = field(default_factory=LmEvalConfig)
 
@@ -366,7 +372,27 @@ def _parse_common_kwargs(payload: dict[str, Any], base_dir: Path) -> dict[str, A
         ),
         "wandb_project": str(payload["wandb_project"]),
         "wandb_entity": payload.get("wandb_entity"),
+        "added_tokens": _parse_added_tokens(payload=payload),
     }
+
+
+def _parse_added_tokens(payload: dict[str, Any]) -> tuple[str, ...]:
+    """Parse ordinary tokenizer-added tokens from run config.
+
+    Args:
+        payload: Raw top-level run config payload.
+
+    Returns:
+        Tuple of non-empty token strings.
+    """
+    added_tokens_raw = payload.get("added_tokens", ())
+    if isinstance(added_tokens_raw, str):
+        added_tokens = (added_tokens_raw,)
+    else:
+        added_tokens = tuple(str(token) for token in added_tokens_raw)
+    assert all(added_tokens), "`added_tokens` entries must be non-empty."
+    assert len(set(added_tokens)) == len(added_tokens), "`added_tokens` must be unique."
+    return added_tokens
 
 
 def _parse_deepspeed_path(payload: dict[str, Any], base_dir: Path) -> Path | None:
@@ -419,6 +445,7 @@ def _parse_numeric_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         "seed": int(payload.get("seed", 42)),
         "num_train_epochs": int(payload.get("num_train_epochs", 8)),
         "learning_rate": float(payload.get("learning_rate", 1e-5)),
+        "lr_scheduler_type": _parse_lr_scheduler_type(payload=payload),
         "max_seq_length": int(payload.get("max_seq_length", 8192)),
         "per_device_train_batch_size": int(
             payload.get("per_device_train_batch_size", 1)
@@ -483,3 +510,17 @@ def _parse_eval_packing(payload: dict[str, Any]) -> bool | None:
     if eval_packing_value is None:
         return None
     return bool(eval_packing_value)
+
+
+def _parse_lr_scheduler_type(payload: dict[str, Any]) -> str:
+    """Parse the learning-rate scheduler name from a run payload.
+
+    Args:
+        payload: Raw top-level run config payload.
+
+    Returns:
+        Non-empty scheduler name accepted by Transformers training args.
+    """
+    lr_scheduler_type = str(payload.get("lr_scheduler_type", "constant_with_warmup"))
+    assert lr_scheduler_type, "`lr_scheduler_type` must be non-empty."
+    return lr_scheduler_type

@@ -44,7 +44,6 @@ class ModelSpec:
         clustering_base_url: Optional external base URL for cluster selectors.
         clustering_served_model_name: Optional request-time model for clustering.
         trigger_steer_default: Enables steer trigger for branching by default.
-        trigger_entropy_default: Legacy compatibility field ignored by runtime.
 
     Returns:
         Dataclass describing one model input.
@@ -65,7 +64,6 @@ class ModelSpec:
     clustering_base_url: str | None = None
     clustering_served_model_name: str | None = None
     trigger_steer_default: bool = False
-    trigger_entropy_default: bool = True
 
     @property
     def uses_external_server(self) -> bool:
@@ -307,13 +305,19 @@ class BranchingConfig:
         num_candidates: Candidate count generated per branch point.
         branch_fanout: Number of selected candidates kept per branch point.
         max_clusters: Max clusters for `cluster_across` selection.
-        candidate_span_tokens: Legacy compatibility field ignored by runtime.
         max_steer_tokens: Max generated tokens for steer-trigger candidates.
         steer_repetition_penalty: Repetition penalty applied to steer-token requests.
+        repetition_checking_enabled: Whether repeated exec/steer block detection can
+            force-close a rollout.
         epsilon_greedy_prob: Probability of one-path exploration at eligible
             triggers for `epsilon_greedy` runs.
-        entropy_threshold: Legacy compatibility field ignored by runtime.
-        entropy_profile_name: Legacy compatibility field ignored by runtime.
+        off_policy_min_candidates: Inclusive lower bound for verbalized options
+            requested by `epsilon_greedy_off_policy`.
+        off_policy_max_candidates: Inclusive upper bound for verbalized options
+            requested by `epsilon_greedy_off_policy`.
+        use_full_stop_strings: Whether generation requests should stop on full
+            close tags such as `</steer>` and `</exec>`. Defaults to legacy
+            partial-prefix stops for tokenizer-agnostic runs.
 
     Returns:
         Dataclass with branching behavior controls.
@@ -325,12 +329,14 @@ class BranchingConfig:
     num_candidates: int = 100
     branch_fanout: int = 4
     max_clusters: int = 4
-    candidate_span_tokens: int = 15
     max_steer_tokens: int = 15
     steer_repetition_penalty: float = 1.01
+    repetition_checking_enabled: bool = True
     epsilon_greedy_prob: float = 0.05
-    entropy_threshold: float | None = None
-    entropy_profile_name: str = "aime24_default"
+    off_policy_min_candidates: int = 3
+    off_policy_max_candidates: int = 10
+    verbalized_off_policy_enabled: bool = False
+    use_full_stop_strings: bool = False
 
 
 @dataclass(frozen=True)
@@ -476,6 +482,20 @@ class BranchingEvalConfig:
         assert (
             self.branching.num_candidates >= self.branching.branch_fanout
         ), "num_candidates must be >= branch_fanout"
+        assert (
+            self.branching.off_policy_min_candidates >= 1
+        ), "off_policy_min_candidates must be >= 1"
+        assert (
+            self.branching.off_policy_max_candidates
+            >= self.branching.off_policy_min_candidates
+        ), "off_policy_max_candidates must be >= off_policy_min_candidates"
+        if self.branching.verbalized_off_policy_enabled:
+            assert (
+                self.branching.branch_fanout <= self.branching.off_policy_min_candidates
+            ), (
+                "verbalized off-policy requires branch_fanout <= "
+                "off_policy_min_candidates"
+            )
         assert 0.0 <= self.branching.branch_prob <= 1.0, "branch_prob must be in [0, 1]"
         assert (
             0.0 <= self.branching.epsilon_greedy_prob <= 1.0
@@ -499,7 +519,6 @@ class ExperimentSpec:
         seed: RNG seed value.
         baseline_rollouts: Baseline rollout count (`N`) for baseline mode.
         trigger_steer: Enables steer trigger.
-        trigger_entropy: Legacy compatibility field ignored by runtime.
 
     Returns:
         Concrete experiment run specification.
@@ -512,7 +531,6 @@ class ExperimentSpec:
     seed: int
     baseline_rollouts: int
     trigger_steer: bool
-    trigger_entropy: bool = False
 
 
 @dataclass(frozen=True)
@@ -676,8 +694,38 @@ def _parse_branching(*, payload: dict[str, Any]) -> BranchingConfig:
         steer_repetition_penalty=float(
             branch_payload.get("steer_repetition_penalty", 1.01)
         ),
+        repetition_checking_enabled=_parse_bool(
+            value=branch_payload.get("repetition_checking_enabled", True)
+        ),
         epsilon_greedy_prob=float(branch_payload.get("epsilon_greedy_prob", 0.05)),
+        off_policy_min_candidates=int(
+            branch_payload.get("off_policy_min_candidates", 3)
+        ),
+        off_policy_max_candidates=int(
+            branch_payload.get("off_policy_max_candidates", 10)
+        ),
+        verbalized_off_policy_enabled=_parse_bool(
+            value=branch_payload.get("verbalized_off_policy_enabled", False)
+        ),
+        use_full_stop_strings=_parse_bool(
+            value=branch_payload.get("use_full_stop_strings", False)
+        ),
     )
+
+
+def _parse_bool(*, value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        assert normalized in {
+            "true",
+            "false",
+            "1",
+            "0",
+        }, f"Expected boolean string, got {value!r}"
+        return normalized in {"true", "1"}
+    return bool(value)
 
 
 def _parse_artifacts(*, payload: dict[str, Any], base_dir: Path) -> ArtifactConfig:

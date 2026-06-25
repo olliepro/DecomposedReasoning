@@ -65,6 +65,7 @@ class RunNameParts:
     size: str
     variant: str
     selector: str
+    step: str
     started_at: str
 
     def search_text(self, *, run_name: str) -> str:
@@ -78,6 +79,7 @@ class RunNameParts:
                 self.size,
                 self.selector,
                 self.variant,
+                self.step,
                 self.started_at,
             ]
         ).lower()
@@ -138,11 +140,13 @@ class RunRegistry:
 
         self._refresh_if_stale(force=False)
         with self._lock:
-            return sorted(
-                self._entries.values(),
-                key=lambda entry: entry.run_dir.stat().st_mtime,
-                reverse=True,
-            )
+            entries = list(self._entries.values())
+        sorted_entries, missing_ids = _sort_existing_entries(entries=entries)
+        if missing_ids:
+            with self._lock:
+                for run_id in missing_ids:
+                    self._entries.pop(run_id, None)
+        return sorted_entries
 
     def single_entry(self) -> RunRegistryEntry | None:
         """Return the only entry when this server is in single-run mode."""
@@ -210,6 +214,22 @@ def split_run_route(
     return entry, inner_path
 
 
+def _sort_existing_entries(
+    *, entries: list[RunRegistryEntry]
+) -> tuple[list[RunRegistryEntry], list[str]]:
+    sortable_entries: list[tuple[float, RunRegistryEntry]] = []
+    missing_ids: list[str] = []
+    for entry in entries:
+        try:
+            mtime = entry.run_dir.stat().st_mtime
+        except FileNotFoundError:
+            missing_ids.append(entry.run_id)
+            continue
+        sortable_entries.append((mtime, entry))
+    sortable_entries.sort(key=lambda item: item[0], reverse=True)
+    return [entry for _, entry in sortable_entries], missing_ids
+
+
 def run_registry_page_html(
     *, entries: list[RunRegistryEntry], summaries: list[RunRegistrySummary]
 ) -> str:
@@ -222,7 +242,7 @@ def run_registry_page_html(
         for summary, is_duplicate in row_inputs
     )
     if not rows:
-        rows = "<tr><td colspan='8'>No SQLite-backed runs found.</td></tr>"
+        rows = "<tr><td colspan='9'>No SQLite-backed runs found.</td></tr>"
     body_html = f"""
 <style>
 .run-filter {{ width:100%; max-width:42rem; margin-top:0.8rem; }}
@@ -267,7 +287,7 @@ def run_registry_page_html(
 <section class="panel">
   <table id="run-table">
     <thead>
-      <tr><th>model</th><th>size</th><th>task</th><th>selector</th><th>started</th><th>avg doc passrate</th><th>open</th><th>variant</th></tr>
+      <tr><th>model</th><th>size</th><th>task</th><th>selector</th><th>step</th><th>started</th><th>avg doc passrate</th><th>open</th><th>variant</th></tr>
     </thead>
     <tbody>{rows}</tbody>
   </table>
@@ -326,6 +346,7 @@ def _summary_row(*, summary: RunRegistrySummary, is_duplicate: bool) -> str:
         f"<td data-pivot='size'><code>{escape(parts.size)}</code></td>"
         f"<td data-pivot='task'><code>{escape(parts.task)}</code></td>"
         f"<td data-pivot='selector'><code>{escape(parts.selector)}</code></td>"
+        f"<td><code>{escape(parts.step)}</code></td>"
         f"<td><code>{escape(parts.started_at)}</code></td>"
         f"<td>{escape(summary.passrate_text())}</td>"
         f"<td><a href='{escape(run_url)}'>open</a></td>"
@@ -416,6 +437,7 @@ def _parse_run_name(*, run_name: str) -> RunNameParts:
         size=size,
         variant=_variant_label(run_name=run_name),
         selector=_selector_label(run_name=run_name),
+        step=_step_label(run_name=run_name),
         started_at=_human_started_at(raw_timestamp=raw_timestamp),
     )
 
@@ -456,6 +478,13 @@ def _step_desc_value(*, run_name: str) -> float:
     batch_index = int(match.group(1))
     step_index = int(match.group(2))
     return -float(batch_index * 1_000_000 + step_index)
+
+
+def _step_label(*, run_name: str) -> str:
+    match = re.search(r"batch_\d+_step_(\d+)", run_name)
+    if match is None:
+        return "n/a"
+    return str(int(match.group(1)))
 
 
 def _variant_label(*, run_name: str) -> str:

@@ -17,6 +17,7 @@ GRAPH_EVENT_TYPES = {
     "candidate_pool_resolved",
     "selector_applied",
     "selector_continued_inline",
+    "verbalized_sampling_applied",
     "malformed_steer_decision",
     "repeat_forced_think_close",
     "leaf_completed",
@@ -40,6 +41,8 @@ class NormalizedEventBatch:
     selectors: list[tuple[Any, ...]] = field(default_factory=list)
     selector_flags: list[tuple[Any, ...]] = field(default_factory=list)
     selector_clusters: list[tuple[Any, ...]] = field(default_factory=list)
+    verbalized_sampling_decisions: list[tuple[Any, ...]] = field(default_factory=list)
+    verbalized_sampling_candidates: list[tuple[Any, ...]] = field(default_factory=list)
     vllm_requests: list[tuple[Any, ...]] = field(default_factory=list)
     vllm_responses: list[tuple[Any, ...]] = field(default_factory=list)
     vllm_choices: list[tuple[Any, ...]] = field(default_factory=list)
@@ -107,6 +110,16 @@ def append_normalized_rows(
     )
     _executemany(
         connection=connection,
+        sql=event_db_sql.INSERT_VERBALIZED_SAMPLING_DECISION_SQL,
+        rows=batch.verbalized_sampling_decisions,
+    )
+    _executemany(
+        connection=connection,
+        sql=event_db_sql.INSERT_VERBALIZED_SAMPLING_CANDIDATE_SQL,
+        rows=batch.verbalized_sampling_candidates,
+    )
+    _executemany(
+        connection=connection,
         sql=event_db_sql.INSERT_VLLM_REQUEST_SQL,
         rows=batch.vllm_requests,
     )
@@ -157,6 +170,8 @@ def _add_normalized_row(*, batch: NormalizedEventBatch, row: dict[str, Any]) -> 
         batch.prompt_contexts.append(_prompt_context_values(base=base, payload=payload))
     elif event_type in {"selector_applied", "selector_continued_inline"}:
         _add_selector_rows(batch=batch, base=base, payload=payload)
+    elif event_type == "verbalized_sampling_applied":
+        _add_verbalized_sampling_rows(batch=batch, base=base, payload=payload)
     elif event_type == "vllm_request":
         batch.vllm_requests.append(_vllm_request_values(base=base, payload=payload))
     elif event_type == "vllm_response":
@@ -316,6 +331,41 @@ def _add_selector_cluster_rows(
     ):
         for candidate_id, cluster_name in assignments:
             batch.selector_clusters.append((base[0], mode, candidate_id, cluster_name))
+
+
+def _add_verbalized_sampling_rows(
+    *, batch: NormalizedEventBatch, base: tuple[Any, ...], payload: dict[str, Any]
+) -> None:
+    sampled_numbers = ",".join(
+        str(value) for value in _int_list(payload.get("sampled_option_numbers", []))
+    )
+    batch.verbalized_sampling_decisions.append(
+        (
+            *base,
+            str(payload.get("branch_point_id", "")),
+            str(payload.get("candidate_pool_id", "")),
+            str(payload.get("node_id", "")),
+            int(payload.get("candidate_count", 0) or 0),
+            int(payload.get("branch_fanout", 0) or 0),
+            sampled_numbers,
+            str(payload.get("parse_status", "")),
+            str(payload.get("enumeration_exec_text", "")),
+        )
+    )
+    selected_numbers = set(_int_list(payload.get("sampled_option_numbers", [])))
+    for candidate_rank, candidate in enumerate(
+        _dict_rows(value=payload.get("candidates", []))
+    ):
+        option_number = int(candidate.get("option_number", 0) or 0)
+        batch.verbalized_sampling_candidates.append(
+            (
+                base[0],
+                option_number,
+                candidate_rank,
+                str(candidate.get("text", "")),
+                1 if option_number in selected_numbers else 0,
+            )
+        )
 
 
 def _vllm_request_values(
@@ -514,6 +564,13 @@ def _event_summary(*, event_type: str, payload: dict[str, Any]) -> str:
         )
     if event_type == "selector_continued_inline":
         return f"selector continued inline {payload.get('selected_candidate_id')}"
+    if event_type == "verbalized_sampling_applied":
+        selected = _int_list(payload.get("sampled_option_numbers", []))
+        return (
+            f"verbalized sampling selected {','.join(str(value) for value in selected)}"
+        )
+    if event_type == "doc_diagnostics_recorded":
+        return "doc diagnostics recorded"
     if event_type == "malformed_steer_decision":
         return (
             "malformed steer decision"
@@ -555,7 +612,11 @@ def _node_event_text_preview(*, event_type: str, payload: dict[str, Any]) -> str
     }:
         return str(payload.get("chunk_text", payload.get("forced_close_text", "")))
     if event_type == "malformed_steer_decision":
-        return str(payload.get("candidate_text", payload.get("assistant_prefix_tail", "")))
+        return str(
+            payload.get("candidate_text", payload.get("assistant_prefix_tail", ""))
+        )
+    if event_type == "verbalized_sampling_applied":
+        return str(payload.get("enumeration_exec_text", ""))[:500]
     return str(payload.get("text_preview", ""))
 
 
@@ -569,7 +630,11 @@ def _node_event_text(*, event_type: str, payload: dict[str, Any]) -> str:
     }:
         return str(payload.get("chunk_text", payload.get("forced_close_text", "")))
     if event_type == "malformed_steer_decision":
-        return str(payload.get("candidate_text", payload.get("assistant_prefix_tail", "")))
+        return str(
+            payload.get("candidate_text", payload.get("assistant_prefix_tail", ""))
+        )
+    if event_type == "verbalized_sampling_applied":
+        return str(payload.get("enumeration_exec_text", ""))
     return ""
 
 

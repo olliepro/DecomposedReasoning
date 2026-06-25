@@ -460,28 +460,6 @@ def test_apply_actor_update_mask_uses_sqrt_token_ratio_gradient_scale() -> None:
     assert torch.equal(batch.batch["advantages"], original_advantages)
 
 
-def test_branching_rollout_settings_parse_entropy_threshold() -> None:
-    """Rollout settings should preserve explicit entropy-trigger overrides."""
-
-    config = SimpleNamespace(
-        actor_rollout_ref=SimpleNamespace(
-            rollout=SimpleNamespace(
-                custom={
-                    "branching_dapo": {
-                        "trigger_entropy_enabled": True,
-                        "entropy_threshold": 0.0,
-                        "entropy_profile_name": "smoke",
-                    }
-                }
-            )
-        )
-    )
-    settings = BranchingRolloutSettings.from_config(config=config)
-    assert settings.trigger_entropy_enabled is True
-    assert settings.entropy_threshold == 0.0
-    assert settings.entropy_profile_name == "smoke"
-
-
 def test_branching_rollout_settings_parse_epsilon_greedy_prob() -> None:
     """Rollout settings should expose inline epsilon-greedy exploration probability."""
 
@@ -515,6 +493,40 @@ def test_branching_rollout_settings_parse_rollout_mode() -> None:
     assert settings.rollout_mode == "structured_baseline"
     assert settings.validated_rollout_mode() == "structured_baseline"
     assert settings.selector_label_for_records() == "structured_baseline"
+
+
+def test_branching_rollout_settings_parse_persistent_log_interval() -> None:
+    """Rollout settings should expose completed-step log retention cadence."""
+
+    config = SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(
+                custom={"branching_dapo": {"persistent_log_interval_steps": 4}}
+            )
+        )
+    )
+
+    settings = BranchingRolloutSettings.from_config(config=config)
+
+    assert settings.persistent_log_interval_steps == 4
+    assert not settings.should_persist_step_logs(global_step=3)
+    assert settings.should_persist_step_logs(global_step=4)
+
+
+def test_branching_rollout_settings_parse_repetition_checking() -> None:
+    """Rollout settings should expose the repeat-loop truncation switch."""
+
+    config = SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(
+                custom={"branching_dapo": {"repetition_checking_enabled": "False"}}
+            )
+        )
+    )
+
+    settings = BranchingRolloutSettings.from_config(config=config)
+
+    assert not settings.repetition_checking_enabled
 
 
 def test_branching_rollout_settings_build_artifact_paths(tmp_path: Path) -> None:
@@ -791,6 +803,65 @@ def test_trainer_persists_branch_segment_advantages(tmp_path: Path) -> None:
     assert rows[0]["mean_combined_advantage"] == pytest.approx(3.0)
     assert rows[0]["token_count"] == 2
     assert rows[0]["leaf_count"] == 1
+
+
+def test_trainer_prunes_completed_non_interval_tree_logs(tmp_path: Path) -> None:
+    """Completed non-interval step logs should be removed after trainer use."""
+
+    db_path = tmp_path / "run" / "batch_0002_step_000002" / "tree_events.sqlite"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_text("", encoding="utf-8")
+    trainer = cast(BranchingRayPPOTrainer, object.__new__(BranchingRayPPOTrainer))
+    trainer.config = SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(
+                custom={"branching_dapo": {"persistent_log_interval_steps": 3}}
+            )
+        )
+    )
+    batch = DataProto(
+        batch=TensorDict({}, batch_size=[1]),
+        non_tensor_batch={
+            "tree_events_db_path": np.asarray(
+                [str(db_path), str(db_path)], dtype=object
+            )
+        },
+    )
+
+    metrics = trainer._prune_nonpersistent_branching_logs(batch=batch, global_step=2)
+
+    assert not db_path.parent.exists()
+    assert metrics["branching/artifacts/persistent_log_interval_steps"] == 3
+    assert metrics["branching/artifacts/persisted_step_logs"] == 0
+    assert metrics["branching/artifacts/pruned_step_log_dirs"] == 1
+
+
+def test_trainer_keeps_interval_tree_logs(tmp_path: Path) -> None:
+    """Completed interval step logs should remain for viewer replay."""
+
+    db_path = tmp_path / "run" / "batch_0003_step_000003" / "tree_events.sqlite"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_text("", encoding="utf-8")
+    trainer = cast(BranchingRayPPOTrainer, object.__new__(BranchingRayPPOTrainer))
+    trainer.config = SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(
+                custom={"branching_dapo": {"persistent_log_interval_steps": 3}}
+            )
+        )
+    )
+    batch = DataProto(
+        batch=TensorDict({}, batch_size=[1]),
+        non_tensor_batch={
+            "tree_events_db_path": np.asarray([str(db_path)], dtype=object)
+        },
+    )
+
+    metrics = trainer._prune_nonpersistent_branching_logs(batch=batch, global_step=3)
+
+    assert db_path.exists()
+    assert metrics["branching/artifacts/persisted_step_logs"] == 1
+    assert metrics["branching/artifacts/pruned_step_log_dirs"] == 0
 
 
 def test_compute_branch_interpolated_grpo_falls_back_to_zero_without_branching() -> (

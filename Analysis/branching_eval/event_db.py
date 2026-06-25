@@ -20,10 +20,12 @@ VISIBLE_RUNTIME_EVENT_TYPES = (
     "candidate_pool_resolved",
     "selector_applied",
     "selector_continued_inline",
+    "verbalized_sampling_applied",
     "malformed_steer_decision",
     "repeat_forced_think_close",
     "leaf_completed",
     "leaf_scored",
+    "doc_diagnostics_recorded",
 )
 GRAPH_EVENT_TYPES = VISIBLE_RUNTIME_EVENT_TYPES
 
@@ -259,6 +261,28 @@ class EventDatabase:
             )
             row = cursor.fetchone()
         return None if row is None else _attempt_summary_row(row=row)
+
+    def read_doc_diagnostics_row(self, **key: Any) -> dict[str, Any] | None:
+        """Return the latest canonical per-doc diagnostics event for one attempt."""
+
+        with closing(self.read_connect()) as connection:
+            _ensure_normalized_current(connection=connection)
+            cursor = connection.execute(
+                """
+                SELECT event_index, timestamp_utc, payload_json
+                FROM event_log
+                WHERE doc_id = ? AND doc_attempt = ?
+                  AND task_name = ? AND model_id = ? AND selector_mode = ?
+                  AND event_type = 'doc_diagnostics_recorded'
+                ORDER BY event_index DESC
+                LIMIT 1
+                """,
+                _attempt_values(key=key),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return _mapping_from_cursor(cursor=cursor, row=row)
 
     def read_leaf_score_rows(self) -> list[dict[str, Any]]:
         """Return only leaf-scored payloads plus indexed attempt keys."""
@@ -716,6 +740,48 @@ class EventDatabase:
             placeholders = ",".join("?" for _ in event_indexes)
             cursor = connection.execute(
                 event_db_sql.SELECTOR_POOL_ROWS_FOR_EVENTS_SQL.format(
+                    placeholders=placeholders
+                ),
+                tuple(int(index) for index in event_indexes),
+            )
+            return [_mapping_from_cursor(cursor=cursor, row=row) for row in cursor]
+
+    def read_verbalized_sampling_decision_rows_for_events(
+        self, *, event_indexes: Sequence[int]
+    ) -> list[dict[str, Any]]:
+        """Return verbalized sampling decision rows for event indexes."""
+
+        if not event_indexes:
+            return []
+        with closing(self.read_connect()) as connection:
+            if not _has_table(
+                connection=connection, table_name="verbalized_sampling_decision"
+            ):
+                return []
+            placeholders = ",".join("?" for _ in event_indexes)
+            cursor = connection.execute(
+                event_db_sql.VERBALIZED_SAMPLING_DECISION_ROWS_FOR_EVENTS_SQL.format(
+                    placeholders=placeholders
+                ),
+                tuple(int(index) for index in event_indexes),
+            )
+            return [_mapping_from_cursor(cursor=cursor, row=row) for row in cursor]
+
+    def read_verbalized_sampling_candidate_rows_for_events(
+        self, *, event_indexes: Sequence[int]
+    ) -> list[dict[str, Any]]:
+        """Return parsed verbalized sampling candidates for event indexes."""
+
+        if not event_indexes:
+            return []
+        with closing(self.read_connect()) as connection:
+            if not _has_table(
+                connection=connection, table_name="verbalized_sampling_candidate"
+            ):
+                return []
+            placeholders = ",".join("?" for _ in event_indexes)
+            cursor = connection.execute(
+                event_db_sql.VERBALIZED_SAMPLING_CANDIDATE_ROWS_FOR_EVENTS_SQL.format(
                     placeholders=placeholders
                 ),
                 tuple(int(index) for index in event_indexes),
@@ -1356,9 +1422,7 @@ def _attempt_values(*, key: dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _node_advantage_values(*, row: dict[str, Any]) -> tuple[Any, ...]:
-    updated_at = str(
-        row.get("updated_at") or datetime.now(tz=timezone.utc).isoformat()
-    )
+    updated_at = str(row.get("updated_at") or datetime.now(tz=timezone.utc).isoformat())
     return (
         int(row["doc_id"]),
         int(row["doc_attempt"]),

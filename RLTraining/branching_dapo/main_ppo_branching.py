@@ -18,7 +18,11 @@ from verl.trainer.main_ppo import run_ppo  # noqa: E402
 from verl.utils.device import auto_set_device  # noqa: E402
 
 
-@hydra.main(config_path="../verl/verl/trainer/config", config_name="ppo_trainer", version_base=None)
+@hydra.main(
+    config_path="../verl/verl/trainer/config",
+    config_name="ppo_trainer",
+    version_base=None,
+)
 def main(config) -> None:
     """Hydra entrypoint for repo-local branching PPO training.
 

@@ -37,7 +37,9 @@ STEER_OPEN_PREFIXES = tuple(
     for prefix_length in range(2, len(STEER_OPEN_TAG) + 1)
 )
 STEER_CANDIDATE_STOP = ("</steer",)
+STEER_CANDIDATE_STOP_FULL = ("</steer>",)
 TERMINAL_STEER_CANDIDATE_STOP = ("</steer", "</think>")
+TERMINAL_STEER_CANDIDATE_STOP_FULL = ("</steer>", "</think>")
 
 
 def normalize_steer_boundary_text(*, text: str) -> str:
@@ -170,11 +172,16 @@ def explicit_exec_stop_completion_suffix(*, text: str) -> str:
     return EXEC_CLOSE_TAG
 
 
-def steer_candidate_stop_markers(*, text: str) -> tuple[str, ...]:
+def steer_candidate_stop_markers(
+    *, text: str, use_full_stop_strings: bool = False
+) -> tuple[str, ...]:
     """Return candidate-generation stops for one normalized steer prefix.
 
     Args:
         text: Canonicalized assistant prefix used for steer candidate generation.
+        use_full_stop_strings: Whether vLLM should stop on complete control
+            tags. Keep false for legacy/tokenizer-agnostic runs; enable for
+            no-split added control-token models.
 
     Returns:
         `</think>` is included only when the model is allowed to choose whether
@@ -182,7 +189,11 @@ def steer_candidate_stop_markers(*, text: str) -> tuple[str, ...]:
     """
 
     if text.lower().endswith(STEER_OPEN_TAG):
-        return STEER_CANDIDATE_STOP
+        return (
+            STEER_CANDIDATE_STOP_FULL if use_full_stop_strings else STEER_CANDIDATE_STOP
+        )
+    if use_full_stop_strings:
+        return TERMINAL_STEER_CANDIDATE_STOP_FULL
     return TERMINAL_STEER_CANDIDATE_STOP
 
 

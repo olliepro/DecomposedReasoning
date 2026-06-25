@@ -43,9 +43,7 @@ def test_normalize_closes_open_exec_without_forcing_steer() -> None:
     """Open exec contexts should stop at exec boundary when no steer prefix exists."""
 
     assert normalize_steer_boundary_text(text="<exec>work") == "<exec>work\n</exec>\n"
-    assert (
-        normalize_steer_boundary_text(text="<exec>work\n") == "<exec>work\n</exec>\n"
-    )
+    assert normalize_steer_boundary_text(text="<exec>work\n") == "<exec>work\n</exec>\n"
 
 
 def test_normalize_completes_partial_steer_prefix_inside_exec() -> None:

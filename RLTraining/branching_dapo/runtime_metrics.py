@@ -35,7 +35,9 @@ class _MetricStore:
         """
 
         with self.lock:
-            self.generation_metrics = {str(key): float(value) for key, value in metrics.items()}
+            self.generation_metrics = {
+                str(key): float(value) for key, value in metrics.items()
+            }
 
     def update_advantage_metrics(self, *, metrics: Mapping[str, float]) -> None:
         """Overwrite stored advantage-side metrics.
@@ -48,7 +50,9 @@ class _MetricStore:
         """
 
         with self.lock:
-            self.advantage_metrics = {str(key): float(value) for key, value in metrics.items()}
+            self.advantage_metrics = {
+                str(key): float(value) for key, value in metrics.items()
+            }
 
     def pop_metrics(self) -> dict[str, float]:
         """Return and clear the stored branching metrics.

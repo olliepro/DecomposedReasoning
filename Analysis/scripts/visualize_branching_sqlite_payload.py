@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -11,11 +12,9 @@ from typing import Any
 from branching_eval.event_db import EventDatabase
 
 try:
-    from scripts.visualize_branching_doc_data import clean_candidate_preview
-    from scripts.visualize_branching_replay import AttemptKey
+    from scripts.visualize_branching_common import AttemptKey, clean_candidate_preview
 except ModuleNotFoundError:
-    from visualize_branching_doc_data import clean_candidate_preview
-    from visualize_branching_replay import AttemptKey
+    from visualize_branching_common import AttemptKey, clean_candidate_preview
 
 BASELINE_LEAF_NODE_PREFIX = "node_leaf_baseline_"
 PROMPT_DETAIL_HEAD_CHARS = 4000
@@ -27,6 +26,7 @@ SELECTOR_DECISION_COMPANION_TYPES = {
 CHUNK_DETAIL_EVENT_TYPES = {
     "repeat_forced_think_close",
 }
+VERBALIZED_SAMPLING_EVENT_TYPES = {"verbalized_sampling_applied"}
 
 
 @dataclass(frozen=True)
@@ -62,6 +62,7 @@ def tree_payload_from_sqlite(
         ]
     )
     summary_row = db.read_attempt_count_row(**_key_kwargs(key=key))
+    diagnostics_row = db.read_doc_diagnostics_row(**_key_kwargs(key=key))
     nodes = _normalized_nodes(rows=node_rows, edges=display_edge_rows)
     _add_baseline_leaf_nodes(nodes=nodes, rows=baseline_leaf_rows)
     edge_payloads = _edge_payload_rows(rows=display_edge_rows)
@@ -119,6 +120,7 @@ def tree_payload_from_sqlite(
         "meta": _tree_meta(
             key=key,
             summary_row=summary_row,
+            diagnostics_row=diagnostics_row,
             nodes=node_payloads,
             edges=edge_payloads,
             node_events=full_node_events,
@@ -598,6 +600,11 @@ def _basic_event_details(*, row: dict[str, Any]) -> dict[str, Any]:
         }
     if event_type in {"selector_applied", "selector_continued_inline"}:
         return {"branch_point_id": row.get("branch_point_id")}
+    if event_type in VERBALIZED_SAMPLING_EVENT_TYPES:
+        return {
+            "branch_point_id": row.get("branch_point_id"),
+            "detail_path": f"events/{int(row['event_index'])}.json",
+        }
     return {}
 
 
@@ -654,6 +661,16 @@ def _detail_event_rows(
     chunk_rows = _rows_by_event(
         rows=db.read_generated_chunk_rows_for_events(event_indexes=event_indexes)
     )
+    verbalized_decisions = _rows_by_event(
+        rows=db.read_verbalized_sampling_decision_rows_for_events(
+            event_indexes=event_indexes
+        )
+    )
+    verbalized_candidates = _rows_by_event(
+        rows=db.read_verbalized_sampling_candidate_rows_for_events(
+            event_indexes=event_indexes
+        )
+    )
     latest_choice_tokens_by_node: dict[str, list[dict[str, Any]]] = {}
     payloads = []
     for row in rows:
@@ -686,6 +703,10 @@ def _detail_event_rows(
                     chunk=chunk,
                     latest_choice_tokens_by_node=latest_choice_tokens_by_node,
                 ),
+                verbalized_decision=first_or_none(
+                    rows=verbalized_decisions.get(event_index, [])
+                ),
+                verbalized_candidates=verbalized_candidates.get(event_index, []),
             )
         )
     return payloads
@@ -703,6 +724,8 @@ def _detail_event_payload(
     choice_tokens: dict[int, list[dict[str, Any]]],
     chunk: dict[str, Any] | None,
     chunk_tokens: list[dict[str, Any]],
+    verbalized_decision: dict[str, Any] | None,
+    verbalized_candidates: list[dict[str, Any]],
 ) -> dict[str, Any]:
     event = _event_payload_row(row=row, metrics={})
     event_type = str(row["event_type"])
@@ -722,6 +745,12 @@ def _detail_event_payload(
             candidate_tokens=candidate_tokens,
             selector_flags=selector_flags,
             selector_clusters=selector_clusters,
+        )
+    elif event_type in VERBALIZED_SAMPLING_EVENT_TYPES:
+        event["details"] = _verbalized_sampling_details(
+            row=row,
+            decision=verbalized_decision,
+            candidates=verbalized_candidates,
         )
     elif event_type == "vllm_step":
         event["details"] = _vllm_details(
@@ -820,6 +849,44 @@ def _selector_decision_details(
     }
 
 
+def _verbalized_sampling_details(
+    *,
+    row: dict[str, Any],
+    decision: dict[str, Any] | None,
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return click-detail payload for verbalized off-policy sampling."""
+
+    source = decision or row
+    candidate_details = [
+        {
+            "option_number": int(candidate.get("option_number") or 0),
+            "text": str(candidate.get("candidate_text") or ""),
+            "selected": bool(int(candidate.get("selected") or 0)),
+        }
+        for candidate in candidates
+    ]
+    selected = [candidate for candidate in candidate_details if candidate["selected"]]
+    alternatives = [
+        candidate for candidate in candidate_details if not candidate["selected"]
+    ]
+    return {
+        "branch_point_id": source.get("branch_point_id"),
+        "candidate_pool_id": source.get("candidate_pool_id"),
+        "node_id": source.get("node_id"),
+        "candidate_count": int(source.get("candidate_count") or 0),
+        "branch_fanout": int(source.get("branch_fanout") or len(selected)),
+        "sampled_option_numbers": _parse_number_list(
+            text=str(source.get("sampled_option_numbers") or "")
+        ),
+        "parse_status": source.get("parse_status") or "",
+        "selected_candidates": selected,
+        "other_candidates": alternatives,
+        "candidates": candidate_details,
+        "enumeration_exec_text": str(source.get("enumeration_exec_text") or ""),
+    }
+
+
 def _flagged_candidate_details(
     *,
     candidates: list[dict[str, Any]],
@@ -882,6 +949,17 @@ def _selected_ids_by_mode(*, flags: list[dict[str, Any]]) -> dict[str, set[int]]
         if mode_name != "active":
             grouped[mode_name].update(active_ids)
     return grouped
+
+
+def _parse_number_list(*, text: str) -> list[int]:
+    """Parse a comma-separated integer list stored in typed SQLite columns."""
+
+    values: list[int] = []
+    for raw_item in text.split(","):
+        item = raw_item.strip()
+        if item:
+            values.append(int(item))
+    return values
 
 
 def _cluster_group_payload(
@@ -1353,6 +1431,7 @@ def _tree_meta(
     *,
     key: AttemptKey,
     summary_row: dict[str, Any],
+    diagnostics_row: dict[str, Any] | None,
     nodes: list[dict[str, Any]],
     edges: list[dict[str, Any]],
     node_events: dict[str, list[dict[str, Any]]],
@@ -1374,6 +1453,21 @@ def _tree_meta(
         "x_max": x_max,
         "attempt_slug": key.slug(),
         "is_rl_run": _is_rl_attempt_key(key=key),
+        "diagnostics": _doc_diagnostics_payload(row=diagnostics_row),
+    }
+
+
+def _doc_diagnostics_payload(*, row: dict[str, Any] | None) -> dict[str, Any]:
+    if row is None:
+        return {}
+    payload_json = row.get("payload_json")
+    assert isinstance(payload_json, str), "doc diagnostics payload must be JSON text"
+    payload = json.loads(payload_json)
+    assert isinstance(payload, dict), "doc diagnostics payload must be an object"
+    return {
+        "event_index": int(row["event_index"]),
+        "timestamp_utc": str(row["timestamp_utc"]),
+        **payload,
     }
 
 
@@ -1384,7 +1478,9 @@ def _advantage_by_child_node(
 
 
 def _is_rl_attempt_key(*, key: AttemptKey) -> bool:
-    return key.task_name.startswith("branching_dapo") or key.model_id == "branching_dapo"
+    return (
+        key.task_name.startswith("branching_dapo") or key.model_id == "branching_dapo"
+    )
 
 
 def _summary_row(*, db: EventDatabase, key: AttemptKey) -> dict[str, Any]:
@@ -1439,6 +1535,7 @@ def _rows_by_event(*, rows: list[dict[str, Any]]) -> dict[int, list[dict[str, An
             row.get("pool_event_index")
             or row.get("response_event_index")
             or row.get("selector_event_index")
+            or row.get("decision_event_index")
             or row.get("event_index")
         )
         assert raw_index is not None, "detail rows must include an event index"

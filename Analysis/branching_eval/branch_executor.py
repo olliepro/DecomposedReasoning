@@ -34,13 +34,29 @@ from branching_eval.branch_decode_utils import (
     updated_prompt_token_ids,
 )
 from branching_eval.config_types import BranchingConfig, DecodingConfig
+from branching_eval.branch_scheduler import (
+    ScheduledDecode,
+    ScheduledExpansion,
+    decode_frontier_streaming_async,
+)
 from branching_eval.legacy_steer_rollout import (
     contains_think_close,
     contains_think_close_or_partial,
     is_chat_eos_stop_reason,
 )
 from branching_eval.local_lru import LocalLruCache
+from branching_eval.nonbranch_steer import resolve_nonbranch_steer_continuation_async
 from branching_eval.runtime_types import DecodeOutcome, PathState
+from branching_eval.request_runtime import (
+    RequestStreamState,
+    append_vllm_request_event,
+    append_vllm_response_error_event,
+    append_vllm_response_event,
+    reset_request_stream_state,
+    resolve_prefix_base_delta,
+    set_request_stream_state,
+    update_request_stream_state_output_ids,
+)
 from branching_eval.selector_runtime import (
     resolve_openai_api_key,
     resolve_openrouter_api_key,
@@ -56,6 +72,7 @@ from branching_eval.steer_normalization import (
     exec_choice_boundary_suffix,
     explicit_exec_stop_completion_suffix,
     has_trailing_steer_open_prefix,
+    is_initial_steer_decision_boundary,
     is_steer_decision_boundary,
     normalize_steer_boundary_text,
     selected_candidate_normalization_suffix,
@@ -64,11 +81,9 @@ from branching_eval.steer_normalization import (
 from branching_eval.event_types import EventContext
 from branching_eval.steer_decode_flow import (
     continue_after_think_close_async,
-    continue_with_single_steer_candidate_async,
     prepare_steer_generation_prefix_async,
     resolve_steer_length_outcome_async,
     resolve_think_close_outcome_async,
-    should_branch_at_trigger,
 )
 from branching_eval.tree_runtime_utils import (
     leaf_event_payload,
@@ -98,13 +113,14 @@ from vllm_client import (
 )
 
 INLINE_EPSILON_SELECTOR_MODE: SelectorMode = "embed_diverse_topk_random"
-EXEC_REPEAT_SIMILARITY_THRESHOLD = 0.85
+EXEC_OPEN_TAG = "<exec>"
+EXEC_REPEAT_SIMILARITY_THRESHOLD = 0.90
 EXEC_REPEAT_SIMILARITY_LOOKBACK_WINDOW = 3
-EXEC_REPEAT_TERMINATION_BLOCK_COUNT = 3
+EXEC_REPEAT_TERMINATION_BLOCK_COUNT = 4
 EXEC_REPEAT_STOP_REASON = "repeated_exec_block_loop"
-STEER_REPEAT_SIMILARITY_THRESHOLD = 0.92
+STEER_REPEAT_SIMILARITY_THRESHOLD = 1.0
 STEER_REPEAT_SIMILARITY_LOOKBACK_WINDOW = 3
-STEER_REPEAT_TERMINATION_BLOCK_COUNT = 4
+STEER_REPEAT_TERMINATION_BLOCK_COUNT = 5
 STEER_REPEAT_STOP_REASON = "repeated_steer_block_loop"
 REPEAT_TERMINATION_MIN_GENERATED_TOKENS = 5_000
 BASELINE_REQUEST_KINDS = frozenset(
@@ -113,7 +129,6 @@ BASELINE_REQUEST_KINDS = frozenset(
 STEER_REPETITION_REQUEST_KINDS = frozenset(
     {"candidate_pool_steer_boundary", "steer_single_candidate"}
 )
-ASSISTANT_PREFIX_TAIL_CHARS = 200
 NODE_CHILD_ID_PATTERN = re.compile(
     r"^node_(?P<parent_node_id>.+)_(?P<child_offset>\d+)_(?P<candidate_id>\d+)$"
 )
@@ -125,22 +140,7 @@ TOKENIZE_CACHE_MAX_ENTRIES = 512
 DETOKENIZE_CACHE_MAX_ENTRIES = 256
 
 
-@dataclass(frozen=True)
-class _RequestStreamState:
-    """Previous request state used for token-prefix invariant validation.
-
-    Args:
-        request_id: Previous request id in this stream.
-        input_token_ids: Previous request input token ids.
-        output_token_ids: Previous request output token ids.
-
-    Returns:
-        Dataclass used for per-stream prefix assertions.
-    """
-
-    request_id: str
-    input_token_ids: tuple[int, ...]
-    output_token_ids: tuple[int, ...]
+_RequestStreamState = RequestStreamState
 
 
 @dataclass(frozen=True)
@@ -179,26 +179,6 @@ class _RequestPriority:
 
 
 @dataclass(frozen=True)
-class _ScheduledDecode:
-    """One queued decode state with branching controls.
-
-    Args:
-        state: Decode path state to process.
-        branching_enabled: Whether trigger branching is enabled for this decode.
-        steer_normalization_enabled: Optional steer normalization override.
-        inline_epsilon_enabled: Optional inline epsilon-greedy override.
-
-    Returns:
-        Dataclass used by the streaming scheduler queue.
-    """
-
-    state: PathState
-    branching_enabled: bool = True
-    steer_normalization_enabled: bool | None = None
-    inline_epsilon_enabled: bool | None = None
-
-
-@dataclass(frozen=True)
 class _RepeatTermination:
     """Metadata for one repeated-block forced close."""
 
@@ -206,6 +186,32 @@ class _RepeatTermination:
     block_kind: str
     block_count: int
     last_similarity_ratio: float | None
+
+
+@dataclass(frozen=True)
+class _VerbalizedParsedCandidate:
+    """One option parsed from a verbalized enumeration exec block."""
+
+    option_number: int
+    text: str
+
+
+VERBALIZED_OFF_POLICY_SELECTOR_LABEL = "verbalized_off_policy"
+VERBALIZED_ENUMERATE_TEMPLATE = (
+    "Enumerate {candidate_count} distinct options for the immediate next decision/step"
+)
+VERBALIZED_CONTINUE_TEMPLATE = "Proceed with option {option_number}"
+VERBALIZED_CONTINUE_EXEC_PREFILL_TEMPLATE = "Let's do option {option_number}:"
+OFF_POLICY_MIN_STEER_BOUNDARIES_BETWEEN_TRIGGERS = 5
+VERBALIZED_OPTION_PATTERN = re.compile(
+    r"^\s*(?:#\s*)?(?P<option>\d+)\s*(?:[.)]|:|-)\s*(?P<text>.*)$"
+)
+
+
+def _steer_insertion_separator(*, assistant_prefix: str) -> str:
+    """Return the separator before a synthetic steer insertion."""
+
+    return "" if assistant_prefix.endswith("\n") else "\n"
 
 
 def _append_steer_phase_span(
@@ -226,6 +232,9 @@ def _append_steer_phase_span(
                 or base.steer_phase_token_spans
                 or accumulated_spans
             ),
+            off_policy_token_spans=(
+                continued.off_policy_token_spans or base.off_policy_token_spans
+            ),
         )
     prior_spans = base.steer_phase_token_spans or accumulated_spans
     return replace(
@@ -234,7 +243,47 @@ def _append_steer_phase_span(
             *prior_spans,
             (span_start, span_end),
         ),
+        off_policy_token_spans=(
+            continued.off_policy_token_spans or base.off_policy_token_spans
+        ),
     )
+
+
+def _parse_verbalized_candidates(
+    *, text: str
+) -> tuple[_VerbalizedParsedCandidate, ...]:
+    """Best-effort parse of numbered options from one enumeration exec block."""
+
+    candidates: list[_VerbalizedParsedCandidate] = []
+    current_option: int | None = None
+    current_lines: list[str] = []
+
+    def flush_current() -> None:
+        if current_option is None:
+            return
+        candidate_text = " ".join(" ".join(current_lines).split()).strip()
+        if candidate_text:
+            candidates.append(
+                _VerbalizedParsedCandidate(
+                    option_number=current_option,
+                    text=candidate_text,
+                )
+            )
+
+    for raw_line in text.splitlines():
+        clean_line = CONTROL_TAG_PATTERN.sub("", raw_line).strip()
+        if not clean_line:
+            continue
+        match = VERBALIZED_OPTION_PATTERN.match(clean_line)
+        if match is None:
+            if current_option is not None:
+                current_lines.append(clean_line)
+            continue
+        flush_current()
+        current_option = int(match.group("option"))
+        current_lines = [str(match.group("text")).strip()]
+    flush_current()
+    return tuple(candidates)
 
 
 def _repeat_forced_think_close_prefix(*, text: str) -> str:
@@ -317,24 +366,6 @@ def _repeat_unclosed_tag_suffix(*, text: str, active_tags: tuple[str, ...]) -> s
     return suffix
 
 
-@dataclass(frozen=True)
-class _ScheduledExpansion:
-    """One queued triggered expansion task.
-
-    Args:
-        state: Parent decode state that triggered branching.
-        outcome: Trigger decode outcome used to build branch point metadata.
-        doc_id: Document id used for candidate-pool resolution.
-
-    Returns:
-        Dataclass used by async expansion queue.
-    """
-
-    state: PathState
-    outcome: DecodeOutcome
-    doc_id: int
-
-
 class BranchExecutor:
     """Runs baseline and branching rollouts for one prompt/model pair.
 
@@ -374,7 +405,6 @@ class BranchExecutor:
         seed: int,
         trigger_steer_enabled: bool,
         env_paths: tuple[Path, ...],
-        trigger_entropy_enabled: bool = False,
         on_leaf_completed: Callable[[LeafRollout], LeafRollout] | None = None,
         enable_request_priorities: bool = False,
         branch_task_semaphore: asyncio.Semaphore | None = None,
@@ -382,7 +412,6 @@ class BranchExecutor:
         close_runtime_clients_on_finish: bool = True,
         initial_prompt_token_ids: tuple[int, ...] | None = None,
     ) -> None:
-        _ = trigger_entropy_enabled
         self.client = client
         self.cluster_client = cluster_client
         self.prompt_text = prompt_text
@@ -430,52 +459,6 @@ class BranchExecutor:
         )
         self._selector_http_session: aiohttp.ClientSession | None = None
         self._selector_http_session_loop_id: int | None = None
-
-    def run_standard_rollouts(self, *, rollout_count: int) -> list[LeafRollout]:
-        """Run non-branching baseline rollouts.
-
-        Args:
-            rollout_count: Number of baseline rollouts (`N`).
-
-        Returns:
-            Baseline leaf rollout rows.
-        """
-
-        return asyncio.run(
-            self.run_standard_rollouts_async(rollout_count=rollout_count)
-        )
-
-    def run_structured_rollouts(self, *, rollout_count: int) -> BranchTree:
-        """Run steer/exec-preserving rollouts without any tree branching.
-
-        Args:
-            rollout_count: Number of independent structured rollouts to execute.
-
-        Returns:
-            Tree containing one leaf per structured rollout.
-
-        Example:
-            >>> executor = BranchExecutor.__new__(BranchExecutor)  # doctest: +SKIP
-            >>> _ = executor.run_structured_rollouts(rollout_count=32)  # doctest: +SKIP
-        """
-
-        return asyncio.run(
-            self.run_structured_rollouts_async(rollout_count=rollout_count)
-        )
-
-    def run_epsilon_greedy_rollouts(self, *, rollout_count: int) -> BranchTree:
-        """Run independent epsilon-greedy rollouts with one active path each.
-
-        Args:
-            rollout_count: Number of independent epsilon-greedy rollouts.
-
-        Returns:
-            Tree containing one leaf per epsilon-greedy rollout.
-        """
-
-        return asyncio.run(
-            self.run_epsilon_greedy_rollouts_async(rollout_count=rollout_count)
-        )
 
     def set_event_context(
         self,
@@ -623,9 +606,7 @@ class BranchExecutor:
     async def run_structured_rollouts_async(self, *, rollout_count: int) -> BranchTree:
         """Run steer/exec-preserving rollouts without branching asynchronously."""
 
-        pending_decode: set[asyncio.Task[tuple[_ScheduledDecode, DecodeOutcome]]] = (
-            set()
-        )
+        pending_decode: set[asyncio.Task[tuple[ScheduledDecode, DecodeOutcome]]] = set()
         try:
             tree, scheduled_rollouts = self._initialize_parallel_rollout_tree(
                 rollout_count=rollout_count,
@@ -687,16 +668,27 @@ class BranchExecutor:
         assert context.doc_id is not None, "epsilon-greedy rollouts require doc_id"
         await self._open_selector_http_session_async()
         try:
+            off_policy = self._is_verbalized_off_policy_run()
+            leaf_limit = (
+                rollout_count
+                * (
+                    self.branching.branch_fanout
+                    ** self.branching.max_branch_points_per_rollout
+                )
+                if off_policy
+                else rollout_count
+            )
             tree, scheduled_rollouts = self._initialize_parallel_rollout_tree(
                 rollout_count=rollout_count,
                 branching_enabled=True,
+                leaf_limit=leaf_limit,
             )
             initial_scheduled = [
                 replace(
                     scheduled,
-                    branching_enabled=False,
+                    branching_enabled=off_policy,
                     steer_normalization_enabled=True,
-                    inline_epsilon_enabled=True,
+                    inline_epsilon_enabled=not off_policy,
                 )
                 for scheduled in scheduled_rollouts
             ]
@@ -704,7 +696,7 @@ class BranchExecutor:
                 tree=tree,
                 frontier=[],
                 doc_id=context.doc_id,
-                leaf_limit=rollout_count,
+                leaf_limit=leaf_limit,
                 initial_scheduled=initial_scheduled,
             )
             self._append_tree_event(
@@ -724,8 +716,12 @@ class BranchExecutor:
             await self._close_runtime_http_sessions_async()
 
     def _initialize_parallel_rollout_tree(
-        self, *, rollout_count: int, branching_enabled: bool
-    ) -> tuple[BranchTree, list[_ScheduledDecode]]:
+        self,
+        *,
+        rollout_count: int,
+        branching_enabled: bool,
+        leaf_limit: int | None = None,
+    ) -> tuple[BranchTree, list[ScheduledDecode]]:
         """Create one multi-rollout tree plus one scheduled root per rollout.
 
         Args:
@@ -764,14 +760,17 @@ class BranchExecutor:
         self._append_tree_event(
             tree=tree,
             event_type="rollout_started",
-            payload={"root_node_id": root_node.node_id, "leaf_limit": rollout_count},
+            payload={
+                "root_node_id": root_node.node_id,
+                "leaf_limit": rollout_count if leaf_limit is None else leaf_limit,
+            },
         )
         self._append_tree_event(
             tree=tree,
             event_type="node_created",
             payload=node_event_payload(node=root_node),
         )
-        scheduled_rollouts: list[_ScheduledDecode] = []
+        scheduled_rollouts: list[ScheduledDecode] = []
         for rollout_index in range(rollout_count):
             scheduled_rollouts.append(
                 self._build_parallel_root_decode(
@@ -784,7 +783,7 @@ class BranchExecutor:
 
     def _build_parallel_root_decode(
         self, *, tree: BranchTree, rollout_index: int, branching_enabled: bool
-    ) -> _ScheduledDecode:
+    ) -> ScheduledDecode:
         """Create one independent rollout rooted at the shared prompt.
 
         Args:
@@ -810,7 +809,7 @@ class BranchExecutor:
             event_type="node_created",
             payload=node_event_payload(node=node),
         )
-        return _ScheduledDecode(
+        return ScheduledDecode(
             state=PathState(
                 node_id=node.node_id,
                 assistant_prefix=self.decoding.initial_assistant_prefix,
@@ -821,37 +820,6 @@ class BranchExecutor:
             ),
             branching_enabled=branching_enabled,
             steer_normalization_enabled=True,
-        )
-
-    def run_branching_rollouts(
-        self,
-        *,
-        doc_id: int,
-        doc_attempt: int = 0,
-        task_name: str,
-        model_id: str,
-        leaf_budget: int | None = None,
-    ) -> BranchTree:
-        """Run branching rollout expansion for one document.
-
-        Args:
-            doc_id: Document id.
-            task_name: Task name.
-            model_id: Model id label.
-            leaf_budget: Optional maximum number of realized leaves.
-
-        Returns:
-            Branch tree with candidate pools, branch points, and leaves.
-        """
-
-        return asyncio.run(
-            self.run_branching_rollouts_async(
-                doc_id=doc_id,
-                doc_attempt=doc_attempt,
-                task_name=task_name,
-                model_id=model_id,
-                leaf_budget=leaf_budget,
-            )
         )
 
     async def run_branching_rollouts_async(
@@ -912,44 +880,6 @@ class BranchExecutor:
         finally:
             await self._close_selector_http_session_async()
             await self._close_runtime_http_sessions_async()
-
-    def run_branching_rollouts_from_frontier(
-        self,
-        *,
-        doc_id: int,
-        doc_attempt: int,
-        task_name: str,
-        model_id: str,
-        tree: BranchTree,
-        frontier: list[PathState],
-        leaf_budget: int | None = None,
-    ) -> BranchTree:
-        """Resume branching rollout expansion from replayed in-memory state.
-
-        Args:
-            doc_id: Document id.
-            doc_attempt: Attempt index.
-            task_name: Task name label.
-            model_id: Model id label.
-            tree: Replayed tree state from canonical event log.
-            frontier: Replayed decode frontier to continue.
-            leaf_budget: Optional maximum number of realized leaves.
-
-        Returns:
-            Updated branch tree with resumed expansion appended.
-        """
-
-        return asyncio.run(
-            self.run_branching_rollouts_from_frontier_async(
-                doc_id=doc_id,
-                doc_attempt=doc_attempt,
-                task_name=task_name,
-                model_id=model_id,
-                tree=tree,
-                frontier=frontier,
-                leaf_budget=leaf_budget,
-            )
-        )
 
     async def run_branching_rollouts_from_frontier_async(
         self,
@@ -1025,7 +955,7 @@ class BranchExecutor:
         frontier: list[PathState],
         doc_id: int,
         leaf_limit: int,
-        initial_scheduled: list[_ScheduledDecode] | None = None,
+        initial_scheduled: list[ScheduledDecode] | None = None,
     ) -> None:
         """Decode frontier states as they complete and enqueue children immediately.
 
@@ -1040,88 +970,18 @@ class BranchExecutor:
             None.
         """
 
-        scheduled_frontier = (
-            [_ScheduledDecode(state=state) for state in frontier]
-            if initial_scheduled is None
-            else initial_scheduled
+        await decode_frontier_streaming_async(
+            executor=self,
+            tree=tree,
+            frontier=frontier,
+            doc_id=doc_id,
+            leaf_limit=leaf_limit,
+            initial_scheduled=initial_scheduled,
         )
-        pending_decode: set[asyncio.Task[tuple[_ScheduledDecode, DecodeOutcome]]] = {
-            self._schedule_decode_task(
-                tree=tree,
-                scheduled=scheduled,
-            )
-            for scheduled in scheduled_frontier
-        }
-        pending_expansion: set[asyncio.Task[list[_ScheduledDecode]]] = set()
-        try:
-            while (pending_decode or pending_expansion) and len(
-                tree.leaves
-            ) < leaf_limit:
-                waiting: set[asyncio.Task[Any]] = set(pending_decode)
-                waiting.update(pending_expansion)
-                done, _ = await asyncio.wait(
-                    waiting, return_when=asyncio.FIRST_COMPLETED
-                )
-                for completed in done:
-                    if completed in pending_decode:
-                        pending_decode.remove(
-                            cast(
-                                asyncio.Task[tuple[_ScheduledDecode, DecodeOutcome]],
-                                completed,
-                            )
-                        )
-                        scheduled, outcome = completed.result()
-                        (
-                            next_scheduled,
-                            scheduled_expansion,
-                        ) = self._handle_state_outcome(
-                            tree=tree,
-                            scheduled=scheduled,
-                            outcome=outcome,
-                            doc_id=doc_id,
-                            leaf_limit=leaf_limit,
-                        )
-                        if len(tree.leaves) >= leaf_limit:
-                            break
-                        for child in next_scheduled:
-                            pending_decode.add(
-                                self._schedule_decode_task(
-                                    tree=tree,
-                                    scheduled=child,
-                                )
-                            )
-                        if scheduled_expansion is not None:
-                            pending_expansion.add(
-                                self._schedule_expansion_task(
-                                    tree=tree,
-                                    scheduled=scheduled_expansion,
-                                )
-                            )
-                        continue
-                    pending_expansion.remove(
-                        cast(asyncio.Task[list[_ScheduledDecode]], completed)
-                    )
-                    next_scheduled = completed.result()
-                    if len(tree.leaves) >= leaf_limit:
-                        break
-                    for child in next_scheduled:
-                        pending_decode.add(
-                            self._schedule_decode_task(
-                                tree=tree,
-                                scheduled=child,
-                            )
-                        )
-                if len(tree.leaves) >= leaf_limit:
-                    break
-        finally:
-            await self._cancel_pending_scheduler_tasks(
-                pending_decode=pending_decode,
-                pending_expansion=pending_expansion,
-            )
 
     def _schedule_decode_task(
-        self, *, tree: BranchTree, scheduled: _ScheduledDecode
-    ) -> asyncio.Task[tuple[_ScheduledDecode, DecodeOutcome]]:
+        self, *, tree: BranchTree, scheduled: ScheduledDecode
+    ) -> asyncio.Task[tuple[ScheduledDecode, DecodeOutcome]]:
         """Create one async decode task for the streaming scheduler queue.
 
         Args:
@@ -1137,8 +997,8 @@ class BranchExecutor:
         )
 
     async def _decode_state_outcome_async(
-        self, *, tree: BranchTree, scheduled: _ScheduledDecode
-    ) -> tuple[_ScheduledDecode, DecodeOutcome]:
+        self, *, tree: BranchTree, scheduled: ScheduledDecode
+    ) -> tuple[ScheduledDecode, DecodeOutcome]:
         """Decode one scheduled state and return `(scheduled, outcome)` pair."""
 
         semaphore = self._ensure_branch_task_semaphore()
@@ -1162,15 +1022,15 @@ class BranchExecutor:
                 )
         return scheduled, outcome
 
-    def _handle_state_outcome(
+    async def _handle_state_outcome(
         self,
         *,
         tree: BranchTree,
-        scheduled: _ScheduledDecode,
+        scheduled: ScheduledDecode,
         outcome: DecodeOutcome,
         doc_id: int,
         leaf_limit: int,
-    ) -> tuple[list[_ScheduledDecode], _ScheduledExpansion | None]:
+    ) -> tuple[list[ScheduledDecode], ScheduledExpansion | None]:
         """Persist one decode outcome and return scheduler work queues.
 
         Args:
@@ -1206,13 +1066,13 @@ class BranchExecutor:
                     "trigger_type": str(outcome.trigger_type),
                 },
             )
-            resumed_state = self._state_ready_for_branch_disabled_resume(
+            resumed_state = await self._state_ready_for_branch_disabled_resume_async(
                 state=state,
                 outcome=outcome,
             )
             return (
                 [
-                    _ScheduledDecode(
+                    ScheduledDecode(
                         state=resumed_state,
                         branching_enabled=False,
                         steer_normalization_enabled=True,
@@ -1236,7 +1096,7 @@ class BranchExecutor:
         )
         if len(tree.leaves) >= leaf_limit:
             return [], None
-        return [], _ScheduledExpansion(
+        return [], ScheduledExpansion(
             state=state,
             outcome=outcome,
             doc_id=doc_id,
@@ -1246,8 +1106,8 @@ class BranchExecutor:
         self,
         *,
         tree: BranchTree,
-        scheduled: _ScheduledExpansion,
-    ) -> asyncio.Task[list[_ScheduledDecode]]:
+        scheduled: ScheduledExpansion,
+    ) -> asyncio.Task[list[ScheduledDecode]]:
         """Create one async expansion task for triggered branch handling."""
 
         return asyncio.create_task(
@@ -1261,8 +1121,8 @@ class BranchExecutor:
         self,
         *,
         tree: BranchTree,
-        scheduled: _ScheduledExpansion,
-    ) -> list[_ScheduledDecode]:
+        scheduled: ScheduledExpansion,
+    ) -> list[ScheduledDecode]:
         """Expand one triggered decode outcome and return child decode work."""
 
         semaphore = self._ensure_branch_task_semaphore()
@@ -1272,13 +1132,13 @@ class BranchExecutor:
                 branchable=[(scheduled.state, scheduled.outcome)],
                 doc_id=scheduled.doc_id,
             )
-        return [_ScheduledDecode(state=child_state) for child_state in child_states]
+        return [ScheduledDecode(state=child_state) for child_state in child_states]
 
     async def _cancel_pending_scheduler_tasks(
         self,
         *,
-        pending_decode: set[asyncio.Task[tuple[_ScheduledDecode, DecodeOutcome]]],
-        pending_expansion: set[asyncio.Task[list[_ScheduledDecode]]],
+        pending_decode: set[asyncio.Task[tuple[ScheduledDecode, DecodeOutcome]]],
+        pending_expansion: set[asyncio.Task[list[ScheduledDecode]]],
     ) -> None:
         """Cancel and drain all pending scheduler tasks."""
 
@@ -1361,69 +1221,6 @@ class BranchExecutor:
         assert leaf_budget > 0, "leaf_budget must be positive when provided"
         return min(int(leaf_budget), max_leaf_limit)
 
-    async def _decode_frontier_batch_async(
-        self,
-        *,
-        tree: BranchTree,
-        frontier: list[PathState],
-        doc_id: int,
-        leaf_limit: int,
-    ) -> list[PathState]:
-        """Decode one frontier wave concurrently and expand triggered branches."""
-
-        outcomes = await asyncio.gather(
-            *[
-                self._decode_until_event_async(tree=tree, state=state)
-                for state in frontier
-            ]
-        )
-        branchable: list[tuple[PathState, DecodeOutcome]] = []
-        maxed: list[tuple[PathState, DecodeOutcome]] = []
-        for state, outcome in zip(frontier, outcomes):
-            if outcome.event_type == "terminated":
-                self._append_leaf_if_room(
-                    tree=tree,
-                    leaf=leaf_from_outcome(outcome=outcome, state=state),
-                    leaf_limit=leaf_limit,
-                )
-                continue
-            if state.branch_points_used >= self.branching.max_branch_points_per_rollout:
-                self._append_tree_event(
-                    tree=tree,
-                    event_type="trigger_skipped_max_branch_points",
-                    payload={
-                        "node_id": state.node_id,
-                        "trigger_type": str(outcome.trigger_type),
-                    },
-                )
-                maxed.append((state, outcome))
-                continue
-            self._append_tree_event(
-                tree=tree,
-                event_type="trigger_fired",
-                payload={
-                    "node_id": state.node_id,
-                    "trigger_type": str(outcome.trigger_type),
-                    "generated_tokens": outcome.generated_tokens,
-                },
-            )
-            branchable.append((state, outcome))
-        if len(tree.leaves) >= leaf_limit:
-            return []
-        if maxed:
-            await self._resume_maxed_states_async(
-                tree=tree,
-                maxed=maxed,
-                leaf_limit=leaf_limit,
-            )
-        if len(tree.leaves) >= leaf_limit or not branchable:
-            return []
-        return await self._expand_branchable_states_async(
-            tree=tree,
-            branchable=branchable,
-            doc_id=doc_id,
-        )
-
     def _append_leaf_if_room(
         self,
         *,
@@ -1468,80 +1265,6 @@ class BranchExecutor:
             updated_leaf.node_id == leaf.node_id
         ), "leaf completion hook must preserve node_id"
         return updated_leaf
-
-    def _append_malformed_steer_decision_event(
-        self,
-        *,
-        tree: BranchTree,
-        node_id: str,
-        source: str,
-        assistant_prefix: str,
-        stop_reason: str = "missing_steer_or_think_close",
-        candidate_id: int | None = None,
-        candidate_text: str = "",
-    ) -> None:
-        """Log a malformed post-exec steer-decision termination."""
-
-        payload: dict[str, object] = {
-            "node_id": node_id,
-            "source": source,
-            "stop_reason": stop_reason,
-            "assistant_prefix_tail": assistant_prefix[-ASSISTANT_PREFIX_TAIL_CHARS:],
-        }
-        if candidate_id is not None:
-            payload["candidate_id"] = candidate_id
-        if candidate_text:
-            payload["candidate_text"] = candidate_text
-        self._append_tree_event(
-            tree=tree,
-            event_type="malformed_steer_decision",
-            payload=payload,
-        )
-
-    def _append_malformed_steer_decision_if_needed(
-        self,
-        *,
-        tree: BranchTree,
-        node_id: str,
-        source: str,
-        assistant_prefix: str,
-        outcome: DecodeOutcome,
-    ) -> None:
-        """Log malformed post-exec steer-decision termination outcomes."""
-
-        if outcome.stop_reason != "missing_steer_or_think_close":
-            return
-        candidate_text = ""
-        if outcome.assistant_prefix.startswith(assistant_prefix):
-            candidate_text = outcome.assistant_prefix[len(assistant_prefix) :]
-        self._append_malformed_steer_decision_event(
-            tree=tree,
-            node_id=node_id,
-            source=source,
-            assistant_prefix=assistant_prefix,
-            stop_reason=outcome.stop_reason,
-            candidate_text=candidate_text,
-        )
-
-    def _state_ready_for_branch_disabled_resume(
-        self, *, state: PathState, outcome: DecodeOutcome
-    ) -> PathState:
-        """Return a resumed state that cannot decode through a steer boundary."""
-
-        resumed_state = self._state_from_outcome(state=state, outcome=outcome)
-        if not self._needs_explicit_exec_stop_completion(outcome=outcome):
-            return resumed_state
-        completed_prefix, completed_prompt_ids = (
-            self._append_explicit_steer_stop_prefix(
-                assistant_prefix=resumed_state.assistant_prefix,
-                prompt_token_ids=resumed_state.prompt_token_ids,
-            )
-        )
-        return replace(
-            resumed_state,
-            assistant_prefix=completed_prefix,
-            prompt_token_ids=completed_prompt_ids,
-        )
 
     async def _state_ready_for_branch_disabled_resume_async(
         self, *, state: PathState, outcome: DecodeOutcome
@@ -1616,6 +1339,17 @@ class BranchExecutor:
     ) -> list[PathState]:
         """Resolve pools/selectors for triggered states and return next frontier."""
 
+        if self._is_verbalized_off_policy_run():
+            next_frontier: list[PathState] = []
+            for state, outcome in branchable:
+                expanded = await self._expand_verbalized_sampling_state_async(
+                    tree=tree,
+                    state=state,
+                    outcome=outcome,
+                )
+                next_frontier.extend(expanded)
+            return next_frontier
+
         pool_results = await asyncio.gather(
             *[
                 self._resolve_candidate_pool_async(
@@ -1639,6 +1373,397 @@ class BranchExecutor:
             )
             next_frontier.extend(expanded)
         return next_frontier
+
+    def _is_verbalized_off_policy_run(self) -> bool:
+        """Return whether this executor should use verbalized off-policy branching."""
+
+        return bool(self.branching.verbalized_off_policy_enabled)
+
+    def _sample_off_policy_candidate_count(self) -> int:
+        """Uniformly sample the number of verbalized options for one trigger."""
+
+        return self.random.randint(
+            self.branching.off_policy_min_candidates,
+            self.branching.off_policy_max_candidates,
+        )
+
+    async def _expand_verbalized_sampling_state_async(
+        self,
+        *,
+        tree: BranchTree,
+        state: PathState,
+        outcome: DecodeOutcome,
+    ) -> list[PathState]:
+        """Generate one verbalized candidate list, then branch by option number."""
+
+        assert outcome.trigger_type == "steer_boundary"
+        candidate_count = self._sample_off_policy_candidate_count()
+        branch_fanout = self.branching.branch_fanout
+        assert branch_fanout <= candidate_count, (
+            "epsilon_greedy_off_policy requires branch_fanout <= "
+            "sampled off-policy candidate count"
+        )
+        candidate_pool_id = self._next_candidate_pool_id()
+        branch_point_id = f"bp_{state.node_id}_{candidate_pool_id}"
+        enumeration_outcome, enumeration_text = (
+            await self._verbalized_enumeration_outcome_async(
+                state=state,
+                outcome=outcome,
+                branch_point_id=branch_point_id,
+                candidate_count=candidate_count,
+            )
+        )
+        parsed_candidates = _parse_verbalized_candidates(text=enumeration_text)
+        sampled_options = tuple(
+            self.random.sample(range(1, candidate_count + 1), k=branch_fanout)
+        )
+        tree.branch_points.append(
+            BranchPointRecord(
+                branch_point_id=branch_point_id,
+                node_id=state.node_id,
+                trigger_type=str(outcome.trigger_type),
+                candidate_pool_id=candidate_pool_id,
+                selections=(
+                    SelectionOutcome(
+                        selector_mode=self.active_selector,
+                        selected_candidate_ids=sampled_options,
+                        shortlist_candidate_ids=sampled_options,
+                    ),
+                ),
+            )
+        )
+        self._append_verbalized_sampling_event(
+            tree=tree,
+            node_id=state.node_id,
+            branch_point_id=branch_point_id,
+            candidate_pool_id=candidate_pool_id,
+            candidate_count=candidate_count,
+            sampled_options=sampled_options,
+            enumeration_text=enumeration_text,
+            parsed_candidates=parsed_candidates,
+        )
+        if branch_fanout == 1:
+            return [
+                await self._verbalized_inline_state_async(
+                    state=state,
+                    outcome=enumeration_outcome,
+                    branch_point_id=branch_point_id,
+                    option_number=sampled_options[0],
+                )
+            ]
+        return [
+            await self._verbalized_child_state_async(
+                tree=tree,
+                parent_state=state,
+                outcome=enumeration_outcome,
+                branch_point_id=branch_point_id,
+                candidate_pool_id=candidate_pool_id,
+                child_offset=child_offset,
+                option_number=option_number,
+            )
+            for child_offset, option_number in enumerate(sampled_options)
+        ]
+
+    async def _verbalized_enumeration_outcome_async(
+        self,
+        *,
+        state: PathState,
+        outcome: DecodeOutcome,
+        branch_point_id: str,
+        candidate_count: int,
+    ) -> tuple[DecodeOutcome, str]:
+        """Append the enumerate steer and generate one enumeration exec."""
+
+        instruction = VERBALIZED_ENUMERATE_TEMPLATE.format(
+            candidate_count=candidate_count
+        )
+        separator = _steer_insertion_separator(
+            assistant_prefix=outcome.assistant_prefix
+        )
+        suffix = (
+            f"{separator}{STEER_OPEN_TAG}{instruction}{STEER_CLOSE_TAG}\n"
+            f"{EXEC_OPEN_TAG}"
+        )
+        prompted, _ = await self._append_off_policy_suffix_to_outcome_async(
+            outcome=outcome,
+            suffix_text=suffix,
+            context="verbalized_sampling_enumerate_steer",
+        )
+        request_budget = self._request_token_budget(
+            prompt_token_ids=prompted.prompt_token_ids,
+            generated_tokens=prompted.generated_tokens,
+        )
+        if request_budget.max_tokens <= 0:
+            return prompted, ""
+        choice = await self._generate_choice_async(
+            assistant_prefix=prompted.assistant_prefix,
+            prompt_token_ids=prompted.prompt_token_ids,
+            max_tokens=min(
+                self.decoding.decode_chunk_tokens, request_budget.max_tokens
+            ),
+            stop=rollout_stop_markers(
+                steer_enabled=True,
+                use_full_stop_strings=self.branching.use_full_stop_strings,
+            ),
+            n=1,
+            request_kind="verbalized_sampling_enumeration",
+            request_stream_id=f"decode:{state.node_id}",
+            enforce_prefix_chain=False,
+        )
+        choice = truncate_choice_at_chat_eos(choice=choice)
+        if not choice_has_generated_content(choice=choice):
+            enumeration_outcome = prompted
+            enumeration_text = ""
+        else:
+            enumeration_outcome = self._append_choice_to_outcome(
+                outcome=prompted,
+                choice=choice,
+            )
+            enumeration_text = str(choice.text)
+        close_suffix = explicit_exec_stop_completion_suffix(
+            text=enumeration_outcome.assistant_prefix
+        )
+        enumeration_outcome, _ = await self._append_off_policy_suffix_to_outcome_async(
+            outcome=enumeration_outcome,
+            suffix_text=close_suffix,
+            context=f"verbalized_sampling_exec_close:{branch_point_id}",
+        )
+        return enumeration_outcome, enumeration_text
+
+    def _append_choice_to_outcome(
+        self, *, outcome: DecodeOutcome, choice: GenerationChoice
+    ) -> DecodeOutcome:
+        """Return outcome after appending one model-generated choice."""
+
+        candidate = candidate_from_choice(candidate_id=0, choice=choice)
+        token_ids = tuple(outcome.token_ids) + tuple(candidate.token_ids)
+        return replace(
+            outcome,
+            event_type="continued",
+            trigger_type=None,
+            assistant_prefix=outcome.assistant_prefix + candidate.text,
+            prompt_token_ids=append_prompt_token_ids(
+                prompt_token_ids=outcome.prompt_token_ids,
+                continuation_token_ids=candidate.token_ids,
+            ),
+            token_ids=token_ids,
+            token_traces=tuple(outcome.token_traces) + tuple(candidate.tokens),
+            generated_tokens=len(token_ids),
+            stop_reason="",
+        )
+
+    async def _append_off_policy_suffix_to_outcome_async(
+        self, *, outcome: DecodeOutcome, suffix_text: str, context: str
+    ) -> tuple[DecodeOutcome, tuple[int, ...]]:
+        """Append a synthetic suffix and mark its token span off-policy."""
+
+        span_start = len(outcome.token_ids)
+        (
+            assistant_prefix,
+            prompt_token_ids,
+            token_ids,
+            token_traces,
+            generated_tokens,
+            suffix_token_ids,
+        ) = await self._append_synthetic_suffix_to_decode_state_async(
+            assistant_prefix=outcome.assistant_prefix,
+            prompt_token_ids=outcome.prompt_token_ids,
+            token_ids=outcome.token_ids,
+            token_traces=outcome.token_traces,
+            generated_tokens=outcome.generated_tokens,
+            suffix_text=suffix_text,
+            context=context,
+        )
+        off_policy_spans = outcome.off_policy_token_spans
+        if len(token_ids) > span_start:
+            off_policy_spans = (*off_policy_spans, (span_start, len(token_ids)))
+        return (
+            replace(
+                outcome,
+                event_type="continued",
+                trigger_type=None,
+                assistant_prefix=assistant_prefix,
+                prompt_token_ids=prompt_token_ids,
+                token_ids=token_ids,
+                token_traces=token_traces,
+                generated_tokens=generated_tokens,
+                stop_reason="",
+                off_policy_token_spans=off_policy_spans,
+            ),
+            suffix_token_ids,
+        )
+
+    async def _verbalized_inline_state_async(
+        self,
+        *,
+        state: PathState,
+        outcome: DecodeOutcome,
+        branch_point_id: str,
+        option_number: int,
+    ) -> PathState:
+        """Append one verbalized option choice without creating a child branch."""
+
+        instruction = VERBALIZED_CONTINUE_TEMPLATE.format(option_number=option_number)
+        exec_prefill = VERBALIZED_CONTINUE_EXEC_PREFILL_TEMPLATE.format(
+            option_number=option_number
+        )
+        separator = _steer_insertion_separator(
+            assistant_prefix=outcome.assistant_prefix
+        )
+        suffix = (
+            f"{separator}{STEER_OPEN_TAG}{instruction}{STEER_CLOSE_TAG}\n"
+            f"{EXEC_OPEN_TAG}{exec_prefill}"
+        )
+        continued, _ = await self._append_off_policy_suffix_to_outcome_async(
+            outcome=outcome,
+            suffix_text=suffix,
+            context=f"verbalized_sampling_inline:{branch_point_id}:{option_number}",
+        )
+        self._reset_request_stream_state(request_stream_id=f"decode:{state.node_id}")
+        return PathState(
+            node_id=state.node_id,
+            assistant_prefix=continued.assistant_prefix,
+            prompt_token_ids=continued.prompt_token_ids,
+            token_ids=continued.token_ids,
+            token_traces=continued.token_traces,
+            branch_points_used=state.branch_points_used,
+            off_policy_steer_boundaries_since_trigger=0,
+            off_policy_trigger_seen=True,
+            steer_phase_token_spans=continued.steer_phase_token_spans,
+            off_policy_token_spans=continued.off_policy_token_spans,
+        )
+
+    async def _verbalized_child_state_async(
+        self,
+        *,
+        tree: BranchTree,
+        parent_state: PathState,
+        outcome: DecodeOutcome,
+        branch_point_id: str,
+        candidate_pool_id: str,
+        child_offset: int,
+        option_number: int,
+    ) -> PathState:
+        """Create one child path for a chosen verbalized option."""
+
+        instruction = VERBALIZED_CONTINUE_TEMPLATE.format(option_number=option_number)
+        exec_prefill = VERBALIZED_CONTINUE_EXEC_PREFILL_TEMPLATE.format(
+            option_number=option_number
+        )
+        separator = _steer_insertion_separator(
+            assistant_prefix=outcome.assistant_prefix
+        )
+        suffix = (
+            f"{separator}{STEER_OPEN_TAG}{instruction}{STEER_CLOSE_TAG}\n"
+            f"{EXEC_OPEN_TAG}{exec_prefill}"
+        )
+        child_outcome, suffix_token_ids = (
+            await self._append_off_policy_suffix_to_outcome_async(
+                outcome=outcome,
+                suffix_text=suffix,
+                context=f"verbalized_sampling_continue:{branch_point_id}:{option_number}",
+            )
+        )
+        child_node_id = f"node_{parent_state.node_id}_{child_offset}_{option_number}"
+        child_state = PathState(
+            node_id=child_node_id,
+            assistant_prefix=child_outcome.assistant_prefix,
+            prompt_token_ids=child_outcome.prompt_token_ids,
+            token_ids=child_outcome.token_ids,
+            token_traces=child_outcome.token_traces,
+            branch_points_used=parent_state.branch_points_used + 1,
+            off_policy_steer_boundaries_since_trigger=0,
+            off_policy_trigger_seen=True,
+            steer_phase_token_spans=child_outcome.steer_phase_token_spans,
+            off_policy_token_spans=child_outcome.off_policy_token_spans,
+        )
+        tree.add_node(
+            node=TreeNode(
+                node_id=child_node_id,
+                parent_node_id=parent_state.node_id,
+                prompt_text=self.prompt_text,
+                assistant_prefix=child_state.assistant_prefix,
+                prompt_token_ids=child_state.prompt_token_ids,
+                branch_points_used=child_state.branch_points_used,
+                branch_token_offset=len(child_state.token_ids),
+            )
+        )
+        edge = TreeEdge(
+            edge_id=f"edge_{parent_state.node_id}_{child_node_id}",
+            parent_node_id=parent_state.node_id,
+            child_node_id=child_node_id,
+            candidate_pool_id=candidate_pool_id,
+            candidate_id=option_number,
+            selector_mode=VERBALIZED_OFF_POLICY_SELECTOR_LABEL,
+        )
+        tree.edges.append(edge)
+        self._append_tree_event(
+            tree=tree,
+            event_type="node_created",
+            payload={
+                "node_id": child_node_id,
+                "parent_node_id": parent_state.node_id,
+                "branch_points_used": child_state.branch_points_used,
+            },
+        )
+        self._append_tree_event(
+            tree=tree,
+            event_type="edge_selected",
+            payload={
+                "edge_id": edge.edge_id,
+                "parent_node_id": edge.parent_node_id,
+                "child_node_id": edge.child_node_id,
+                "candidate_pool_id": edge.candidate_pool_id,
+                "candidate_id": edge.candidate_id,
+                "selector_mode": edge.selector_mode,
+                "candidate_text_normalized": suffix,
+                "candidate_token_ids_normalized": list(suffix_token_ids),
+            },
+        )
+        return child_state
+
+    def _append_verbalized_sampling_event(
+        self,
+        *,
+        tree: BranchTree,
+        node_id: str,
+        branch_point_id: str,
+        candidate_pool_id: str,
+        candidate_count: int,
+        sampled_options: tuple[int, ...],
+        enumeration_text: str,
+        parsed_candidates: tuple[_VerbalizedParsedCandidate, ...],
+    ) -> None:
+        """Append viewer/runtime details for one verbalized sampling decision."""
+
+        parsed_rows = [
+            {
+                "option_number": candidate.option_number,
+                "text": candidate.text,
+                "selected": candidate.option_number in set(sampled_options),
+            }
+            for candidate in parsed_candidates
+        ]
+        parse_status = (
+            "complete"
+            if len(parsed_candidates) >= candidate_count
+            else "partial" if parsed_candidates else "empty"
+        )
+        self._append_tree_event(
+            tree=tree,
+            event_type="verbalized_sampling_applied",
+            payload={
+                "branch_point_id": branch_point_id,
+                "candidate_pool_id": candidate_pool_id,
+                "node_id": node_id,
+                "candidate_count": candidate_count,
+                "branch_fanout": len(sampled_options),
+                "sampled_option_numbers": list(sampled_options),
+                "parse_status": parse_status,
+                "enumeration_exec_text": enumeration_text,
+                "candidates": parsed_rows,
+            },
+        )
 
     def _record_branch_point(
         self,
@@ -1926,45 +2051,16 @@ class BranchExecutor:
             candidate_token_ids = tuple(
                 await self._tokenize_text_async(text=candidate_text)
             )
-        if not steer_candidate_has_decision_tag(
+        if steer_candidate_has_decision_tag(
             prefix=outcome.assistant_prefix,
             candidate_text=candidate_text,
         ):
-            span_start = len(outcome.token_ids)
-            updated_token_ids = tuple(outcome.token_ids) + candidate_token_ids
-            updated_prompt_ids = append_prompt_token_ids(
-                prompt_token_ids=outcome.prompt_token_ids,
-                continuation_token_ids=candidate_token_ids,
+            candidate_text, candidate_token_ids = (
+                await self._normalized_child_candidate_async(
+                    trigger_type=pool.trigger_type,
+                    candidate=candidate,
+                )
             )
-            self._append_malformed_steer_decision_event(
-                tree=tree,
-                node_id=state.node_id,
-                source="inline_selection",
-                assistant_prefix=outcome.assistant_prefix + candidate_text,
-                candidate_id=candidate_id,
-                candidate_text=candidate_text,
-            )
-            return DecodeOutcome(
-                event_type="terminated",
-                trigger_type=None,
-                assistant_prefix=outcome.assistant_prefix + candidate_text,
-                prompt_token_ids=updated_prompt_ids,
-                token_ids=updated_token_ids,
-                token_traces=tuple(outcome.token_traces) + tuple(candidate.tokens),
-                generated_tokens=len(updated_token_ids),
-                stop_reason="missing_steer_or_think_close",
-                branch_points_used=state.branch_points_used,
-                steer_phase_token_spans=(
-                    *outcome.steer_phase_token_spans,
-                    (span_start, len(updated_token_ids)),
-                ),
-            )
-        candidate_text, candidate_token_ids = (
-            await self._normalized_child_candidate_async(
-                trigger_type=pool.trigger_type,
-                candidate=candidate,
-            )
-        )
         span_start = len(outcome.token_ids)
         updated_generated_tokens = len(outcome.token_ids) + len(candidate_token_ids)
         continued = DecodeOutcome(
@@ -1984,6 +2080,7 @@ class BranchExecutor:
                 *outcome.steer_phase_token_spans,
                 (span_start, updated_generated_tokens),
             ),
+            off_policy_token_spans=outcome.off_policy_token_spans,
         )
         self._reset_request_stream_state(request_stream_id=f"decode:{state.node_id}")
         self._append_inline_selection_event(
@@ -2009,54 +2106,15 @@ class BranchExecutor:
     ) -> DecodeOutcome:
         """Return inline epsilon or legacy single-candidate continuation."""
 
-        if not self._should_use_inline_epsilon(
-            inline_epsilon_enabled=(
-                branching_enabled
-                if inline_epsilon_enabled is None
-                else inline_epsilon_enabled
-            )
-        ):
-            return await continue_with_single_steer_candidate_async(
-                executor=self,
-                assistant_prefix=trigger_outcome.assistant_prefix,
-                prompt_token_ids=trigger_outcome.prompt_token_ids,
-                token_ids=trigger_outcome.token_ids,
-                token_traces=trigger_outcome.token_traces,
-                generated_tokens=trigger_outcome.generated_tokens,
-                request_stream_id=f"decode:{state.node_id}",
-            )
-        candidate_token_budget = await self._candidate_token_budget_async(
-            trigger_type="steer_boundary",
-            generated_tokens=trigger_outcome.generated_tokens,
-        )
-        if candidate_token_budget <= 0:
-            return DecodeOutcome(
-                event_type="terminated",
-                trigger_type=None,
-                assistant_prefix=trigger_outcome.assistant_prefix,
-                prompt_token_ids=trigger_outcome.prompt_token_ids,
-                token_ids=trigger_outcome.token_ids,
-                token_traces=trigger_outcome.token_traces,
-                generated_tokens=trigger_outcome.generated_tokens,
-                stop_reason="max_gen_toks_reached",
-                branch_points_used=state.branch_points_used,
-            )
-        context = self._require_event_context()
-        assert context.doc_id is not None, "inline epsilon continuation requires doc_id"
-        pool = await self._resolve_candidate_pool_async(
-            doc_id=context.doc_id,
-            state=state,
-            trigger_type="steer_boundary",
-            assistant_prefix=trigger_outcome.assistant_prefix,
-            prompt_token_ids=trigger_outcome.prompt_token_ids,
-            generated_tokens=trigger_outcome.generated_tokens,
-        )
-        return await self._continue_triggered_state_inline_async(
+        result = await resolve_nonbranch_steer_continuation_async(
+            executor=self,
             tree=tree,
             state=state,
-            outcome=trigger_outcome,
-            pool=pool,
+            trigger_outcome=trigger_outcome,
+            branching_enabled=branching_enabled,
+            inline_epsilon_enabled=inline_epsilon_enabled,
         )
+        return result.outcome
 
     def _selected_ids_for_branch(
         self,
@@ -2093,14 +2151,14 @@ class BranchExecutor:
         selected_ids: tuple[int, ...],
         max_count: int,
     ) -> tuple[int, ...]:
-        """Deduplicate steer selections and avoid replacement by text/id.
+        """Prefer unique steer texts, then backfill to full branch fanout.
 
         Args:
             pool: Steer-trigger candidate pool.
             selected_ids: Selector-produced candidate ids.
 
         Returns:
-            Up to `branch_fanout` unique steer candidate ids.
+            Exactly `branch_fanout` candidate ids when the pool is non-empty.
         """
 
         candidates_by_id = {
@@ -2122,8 +2180,6 @@ class BranchExecutor:
             seen_texts.add(candidate.text)
             if len(deduped) >= max_count:
                 break
-        if self.active_selector == "embed_diverse_topk_random":
-            return tuple(deduped)
         if len(deduped) >= max_count:
             return tuple(deduped)
         for candidate in pool.candidates:
@@ -2136,6 +2192,22 @@ class BranchExecutor:
             seen_texts.add(candidate.text)
             if len(deduped) >= max_count:
                 break
+        if len(deduped) >= max_count:
+            return tuple(deduped)
+        for candidate in pool.candidates:
+            if candidate.candidate_id in seen_ids:
+                continue
+            deduped.append(candidate.candidate_id)
+            seen_ids.add(candidate.candidate_id)
+            if len(deduped) >= max_count:
+                break
+        if len(deduped) >= max_count or not pool.candidates:
+            return tuple(deduped)
+        pool_ids = tuple(candidate.candidate_id for candidate in pool.candidates)
+        backfill_index = 0
+        while len(deduped) < max_count:
+            deduped.append(pool_ids[backfill_index % len(pool_ids)])
+            backfill_index += 1
         return tuple(deduped)
 
     async def _expand_children_async(
@@ -2165,116 +2237,19 @@ class BranchExecutor:
                 candidate_decision_token_ids = tuple(
                     await self._tokenize_text_async(text=candidate_decision_text)
                 )
-            if not steer_candidate_has_decision_tag(
+            if steer_candidate_has_decision_tag(
                 prefix=outcome.assistant_prefix,
                 candidate_text=candidate_decision_text,
             ):
-                child_node_id = (
-                    f"node_{parent_state.node_id}_{child_offset}_{candidate_id}"
-                )
-                child_prefix = outcome.assistant_prefix + candidate_decision_text
-                child_prompt_token_ids = append_prompt_token_ids(
-                    prompt_token_ids=outcome.prompt_token_ids,
-                    continuation_token_ids=candidate_decision_token_ids,
-                )
-                child_token_ids = (
-                    tuple(outcome.token_ids) + candidate_decision_token_ids
-                )
-                child_token_traces = tuple(outcome.token_traces) + tuple(
-                    candidate.tokens
-                )
-                span_start = len(outcome.token_ids)
-                child_steer_spans = (
-                    *outcome.steer_phase_token_spans,
-                    (span_start, len(child_token_ids)),
-                )
-                child_state = PathState(
-                    node_id=child_node_id,
-                    assistant_prefix=child_prefix,
-                    prompt_token_ids=child_prompt_token_ids,
-                    token_ids=child_token_ids,
-                    token_traces=child_token_traces,
-                    branch_points_used=parent_state.branch_points_used + 1,
-                    steer_phase_token_spans=child_steer_spans,
-                )
-                tree.add_node(
-                    node=TreeNode(
-                        node_id=child_node_id,
-                        parent_node_id=parent_state.node_id,
-                        prompt_text=self.prompt_text,
-                        assistant_prefix=child_state.assistant_prefix,
-                        prompt_token_ids=child_state.prompt_token_ids,
-                        branch_points_used=child_state.branch_points_used,
+                candidate_text, candidate_token_ids = (
+                    await self._normalized_child_candidate_async(
+                        trigger_type=pool.trigger_type,
+                        candidate=candidate,
                     )
                 )
-                edge = TreeEdge(
-                    edge_id=f"edge_{parent_state.node_id}_{child_node_id}",
-                    parent_node_id=parent_state.node_id,
-                    child_node_id=child_node_id,
-                    candidate_pool_id=pool.candidate_pool_id,
-                    candidate_id=candidate.candidate_id,
-                    selector_mode=self.active_selector,
-                )
-                tree.edges.append(edge)
-                self._append_tree_event(
-                    tree=tree,
-                    event_type="node_created",
-                    payload={
-                        "node_id": child_node_id,
-                        "parent_node_id": parent_state.node_id,
-                        "branch_points_used": child_state.branch_points_used,
-                    },
-                )
-                self._append_tree_event(
-                    tree=tree,
-                    event_type="edge_selected",
-                    payload={
-                        "edge_id": edge.edge_id,
-                        "parent_node_id": edge.parent_node_id,
-                        "child_node_id": edge.child_node_id,
-                        "candidate_pool_id": edge.candidate_pool_id,
-                        "candidate_id": edge.candidate_id,
-                        "selector_mode": edge.selector_mode,
-                        "candidate_text_normalized": candidate_decision_text,
-                        "candidate_token_ids_normalized": list(
-                            candidate_decision_token_ids
-                        ),
-                    },
-                )
-                self._append_malformed_steer_decision_event(
-                    tree=tree,
-                    node_id=child_node_id,
-                    source="branch_selection",
-                    assistant_prefix=child_prefix,
-                    candidate_id=candidate_id,
-                    candidate_text=candidate_decision_text,
-                )
-                terminal_outcome = DecodeOutcome(
-                    event_type="terminated",
-                    trigger_type=None,
-                    assistant_prefix=child_prefix,
-                    prompt_token_ids=child_prompt_token_ids,
-                    token_ids=child_token_ids,
-                    token_traces=child_token_traces,
-                    generated_tokens=len(child_token_ids),
-                    stop_reason="missing_steer_or_think_close",
-                    branch_points_used=child_state.branch_points_used,
-                    steer_phase_token_spans=child_steer_spans,
-                )
-                self._append_completed_leaf(
-                    tree=tree,
-                    leaf=leaf_from_outcome(
-                        outcome=terminal_outcome,
-                        state=child_state,
-                    ),
-                )
-                continue
-            candidate_text, candidate_token_ids = (
-                await self._normalized_child_candidate_async(
-                    trigger_type=pool.trigger_type,
-                    candidate=candidate,
-                )
-            )
+            else:
+                candidate_text = candidate_decision_text
+                candidate_token_ids = candidate_decision_token_ids
             child_node_id = f"node_{parent_state.node_id}_{child_offset}_{candidate_id}"
             child_prefix = outcome.assistant_prefix + candidate_text
             span_start = len(outcome.token_ids)
@@ -2294,6 +2269,7 @@ class BranchExecutor:
                     *outcome.steer_phase_token_spans,
                     (span_start, len(child_token_ids)),
                 ),
+                off_policy_token_spans=outcome.off_policy_token_spans,
             )
             tree.add_node(
                 node=TreeNode(
@@ -2340,27 +2316,6 @@ class BranchExecutor:
             children.append(child_state)
         return children
 
-    def _decode_until_event(
-        self,
-        *,
-        tree: BranchTree,
-        state: PathState,
-        branching_enabled: bool = True,
-        steer_normalization_enabled: bool | None = None,
-        inline_epsilon_enabled: bool | None = None,
-    ) -> DecodeOutcome:
-        """Compatibility wrapper that executes the async decode workflow."""
-
-        return asyncio.run(
-            self._decode_until_event_async(
-                tree=tree,
-                state=state,
-                branching_enabled=branching_enabled,
-                steer_normalization_enabled=steer_normalization_enabled,
-                inline_epsilon_enabled=inline_epsilon_enabled,
-            )
-        )
-
     async def _decode_until_event_async(
         self,
         *,
@@ -2401,11 +2356,15 @@ class BranchExecutor:
             else inline_epsilon_enabled
         )
         trigger_steer_enabled = self.trigger_steer_enabled and steer_mode_enabled
+        repetition_checking_enabled = self.branching.repetition_checking_enabled
         boundary_detection_prob = self._steer_boundary_detection_probability(
             branching_enabled=branching_enabled,
             inline_epsilon_enabled=effective_inline_epsilon_enabled,
         )
-        rollout_stop = rollout_stop_markers(steer_enabled=trigger_steer_enabled)
+        rollout_stop = rollout_stop_markers(
+            steer_enabled=trigger_steer_enabled,
+            use_full_stop_strings=self.branching.use_full_stop_strings,
+        )
         exec_repetition_state = initialize_exec_repetition_state(
             text=assistant_prefix,
             similarity_threshold=EXEC_REPEAT_SIMILARITY_THRESHOLD,
@@ -2417,6 +2376,11 @@ class BranchExecutor:
             similarity_lookback_window=STEER_REPEAT_SIMILARITY_LOOKBACK_WINDOW,
         )
         steer_phase_token_spans = state.steer_phase_token_spans
+        off_policy_token_spans = state.off_policy_token_spans
+        off_policy_steer_boundaries_since_trigger = (
+            state.off_policy_steer_boundaries_since_trigger
+        )
+        off_policy_trigger_seen = state.off_policy_trigger_seen
 
         def finalize_outcome(*, outcome: DecodeOutcome) -> DecodeOutcome:
             """Attach the current path trigger count to one returned outcome."""
@@ -2427,6 +2391,75 @@ class BranchExecutor:
                 steer_phase_token_spans=(
                     outcome.steer_phase_token_spans or steer_phase_token_spans
                 ),
+                off_policy_token_spans=(
+                    outcome.off_policy_token_spans or off_policy_token_spans
+                ),
+                off_policy_steer_boundaries_since_trigger=(
+                    outcome.off_policy_steer_boundaries_since_trigger
+                    if outcome.off_policy_steer_boundaries_since_trigger is not None
+                    else off_policy_steer_boundaries_since_trigger
+                ),
+                off_policy_trigger_seen=(
+                    outcome.off_policy_trigger_seen
+                    if outcome.off_policy_trigger_seen is not None
+                    else off_policy_trigger_seen
+                ),
+            )
+
+        def steer_boundary_count_increment(*, prefix: str) -> int:
+            """Return whether this steer boundary counts toward off-policy cooldown."""
+
+            if not self._is_verbalized_off_policy_run():
+                return 0
+            if is_initial_steer_decision_boundary(text=prefix):
+                return 0
+            return 1
+
+        def steer_boundary_count_after_current(*, prefix: str) -> int:
+            """Return cooldown count if the current steer boundary is consumed."""
+
+            return (
+                off_policy_steer_boundaries_since_trigger
+                + steer_boundary_count_increment(prefix=prefix)
+            )
+
+        def mark_steer_boundary_consumed(*, prefix: str) -> None:
+            """Record one non-branch steer boundary on the active path."""
+
+            nonlocal off_policy_steer_boundaries_since_trigger
+            nonlocal state
+            off_policy_steer_boundaries_since_trigger = (
+                steer_boundary_count_after_current(prefix=prefix)
+            )
+            state = replace(
+                state,
+                off_policy_steer_boundaries_since_trigger=(
+                    off_policy_steer_boundaries_since_trigger
+                ),
+            )
+
+        def branchable_steer_outcome(*, outcome: DecodeOutcome) -> DecodeOutcome:
+            """Attach the current steer-boundary count to a returned trigger."""
+
+            return replace(
+                outcome,
+                off_policy_steer_boundaries_since_trigger=(
+                    steer_boundary_count_after_current(prefix=outcome.assistant_prefix)
+                ),
+            )
+
+        def should_branch_at_current_steer_boundary(
+            *, branching_enabled: bool, assistant_prefix: str
+        ) -> bool:
+            """Return whether this steer boundary should trigger expansion."""
+
+            return self._should_branch_at_steer_trigger(
+                branching_enabled=branching_enabled,
+                assistant_prefix=assistant_prefix,
+                steer_boundaries_since_trigger=steer_boundary_count_after_current(
+                    prefix=assistant_prefix
+                ),
+                off_policy_trigger_seen=off_policy_trigger_seen,
             )
 
         def adopt_decode_state(*, outcome: DecodeOutcome) -> None:
@@ -2434,9 +2467,12 @@ class BranchExecutor:
 
             nonlocal assistant_prefix
             nonlocal generated_tokens
+            nonlocal off_policy_steer_boundaries_since_trigger
+            nonlocal off_policy_trigger_seen
             nonlocal prompt_token_ids
             nonlocal state
             nonlocal steer_phase_token_spans
+            nonlocal off_policy_token_spans
             nonlocal token_ids
             nonlocal token_traces
 
@@ -2446,11 +2482,27 @@ class BranchExecutor:
             token_traces = list(outcome.token_traces)
             generated_tokens = outcome.generated_tokens
             steer_phase_token_spans = outcome.steer_phase_token_spans
+            off_policy_token_spans = outcome.off_policy_token_spans
+            off_policy_steer_boundaries_since_trigger = (
+                outcome.off_policy_steer_boundaries_since_trigger
+                if outcome.off_policy_steer_boundaries_since_trigger is not None
+                else off_policy_steer_boundaries_since_trigger
+            )
+            off_policy_trigger_seen = (
+                outcome.off_policy_trigger_seen
+                if outcome.off_policy_trigger_seen is not None
+                else off_policy_trigger_seen
+            )
             state = replace(
                 state,
                 branch_points_used=outcome.branch_points_used
                 or state.branch_points_used,
+                off_policy_steer_boundaries_since_trigger=(
+                    off_policy_steer_boundaries_since_trigger
+                ),
+                off_policy_trigger_seen=off_policy_trigger_seen,
                 steer_phase_token_spans=outcome.steer_phase_token_spans,
+                off_policy_token_spans=outcome.off_policy_token_spans,
             )
 
         def track_steer_phase_span(
@@ -2546,7 +2598,7 @@ class BranchExecutor:
             """Update exec repetition tracking from one appended text delta."""
 
             nonlocal exec_repetition_state
-            if not trigger_steer_enabled:
+            if not trigger_steer_enabled or not repetition_checking_enabled:
                 return None
             (
                 exec_repetition_state,
@@ -2568,7 +2620,7 @@ class BranchExecutor:
             """Update steer repetition tracking from one appended text delta."""
 
             nonlocal steer_repetition_state
-            if not trigger_steer_enabled:
+            if not trigger_steer_enabled or not repetition_checking_enabled:
                 return None
             _ = prefix_before, prefix_after
             (
@@ -2592,6 +2644,7 @@ class BranchExecutor:
             nonlocal prompt_token_ids
             nonlocal state
             nonlocal steer_phase_token_spans
+            nonlocal off_policy_token_spans
             nonlocal token_ids
             nonlocal token_traces
 
@@ -2604,9 +2657,13 @@ class BranchExecutor:
                 steer_phase_token_spans = (
                     close_base.steer_phase_token_spans or steer_phase_token_spans
                 )
+                off_policy_token_spans = (
+                    close_base.off_policy_token_spans or off_policy_token_spans
+                )
                 state = replace(
                     state,
                     steer_phase_token_spans=steer_phase_token_spans,
+                    off_policy_token_spans=off_policy_token_spans,
                 )
             normalized_prefix = _repeat_forced_think_close_prefix(text=assistant_prefix)
             assert normalized_prefix.startswith(
@@ -2701,6 +2758,9 @@ class BranchExecutor:
                 steer_phase_token_spans=(
                     continued.steer_phase_token_spans or steer_phase_token_spans
                 ),
+                off_policy_token_spans=(
+                    continued.off_policy_token_spans or off_policy_token_spans
+                ),
             )
 
         def repeated_block_termination(
@@ -2712,6 +2772,7 @@ class BranchExecutor:
 
             if (
                 trigger_steer_enabled
+                and repetition_checking_enabled
                 and generated_tokens >= REPEAT_TERMINATION_MIN_GENERATED_TOKENS
                 and exec_repetition_state.repeated_exec_blocks
                 >= EXEC_REPEAT_TERMINATION_BLOCK_COUNT
@@ -2731,6 +2792,7 @@ class BranchExecutor:
                 )
             if (
                 trigger_steer_enabled
+                and repetition_checking_enabled
                 and generated_tokens >= REPEAT_TERMINATION_MIN_GENERATED_TOKENS
                 and steer_repetition_state.repeated_exec_blocks
                 >= STEER_REPEAT_TERMINATION_BLOCK_COUNT
@@ -2750,9 +2812,7 @@ class BranchExecutor:
                 )
             return None
 
-        async def resolve_steer_decision_prefix(
-            *, source: str
-        ) -> DecodeOutcome | None:
+        async def resolve_steer_decision_prefix(*, source: str) -> DecodeOutcome | None:
             """Resolve a steer decision prefix before exec decoding starts."""
 
             nonlocal assistant_prefix
@@ -2786,9 +2846,11 @@ class BranchExecutor:
                 generated_tokens=generated_tokens,
                 stop_reason="",
             )
-            if self._should_branch_at_steer_trigger(
-                branching_enabled=branching_enabled
+            if should_branch_at_current_steer_boundary(
+                branching_enabled=branching_enabled,
+                assistant_prefix=trigger_outcome.assistant_prefix,
             ):
+                trigger_outcome = branchable_steer_outcome(outcome=trigger_outcome)
                 if not self._trigger_has_branch_budget(
                     trigger_type="steer_boundary",
                     generated_tokens=trigger_outcome.generated_tokens,
@@ -2800,6 +2862,7 @@ class BranchExecutor:
                         stop_reason="max_gen_toks_reached",
                     )
                 return trigger_outcome
+            mark_steer_boundary_consumed(prefix=trigger_outcome.assistant_prefix)
             continued = await self._resolve_nonbranch_steer_trigger_async(
                 tree=tree,
                 state=state,
@@ -2811,13 +2874,6 @@ class BranchExecutor:
                 base=trigger_outcome, continued=continued
             )
             if continued.event_type == "terminated":
-                self._append_malformed_steer_decision_if_needed(
-                    tree=tree,
-                    node_id=state.node_id,
-                    source=source,
-                    assistant_prefix=trigger_outcome.assistant_prefix,
-                    outcome=continued,
-                )
                 return continued
             steer_chunk_text, _ = self._state_delta(
                 prefix_before=trigger_outcome.assistant_prefix,
@@ -2927,6 +2983,9 @@ class BranchExecutor:
             raw_chunk_text = str(choice.text)
             raw_chunk_token_ids = tuple(choice.token_ids or ())
             chat_eos_stop = is_chat_eos_stop_reason(stop_reason=choice.stop_reason)
+            think_close_stop = is_think_close_stop_reason(
+                stop_reason=choice.stop_reason
+            )
 
             def append_decode_event(
                 *,
@@ -2952,7 +3011,79 @@ class BranchExecutor:
                     token_ids_after=token_ids_after,
                 )
 
+            async def continue_after_decode_think_close_stop_async(
+                *, base: DecodeOutcome
+            ) -> DecodeOutcome:
+                """Append excluded `</think>` stop text, then continue after thinking."""
+
+                think_closed = base
+                if not contains_think_close(text=think_closed.assistant_prefix):
+                    (
+                        updated_prefix,
+                        updated_prompt_ids,
+                        updated_token_ids,
+                        updated_token_traces,
+                        updated_generated_tokens,
+                        _,
+                    ) = await self._append_synthetic_suffix_to_decode_state_async(
+                        assistant_prefix=think_closed.assistant_prefix,
+                        prompt_token_ids=think_closed.prompt_token_ids,
+                        token_ids=think_closed.token_ids,
+                        token_traces=think_closed.token_traces,
+                        generated_tokens=think_closed.generated_tokens,
+                        suffix_text=THINK_CLOSE_TAG,
+                        context="decode_think_close_stop",
+                    )
+                    think_closed = replace(
+                        think_closed,
+                        assistant_prefix=updated_prefix,
+                        prompt_token_ids=updated_prompt_ids,
+                        token_ids=updated_token_ids,
+                        token_traces=updated_token_traces,
+                        generated_tokens=updated_generated_tokens,
+                    )
+                if has_boxed_answer_after_first_think_close(
+                    text=think_closed.assistant_prefix
+                ):
+                    return replace(
+                        think_closed,
+                        event_type="terminated",
+                        trigger_type=None,
+                        stop_reason="think_end",
+                    )
+                return await continue_after_think_close_async(
+                    executor=self,
+                    assistant_prefix=think_closed.assistant_prefix,
+                    prompt_token_ids=think_closed.prompt_token_ids,
+                    token_ids=think_closed.token_ids,
+                    token_traces=think_closed.token_traces,
+                    generated_tokens=think_closed.generated_tokens,
+                    request_stream_id=f"decode:{state.node_id}",
+                )
+
             if not choice_has_generated_content(choice=choice):
+                if think_close_stop:
+                    think_close_outcome = (
+                        await continue_after_decode_think_close_stop_async(
+                            base=DecodeOutcome(
+                                event_type="continued",
+                                trigger_type=None,
+                                assistant_prefix=assistant_prefix,
+                                prompt_token_ids=prompt_token_ids,
+                                token_ids=tuple(token_ids),
+                                token_traces=tuple(token_traces),
+                                generated_tokens=generated_tokens,
+                                stop_reason="",
+                            )
+                        )
+                    )
+                    append_decode_event(
+                        prefix_after=think_close_outcome.assistant_prefix,
+                        prompt_token_ids_after=think_close_outcome.prompt_token_ids,
+                        token_ids_after=think_close_outcome.token_ids,
+                        generated_after=think_close_outcome.generated_tokens,
+                    )
+                    return finalize_outcome(outcome=think_close_outcome)
                 if choice.stop_reason == "max_context_length_reached":
                     empty_stop_reason = "max_context_length_reached"
                 elif chat_eos_stop:
@@ -2991,6 +3122,7 @@ class BranchExecutor:
                     trigger_steer_enabled
                     and (branching_enabled or effective_inline_epsilon_enabled)
                     and not explicit_steer_stop
+                    and not think_close_stop
                     and not chat_eos_stop
                 ),
                 branch_prob=boundary_detection_prob,
@@ -3027,6 +3159,22 @@ class BranchExecutor:
                     generated_after=chat_eos_outcome.generated_tokens,
                 )
                 return finalize_outcome(outcome=chat_eos_outcome)
+            if think_close_stop:
+                think_close_outcome = (
+                    await continue_after_decode_think_close_stop_async(
+                        base=replace(
+                            chunk_outcome,
+                            prompt_token_ids=prompt_token_ids,
+                        )
+                    )
+                )
+                append_decode_event(
+                    prefix_after=think_close_outcome.assistant_prefix,
+                    prompt_token_ids_after=think_close_outcome.prompt_token_ids,
+                    token_ids_after=think_close_outcome.token_ids,
+                    generated_after=think_close_outcome.generated_tokens,
+                )
+                return finalize_outcome(outcome=think_close_outcome)
             decode_chunk_text, _ = self._state_delta(
                 prefix_before=chunk_prefix_before,
                 prefix_after=assistant_prefix,
@@ -3116,9 +3264,11 @@ class BranchExecutor:
                         generated_after=terminated_outcome.generated_tokens,
                     )
                     return finalize_outcome(outcome=terminated_outcome)
-                if self._should_branch_at_steer_trigger(
-                    branching_enabled=branching_enabled
+                if should_branch_at_current_steer_boundary(
+                    branching_enabled=branching_enabled,
+                    assistant_prefix=trigger_outcome.assistant_prefix,
                 ):
+                    trigger_outcome = branchable_steer_outcome(outcome=trigger_outcome)
                     append_decode_event(
                         prefix_after=trigger_outcome.assistant_prefix,
                         prompt_token_ids_after=trigger_outcome.prompt_token_ids,
@@ -3126,6 +3276,7 @@ class BranchExecutor:
                         generated_after=trigger_outcome.generated_tokens,
                     )
                     return finalize_outcome(outcome=trigger_outcome)
+                mark_steer_boundary_consumed(prefix=trigger_outcome.assistant_prefix)
                 continued = await self._resolve_nonbranch_steer_trigger_async(
                     tree=tree,
                     state=state,
@@ -3137,13 +3288,6 @@ class BranchExecutor:
                     base=trigger_outcome, continued=continued
                 )
                 if continued.event_type == "terminated":
-                    self._append_malformed_steer_decision_if_needed(
-                        tree=tree,
-                        node_id=state.node_id,
-                        source="steer_boundary_inline_continuation",
-                        assistant_prefix=trigger_outcome.assistant_prefix,
-                        outcome=continued,
-                    )
                     append_decode_event(
                         prefix_after=continued.assistant_prefix,
                         prompt_token_ids_after=continued.prompt_token_ids,
@@ -3251,9 +3395,13 @@ class BranchExecutor:
                     prefix_before=assistant_prefix,
                     prefix_after=explicit_trigger.assistant_prefix,
                 )
-                if self._should_branch_at_steer_trigger(
-                    branching_enabled=branching_enabled
+                if should_branch_at_current_steer_boundary(
+                    branching_enabled=branching_enabled,
+                    assistant_prefix=explicit_trigger.assistant_prefix,
                 ):
+                    explicit_trigger = branchable_steer_outcome(
+                        outcome=explicit_trigger
+                    )
                     if not self._trigger_has_branch_budget(
                         trigger_type=explicit_trigger.trigger_type,
                         generated_tokens=explicit_trigger.generated_tokens,
@@ -3279,6 +3427,7 @@ class BranchExecutor:
                         generated_after=explicit_trigger.generated_tokens,
                     )
                     return finalize_outcome(outcome=explicit_trigger)
+                mark_steer_boundary_consumed(prefix=explicit_trigger.assistant_prefix)
                 continued = await self._resolve_nonbranch_steer_trigger_async(
                     tree=tree,
                     state=state,
@@ -3290,13 +3439,6 @@ class BranchExecutor:
                     base=explicit_trigger, continued=continued
                 )
                 if continued.event_type == "terminated":
-                    self._append_malformed_steer_decision_if_needed(
-                        tree=tree,
-                        node_id=state.node_id,
-                        source="explicit_stop_nonbranch",
-                        assistant_prefix=explicit_trigger.assistant_prefix,
-                        outcome=continued,
-                    )
                     append_decode_event(
                         prefix_after=continued.assistant_prefix,
                         prompt_token_ids_after=continued.prompt_token_ids,
@@ -3392,9 +3534,13 @@ class BranchExecutor:
                         generated_after=steer_length_outcome.generated_tokens,
                     )
                     return finalize_outcome(outcome=steer_length_outcome)
-                if self._should_branch_at_steer_trigger(
-                    branching_enabled=branching_enabled
+                if should_branch_at_current_steer_boundary(
+                    branching_enabled=branching_enabled,
+                    assistant_prefix=steer_length_outcome.assistant_prefix,
                 ):
+                    steer_length_outcome = branchable_steer_outcome(
+                        outcome=steer_length_outcome
+                    )
                     if not self._trigger_has_branch_budget(
                         trigger_type=steer_length_outcome.trigger_type,
                         generated_tokens=steer_length_outcome.generated_tokens,
@@ -3420,6 +3566,9 @@ class BranchExecutor:
                         generated_after=steer_length_outcome.generated_tokens,
                     )
                     return finalize_outcome(outcome=steer_length_outcome)
+                mark_steer_boundary_consumed(
+                    prefix=steer_length_outcome.assistant_prefix
+                )
                 steer_length_trigger_text, _ = self._state_delta(
                     prefix_before=assistant_prefix,
                     prefix_after=steer_length_outcome.assistant_prefix,
@@ -3443,13 +3592,6 @@ class BranchExecutor:
                     base=steer_length_outcome, continued=continued
                 )
                 if continued.event_type == "terminated":
-                    self._append_malformed_steer_decision_if_needed(
-                        tree=tree,
-                        node_id=state.node_id,
-                        source="length_boundary_nonbranch",
-                        assistant_prefix=steer_length_outcome.assistant_prefix,
-                        outcome=continued,
-                    )
                     append_decode_event(
                         prefix_after=continued.assistant_prefix,
                         prompt_token_ids_after=continued.prompt_token_ids,
@@ -3548,36 +3690,22 @@ class BranchExecutor:
                 if outcome.branch_points_used is None
                 else outcome.branch_points_used
             ),
+            off_policy_steer_boundaries_since_trigger=(
+                state.off_policy_steer_boundaries_since_trigger
+                if outcome.off_policy_steer_boundaries_since_trigger is None
+                else outcome.off_policy_steer_boundaries_since_trigger
+            ),
+            off_policy_trigger_seen=(
+                state.off_policy_trigger_seen
+                if outcome.off_policy_trigger_seen is None
+                else outcome.off_policy_trigger_seen
+            ),
             steer_phase_token_spans=(
                 outcome.steer_phase_token_spans or state.steer_phase_token_spans
             ),
-        )
-
-    def _resolve_candidate_pool(
-        self,
-        *,
-        doc_id: int,
-        state: PathState,
-        trigger_type: str,
-        entropy_value: float | None = None,
-        assistant_prefix: str,
-        prompt_token_ids: tuple[int, ...] | None,
-        generated_tokens: int,
-    ) -> CandidatePoolRecord:
-        """Compatibility wrapper that executes async pool resolution."""
-
-        _ = entropy_value
-
-        return asyncio.run(
-            self._resolve_candidate_pool_async(
-                doc_id=doc_id,
-                state=state,
-                trigger_type=trigger_type,
-                entropy_value=entropy_value,
-                assistant_prefix=assistant_prefix,
-                prompt_token_ids=prompt_token_ids,
-                generated_tokens=generated_tokens,
-            )
+            off_policy_token_spans=(
+                outcome.off_policy_token_spans or state.off_policy_token_spans
+            ),
         )
 
     async def _resolve_candidate_pool_async(
@@ -3615,33 +3743,6 @@ class BranchExecutor:
         )
         return pool
 
-    def _generate_candidate_pool(
-        self,
-        *,
-        candidate_pool_id: str,
-        state: PathState,
-        trigger_type: str,
-        entropy_value: float | None = None,
-        assistant_prefix: str,
-        prompt_token_ids: tuple[int, ...] | None,
-        candidate_token_budget: int,
-    ) -> CandidatePoolRecord:
-        """Compatibility wrapper that executes async candidate generation."""
-
-        _ = entropy_value
-
-        return asyncio.run(
-            self._generate_candidate_pool_async(
-                candidate_pool_id=candidate_pool_id,
-                state=state,
-                trigger_type=trigger_type,
-                entropy_value=entropy_value,
-                assistant_prefix=assistant_prefix,
-                prompt_token_ids=prompt_token_ids,
-                candidate_token_budget=candidate_token_budget,
-            )
-        )
-
     async def _generate_candidate_pool_async(
         self,
         *,
@@ -3671,7 +3772,10 @@ class BranchExecutor:
             prompt_token_ids=canonical_prompt_ids,
             max_tokens=candidate_token_budget,
             n=self.branching.num_candidates,
-            stop=steer_candidate_stop_markers(text=canonical_prefix),
+            stop=steer_candidate_stop_markers(
+                text=canonical_prefix,
+                use_full_stop_strings=self.branching.use_full_stop_strings,
+            ),
             request_kind="candidate_pool_steer_boundary",
             request_stream_id=(
                 f"candidate_pool:{state.node_id}:{trigger_type}:{candidate_pool_id}"
@@ -3761,13 +3865,39 @@ class BranchExecutor:
 
         return SelectorParams(branch_fanout=1, max_clusters=self.branching.max_clusters)
 
-    def _should_branch_at_steer_trigger(self, *, branching_enabled: bool) -> bool:
+    def _should_branch_at_steer_trigger(
+        self,
+        *,
+        branching_enabled: bool,
+        assistant_prefix: str,
+        steer_boundaries_since_trigger: int,
+        off_policy_trigger_seen: bool,
+    ) -> bool:
         """Return whether the current steer trigger should create child branches."""
 
+        if self._is_verbalized_off_policy_run() and is_initial_steer_decision_boundary(
+            text=assistant_prefix
+        ):
+            return False
+        off_policy_min_steer_boundaries = (
+            OFF_POLICY_MIN_STEER_BOUNDARIES_BETWEEN_TRIGGERS
+            if off_policy_trigger_seen
+            else 2
+        )
+        if (
+            self._is_verbalized_off_policy_run()
+            and steer_boundaries_since_trigger < off_policy_min_steer_boundaries
+        ):
+            return False
+        trigger_probability = (
+            float(self.branching.epsilon_greedy_prob)
+            if self._is_verbalized_off_policy_run()
+            else float(self.branching.branch_prob)
+        )
         return (
             branching_enabled
             and self.allow_true_branching
-            and should_branch_at_trigger(executor=self)
+            and self.random.random() <= trigger_probability
         )
 
     def _steer_boundary_detection_probability(
@@ -3781,15 +3911,22 @@ class BranchExecutor:
         stop marker.
         """
 
+        off_policy_possible = (
+            branching_enabled
+            and self.allow_true_branching
+            and self._is_verbalized_off_policy_run()
+            and float(self.branching.epsilon_greedy_prob) > 0.0
+        )
         true_branch_possible = (
             branching_enabled
             and self.allow_true_branching
+            and not self._is_verbalized_off_policy_run()
             and float(self.branching.branch_prob) > 0.0
         )
         inline_epsilon_possible = (
             inline_epsilon_enabled and float(self.branching.epsilon_greedy_prob) > 0.0
         )
-        if true_branch_possible or inline_epsilon_possible:
+        if off_policy_possible or true_branch_possible or inline_epsilon_possible:
             return 1.0
         return 0.0
 
@@ -3802,27 +3939,6 @@ class BranchExecutor:
         if epsilon_probability <= 0.0:
             return False
         return self.random.random() <= epsilon_probability
-
-    def _steer_normalization_budget_tokens(self) -> int:
-        """Return cached token budget for the maximal injected steer suffix.
-
-        Args:
-            None.
-
-        Returns:
-            Token count reserved for `</steer>\n<exec>` normalization.
-        """
-
-        if self._steer_normalization_token_budget is None:
-            suffix_text, _ = selected_candidate_normalization_suffix(text="")
-            suffix_token_ids = self._tokenize_text(text=suffix_text)
-            self._assert_text_token_alignment(
-                text=suffix_text,
-                token_ids=tuple(suffix_token_ids),
-                context="steer_normalization_budget_tokens",
-            )
-            self._steer_normalization_token_budget = len(suffix_token_ids)
-        return self._steer_normalization_token_budget
 
     async def _steer_normalization_budget_tokens_async(self) -> int:
         """Return async-cached token budget for the maximal injected steer suffix.
@@ -4067,30 +4183,6 @@ class BranchExecutor:
             tuple(suffix_token_ids),
         )
 
-    def _normalize_steer_prefix_prompt_ids(
-        self,
-        *,
-        assistant_prefix: str,
-        prompt_token_ids: tuple[int, ...] | None,
-    ) -> tuple[str, tuple[int, ...] | None]:
-        normalized_prefix = normalize_steer_boundary_text(text=assistant_prefix)
-        if prompt_token_ids is None:
-            return normalized_prefix, None
-        assert normalized_prefix.startswith(assistant_prefix), (
-            "steer prefix normalization must be append-only when prompt_token_ids "
-            "are available"
-        )
-        injected_suffix = normalized_prefix[len(assistant_prefix) :]
-        if not injected_suffix:
-            return normalized_prefix, prompt_token_ids
-        suffix_token_ids = self._tokenize_text(text=injected_suffix)
-        self._assert_text_token_alignment(
-            text=injected_suffix,
-            token_ids=tuple(suffix_token_ids),
-            context="normalize_steer_prefix_suffix",
-        )
-        return normalized_prefix, tuple(prompt_token_ids) + tuple(suffix_token_ids)
-
     async def _normalize_steer_prefix_prompt_ids_async(
         self,
         *,
@@ -4139,61 +4231,6 @@ class BranchExecutor:
         )
         return updated_prefix, tuple(prompt_token_ids) + tuple(suffix_token_ids)
 
-    def _append_explicit_steer_stop_prefix(
-        self,
-        *,
-        assistant_prefix: str,
-        prompt_token_ids: tuple[int, ...] | None,
-    ) -> tuple[str, tuple[int, ...] | None]:
-        """Append/tokenize excluded `</exec` stop marker before normalization."""
-
-        stop_prefix = explicit_exec_stop_completion_suffix(text=assistant_prefix)
-        if not stop_prefix:
-            return assistant_prefix, prompt_token_ids
-        updated_prefix = assistant_prefix + stop_prefix
-        if prompt_token_ids is None:
-            return updated_prefix, None
-        suffix_token_ids = self._tokenize_text(text=stop_prefix)
-        self._assert_text_token_alignment(
-            text=stop_prefix,
-            token_ids=tuple(suffix_token_ids),
-            context="explicit_steer_stop_prefix",
-        )
-        return updated_prefix, tuple(prompt_token_ids) + tuple(suffix_token_ids)
-
-    def _normalized_child_candidate(
-        self, *, trigger_type: str, candidate: CandidateRecord
-    ) -> tuple[str, tuple[int, ...]]:
-        aligned_candidate = self._candidate_with_aligned_text(candidate=candidate)
-        assert (
-            trigger_type == "steer_boundary"
-        ), f"unsupported trigger_type: {trigger_type}"
-        candidate_text, candidate_token_ids = self._append_think_close_stop_suffix(
-            candidate=aligned_candidate
-        )
-        if candidate_text and not candidate_token_ids:
-            candidate_token_ids = tuple(self._tokenize_text(text=candidate_text))
-        assert_no_text_after_first_steer_close(text=candidate_text)
-        injected_suffix, _ = selected_candidate_normalization_suffix(
-            text=candidate_text
-        )
-        if not injected_suffix:
-            self._assert_text_token_alignment(
-                text=candidate_text,
-                token_ids=tuple(candidate_token_ids),
-                context="normalized_child_candidate",
-            )
-            return candidate_text, candidate_token_ids
-        suffix_token_ids = self._tokenize_text(text=injected_suffix)
-        normalized_text = candidate_text + injected_suffix
-        normalized_token_ids = tuple(candidate_token_ids) + tuple(suffix_token_ids)
-        self._assert_text_token_alignment(
-            text=normalized_text,
-            token_ids=normalized_token_ids,
-            context="normalized_child_candidate",
-        )
-        return (normalized_text, normalized_token_ids)
-
     async def _normalized_child_candidate_async(
         self, *, trigger_type: str, candidate: CandidateRecord
     ) -> tuple[str, tuple[int, ...]]:
@@ -4235,19 +4272,6 @@ class BranchExecutor:
         )
         return (normalized_text, normalized_token_ids)
 
-    def _append_think_close_stop_suffix(
-        self, *, candidate: CandidateRecord
-    ) -> tuple[str, tuple[int, ...]]:
-        """Append/tokenize `</think>` when it was returned as a stop reason."""
-
-        if not is_think_close_stop_reason(stop_reason=candidate.stop_reason):
-            return candidate.text, candidate.token_ids
-        base_text = text_before_first_think_close(text=candidate.text)
-        suffix_token_ids = self._tokenize_text(text="</think>")
-        return base_text + "</think>", tuple(candidate.token_ids) + tuple(
-            suffix_token_ids
-        )
-
     async def _append_think_close_stop_suffix_async(
         self, *, candidate: CandidateRecord
     ) -> tuple[str, tuple[int, ...]]:
@@ -4260,27 +4284,6 @@ class BranchExecutor:
         return base_text + "</think>", tuple(candidate.token_ids) + tuple(
             suffix_token_ids
         )
-
-    def _candidate_with_aligned_text(
-        self, *, candidate: CandidateRecord
-    ) -> CandidateRecord:
-        """Return candidate with text aligned to detokenized token ids when available.
-
-        Args:
-            candidate: Candidate record.
-
-        Returns:
-            Candidate whose text matches detokenized token ids.
-        """
-
-        if not candidate.token_ids:
-            return candidate
-        decoded_text = self._detokenize_ids(token_ids=candidate.token_ids)
-        if decoded_text is None:
-            return candidate
-        if decoded_text == candidate.text:
-            return candidate
-        return replace(candidate, text=decoded_text)
 
     async def _candidate_with_aligned_text_async(
         self, *, candidate: CandidateRecord
@@ -4295,37 +4298,6 @@ class BranchExecutor:
         if decoded_text == candidate.text:
             return candidate
         return replace(candidate, text=decoded_text)
-
-    def _assert_text_token_alignment(
-        self,
-        *,
-        text: str,
-        token_ids: tuple[int, ...],
-        context: str,
-    ) -> None:
-        """Assert that detokenizing `token_ids` reproduces `text` exactly.
-
-        Args:
-            text: Expected text representation.
-            token_ids: Token IDs expected to decode to `text`.
-            context: Debug label used in assertion messages.
-
-        Returns:
-            None.
-        """
-
-        if not self.decoding.debug_assert_text_token_alignment:
-            return
-        if not token_ids:
-            assert text == "", f"{context}: empty token_ids for non-empty text"
-            return
-        decoded_text = self._detokenize_ids(token_ids=token_ids)
-        if decoded_text is None:
-            return
-        assert decoded_text == text, (
-            f"{context}: detokenized text mismatch; "
-            f"decoded={decoded_text!r} expected={text!r}"
-        )
 
     async def _assert_text_token_alignment_async(
         self,
@@ -4620,35 +4592,6 @@ class BranchExecutor:
             },
         )
 
-    def _generate_choice(
-        self,
-        *,
-        assistant_prefix: str,
-        prompt_token_ids: tuple[int, ...] | None,
-        max_tokens: int,
-        stop: tuple[str, ...] | None,
-        n: int,
-        temperature: float | None = None,
-        request_kind: str = "decode_chunk",
-        request_stream_id: str | None = None,
-        enforce_prefix_chain: bool = True,
-    ) -> GenerationChoice:
-        """Compatibility wrapper that executes async single-choice generation."""
-
-        return asyncio.run(
-            self._generate_choice_async(
-                assistant_prefix=assistant_prefix,
-                prompt_token_ids=prompt_token_ids,
-                max_tokens=max_tokens,
-                stop=stop,
-                n=n,
-                temperature=temperature,
-                request_kind=request_kind,
-                request_stream_id=request_stream_id,
-                enforce_prefix_chain=enforce_prefix_chain,
-            )
-        )
-
     async def _generate_choice_async(
         self,
         *,
@@ -4676,35 +4619,6 @@ class BranchExecutor:
             enforce_prefix_chain=enforce_prefix_chain,
         )
         return choices[0]
-
-    def _generate_many(
-        self,
-        *,
-        assistant_prefix: str,
-        prompt_token_ids: tuple[int, ...] | None,
-        max_tokens: int,
-        n: int,
-        stop: tuple[str, ...] | None,
-        temperature: float | None = None,
-        request_kind: str = "candidate_pool",
-        request_stream_id: str | None = None,
-        enforce_prefix_chain: bool = False,
-    ) -> tuple[GenerationChoice, ...]:
-        """Compatibility wrapper that executes async multi-choice generation."""
-
-        return asyncio.run(
-            self._generate_many_async(
-                assistant_prefix=assistant_prefix,
-                prompt_token_ids=prompt_token_ids,
-                max_tokens=max_tokens,
-                n=n,
-                stop=stop,
-                temperature=temperature,
-                request_kind=request_kind,
-                request_stream_id=request_stream_id,
-                enforce_prefix_chain=enforce_prefix_chain,
-            )
-        )
 
     async def _generate_many_async(
         self,
@@ -5018,7 +4932,9 @@ class BranchExecutor:
         )
         if prefix_chain_enabled and choices:
             output_token_ids = tuple(choices[0].token_ids or ())
-            self._request_stream_state[request_stream_id] = _RequestStreamState(
+            set_request_stream_state(
+                request_stream_state=self._request_stream_state,
+                request_stream_id=request_stream_id,
                 request_id=request_id,
                 input_token_ids=input_token_ids,
                 output_token_ids=output_token_ids,
@@ -5293,19 +5209,12 @@ class BranchExecutor:
         current_input_token_ids: tuple[int, ...],
         prefix_chain_enabled: bool,
     ) -> tuple[tuple[int, ...], tuple[int, ...], str | None]:
-        if not prefix_chain_enabled:
-            return (), current_input_token_ids, None
-        previous_state = self._request_stream_state.get(request_stream_id)
-        if previous_state is None:
-            return (), current_input_token_ids, None
-        base = previous_state.input_token_ids + previous_state.output_token_ids
-        assert current_input_token_ids[: len(base)] == base, (
-            f"request stream prefix mismatch for {request_stream_id}: "
-            f"expected base token prefix length {len(base)}, "
-            f"got input length {len(current_input_token_ids)}"
+        return resolve_prefix_base_delta(
+            request_stream_state=self._request_stream_state,
+            request_stream_id=request_stream_id,
+            current_input_token_ids=current_input_token_ids,
+            prefix_chain_enabled=prefix_chain_enabled,
         )
-        delta = current_input_token_ids[len(base) :]
-        return base, delta, previous_state.request_id
 
     def _update_request_stream_state_output_ids(
         self,
@@ -5324,22 +5233,19 @@ class BranchExecutor:
             None.
         """
 
-        previous_state = self._request_stream_state.get(request_stream_id)
-        if previous_state is None:
-            return
-        assert previous_state.output_token_ids[: len(consumed_output_token_ids)] == (
-            consumed_output_token_ids
-        ), f"consumed output ids must prefix cached output ids for {request_stream_id}"
-        self._request_stream_state[request_stream_id] = _RequestStreamState(
-            request_id=previous_state.request_id,
-            input_token_ids=previous_state.input_token_ids,
-            output_token_ids=consumed_output_token_ids,
+        update_request_stream_state_output_ids(
+            request_stream_state=self._request_stream_state,
+            request_stream_id=request_stream_id,
+            consumed_output_token_ids=consumed_output_token_ids,
         )
 
     def _reset_request_stream_state(self, *, request_stream_id: str) -> None:
         """Drop cached prefix-chain state for one request stream."""
 
-        self._request_stream_state.pop(request_stream_id, None)
+        reset_request_stream_state(
+            request_stream_state=self._request_stream_state,
+            request_stream_id=request_stream_id,
+        )
 
     def _append_vllm_request_event(
         self,
@@ -5366,37 +5272,30 @@ class BranchExecutor:
         request_branch_number: str | None = None,
         repetition_penalty: float | None = None,
     ) -> None:
-        context = self._require_event_context()
-        self.artifact_store.append_event(
-            context=context,
-            event_type="vllm_request",
-            payload={
-                "request_id": request_id,
-                "request_stream_id": request_stream_id,
-                "prev_request_id": prev_request_id,
-                "request_kind": request_kind,
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "min_p": min_p,
-                "presence_penalty": presence_penalty,
-                "max_tokens": max_tokens,
-                "n": n,
-                "seed": seed,
-                "stop": list(stop) if stop is not None else None,
-                "top_logprobs": top_logprobs,
-                "request_priority": request_priority_value,
-                "request_branch_number": request_branch_number,
-                "repetition_penalty": repetition_penalty,
-                "current_input_token_count": len(current_input_token_ids),
-                "base_prefix_token_count": len(base_prefix_token_ids),
-                "delta_token_count": len(delta_input_token_ids),
-                "delta_input_token_ids": list(delta_input_token_ids),
-                "assistant_prefix_char_count": len(assistant_prefix),
-                "assistant_prefix_tail": assistant_prefix[
-                    -ASSISTANT_PREFIX_TAIL_CHARS:
-                ],
-            },
+        append_vllm_request_event(
+            artifact_store=self.artifact_store,
+            context=self._require_event_context(),
+            request_id=request_id,
+            request_stream_id=request_stream_id,
+            prev_request_id=prev_request_id,
+            request_kind=request_kind,
+            assistant_prefix=assistant_prefix,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+            max_tokens=max_tokens,
+            n=n,
+            seed=seed,
+            stop=stop,
+            top_logprobs=top_logprobs,
+            current_input_token_ids=current_input_token_ids,
+            base_prefix_token_ids=base_prefix_token_ids,
+            delta_input_token_ids=delta_input_token_ids,
+            request_priority_value=request_priority_value,
+            request_branch_number=request_branch_number,
+            repetition_penalty=repetition_penalty,
         )
 
     def _append_vllm_response_event(
@@ -5408,22 +5307,15 @@ class BranchExecutor:
         latency_seconds: float,
         choices: tuple[GenerationChoice, ...],
     ) -> None:
-        context = self._require_event_context()
-        self.artifact_store.append_event(
-            context=context,
-            event_type="vllm_response",
-            payload={
-                "request_id": request_id,
-                "request_stream_id": request_stream_id,
-                "request_kind": request_kind,
-                "status": "ok",
-                "latency_seconds": latency_seconds,
-                "choice_count": len(choices),
-                "choices": [
-                    self._serialize_choice_for_vllm_event(choice=choice)
-                    for choice in choices
-                ],
-            },
+        append_vllm_response_event(
+            artifact_store=self.artifact_store,
+            context=self._require_event_context(),
+            request_id=request_id,
+            request_stream_id=request_stream_id,
+            request_kind=request_kind,
+            latency_seconds=latency_seconds,
+            choices=choices,
+            compact_text_preview=self._compact_text_preview_positional,
         )
 
     def _append_vllm_response_error_event(
@@ -5435,48 +5327,21 @@ class BranchExecutor:
         error_message: str,
         latency_seconds: float,
     ) -> None:
-        context = self._require_event_context()
-        self.artifact_store.append_event(
-            context=context,
-            event_type="vllm_response",
-            payload={
-                "request_id": request_id,
-                "request_stream_id": request_stream_id,
-                "request_kind": request_kind,
-                "status": "error",
-                "error_message": error_message,
-                "latency_seconds": latency_seconds,
-                "choices": [],
-            },
+        append_vllm_response_error_event(
+            artifact_store=self.artifact_store,
+            context=self._require_event_context(),
+            request_id=request_id,
+            request_stream_id=request_stream_id,
+            request_kind=request_kind,
+            error_message=error_message,
+            latency_seconds=latency_seconds,
         )
 
-    def _serialize_choice_for_vllm_event(
-        self, *, choice: GenerationChoice
-    ) -> dict[str, Any]:
-        token_ids = tuple(choice.token_ids or ())
-        token_rows = []
-        for token_index, parsed_token in enumerate(choice.tokens):
-            token_id = token_ids[token_index] if token_index < len(token_ids) else None
-            token_rows.append(
-                {
-                    "token_index": token_index,
-                    "token_id": token_id,
-                    "token_text": parsed_token.token,
-                    "selected_logprob": parsed_token.logprob,
-                }
-            )
-        return {
-            "index": choice.index,
-            "token_ids": list(token_ids),
-            "finish_reason": choice.finish_reason,
-            "stop_reason": choice.stop_reason,
-            "output_token_count": len(token_ids),
-            "text_preview": self._compact_text_preview(
-                text=choice.text,
-                max_chars=160,
-            ),
-            "tokens": token_rows,
-        }
+    @staticmethod
+    def _compact_text_preview_positional(text: str, max_chars: int) -> str:
+        """Positional adapter for request-runtime serialization."""
+
+        return BranchExecutor._compact_text_preview(text=text, max_chars=max_chars)
 
     @staticmethod
     def _serialize_candidate_for_pool_event(
@@ -5579,30 +5444,6 @@ class BranchExecutor:
             )
         return rows
 
-    def _tokenize_text(self, *, text: str) -> tuple[int, ...]:
-        """Tokenize text and reuse executor-local LRU entries.
-
-        Args:
-            text: Raw text to tokenize.
-
-        Returns:
-            Token ids for `text`.
-        """
-
-        cached_token_ids = self._tokenize_text_cache.get(key=text)
-        if cached_token_ids is not None:
-            return cached_token_ids
-        tokenize = getattr(self.client, "tokenize", None)
-        assert tokenize is not None, "client must provide tokenize"
-        token_ids = tuple(
-            tokenize(
-                model=self.model_name,
-                text=text,
-                add_special_tokens=False,
-            )
-        )
-        return self._tokenize_text_cache.set(key=text, value=token_ids)
-
     async def _tokenize_text_async(self, *, text: str) -> tuple[int, ...]:
         """Tokenize text with async endpoint and reuse executor-local LRU entries.
 
@@ -5626,27 +5467,6 @@ class BranchExecutor:
                 add_special_tokens=False,
             )
         return self._tokenize_text_cache.set(key=text, value=tuple(token_ids))
-
-    def _detokenize_ids(self, *, token_ids: tuple[int, ...]) -> str | None:
-        """Detokenize token ids and reuse executor-local LRU entries.
-
-        Args:
-            token_ids: Token ids to decode.
-
-        Returns:
-            Decoded text when the client exposes detokenization, else `None`.
-        """
-
-        if not token_ids:
-            return ""
-        cached_text = self._detokenize_ids_cache.get(key=token_ids)
-        if cached_text is not None:
-            return cached_text
-        detokenize = getattr(self.client, "detokenize", None)
-        if detokenize is None:
-            return None
-        decoded_text = str(detokenize(model=self.model_name, token_ids=token_ids))
-        return self._detokenize_ids_cache.set(key=token_ids, value=decoded_text)
 
     async def _detokenize_ids_async(self, *, token_ids: tuple[int, ...]) -> str | None:
         """Detokenize token ids with async endpoint and reuse cached results.

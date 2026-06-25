@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import cast
 
+import pytest
+
 from branching_dapo.config_types import BranchAdvantageIndex
 from branching_dapo.reward_fn import compute_score_branching_dapo
 
@@ -248,6 +250,48 @@ def test_compute_score_branching_dapo_accepts_interleaved_steer_exec_pairs() -> 
     assert result["structure_issues"] == []
 
 
+@pytest.mark.parametrize(
+    ("case_id", "think_text"),
+    (
+        (
+            "V1_multiple_pairs",
+            "<steer>A</steer><exec>B</exec><steer>C</steer><exec>D</exec>",
+        ),
+        (
+            "V2_control_words_as_plain_text",
+            "<steer>Use a steer plan.</steer><exec>The exec word is prose.</exec>",
+        ),
+        (
+            "V3_math_comparison_symbols",
+            "<steer>Compare variables.</steer><exec>Since x < y and y > 0.</exec>",
+        ),
+        (
+            "V4_math_index_comparisons",
+            "<steer>Compare indices.</steer><exec>Use a_i < a_j and n >= 2.</exec>",
+        ),
+    ),
+)
+def test_compute_score_branching_dapo_accepts_valid_edge_cases(
+    *, case_id: str, think_text: str
+) -> None:
+    """Reward structure should keep strict tags while allowing normal math prose."""
+
+    result = compute_score_branching_dapo(
+        data_source="AceReason-Math",
+        solution_str=f"<think>{think_text}</think>\n\n\\boxed{{5}}",
+        ground_truth=["5"],
+        extra_info={
+            "source_family": "AceReason-Math",
+            "case_id": case_id,
+            "rollout_reward_scores": {},
+        },
+    )
+
+    assert result["score"] == 1.1
+    assert result["format_valid"] is True
+    assert result["structure_issues"] == []
+
+
 def test_compute_score_branching_dapo_rejects_missing_steer_exec_by_default() -> None:
     """Strict reward mode should require steer/exec pairs inside think text."""
 
@@ -323,6 +367,190 @@ def test_compute_score_branching_dapo_rejects_empty_steer_exec_block() -> None:
     assert result["answer_reward"] == 1.0
     assert result["format_valid"] is False
     assert "empty_steer_exec_block" in cast(list[str], result["structure_issues"])
+
+
+def test_compute_score_branching_dapo_rejects_control_tags_inside_steer() -> None:
+    """Reward structure should reject malformed nested control tags in steer text."""
+
+    malformed_cases = (
+        "<steer>Bad </exec><steer>Next</steer><exec>Work</exec>",
+        "<steer>Bad <exec>Nested</exec></steer><exec>Work</exec>",
+        "<steer>Bad <steer>Nested</steer></steer><exec>Work</exec>",
+        "<steer>Plan</steer><exec>Bad <steer>Nested</steer></exec>",
+        "<steer>Plan</steer><exec>Bad </steer></exec>",
+        "<steer>Bad <</steer><exec>Work</exec>",
+        "<steer>Plan</steer><exec>Bad <</exec>",
+        "<steer>Plan</steer><exec>Bad <exe</steer></exec>",
+    )
+    for malformed_think_text in malformed_cases:
+        result = compute_score_branching_dapo(
+            data_source="AceReason-Math",
+            solution_str=f"<think>{malformed_think_text}</think>\n\n\\boxed{{5}}",
+            ground_truth=["5"],
+            extra_info={
+                "source_family": "AceReason-Math",
+                "rollout_reward_scores": {},
+            },
+        )
+
+        assert result["score"] == 1.0
+        assert result["acc"] is True
+        assert result["structure_reward"] == 0.0
+        assert result["answer_reward"] == 1.0
+        assert result["format_valid"] is False
+        assert "control_tag_inside_steer_exec_block" in cast(
+            list[str], result["structure_issues"]
+        )
+
+
+@pytest.mark.parametrize(
+    ("case_id", "think_text"),
+    (
+        (
+            "D1_duplicate_steer_open",
+            "<steer>Plan</steer><exec>Work</exec><<steer>Next</steer><exec>More</exec>",
+        ),
+        (
+            "D2_duplicate_exec_open",
+            "<steer>Plan</steer><exec>Work</exec><<exec>Wrong</exec><steer>Next</steer>",
+        ),
+        (
+            "D3_triple_steer_open",
+            "<steer>Plan</steer><exec>Work</exec><<<steer>Next</steer><exec>More</exec>",
+        ),
+        (
+            "D4_spaced_extra_open",
+            "<steer>Plan</steer><exec>Work</exec>< <steer>Next</steer><exec>More</exec>",
+        ),
+        ("C3_spaced_close_like", "<steer>Bad < /steer><exec>Work</exec>"),
+        ("C4_nested_close_marker", "<steer>Bad </</steer><exec>Work</exec>"),
+        ("I1_incomplete_steer_tag", "<steer>Bad <stee</exec><exec>Work</exec>"),
+        ("I2_incomplete_short_steer_tag", "<steer>Bad <st</exec><exec>Work</exec>"),
+        (
+            "I3_think_close_inside_exec",
+            "<steer>Plan</steer><exec>Bad </think></exec>",
+        ),
+        (
+            "N5_nested_think_inside_steer",
+            "<steer>Bad <think>Nested</think></steer><exec>Work</exec>",
+        ),
+        ("M1_bad_steer_open_spelling", "<steeer>Plan</steer><exec>Work</exec>"),
+        ("M2_bad_steer_close_spelling", "<steer>Plan</steeer><exec>Work</exec>"),
+        ("M3_split_steer_close", "<steer>Plan</stee r><exec>Work</exec>"),
+        ("M4_steer_open_suffix", "<steerFINAL>Plan</steer><exec>Work</exec>"),
+        ("M5_steen_close", "<steer>Plan</steen><exec>Work</exec>"),
+        ("M6_nonlatin_open", "<ستار>Plan</steer><exec>Work</exec>"),
+        ("A1_steer_attribute", '<steer mode="plan">Plan</steer><exec>Work</exec>'),
+        ("A2_steer_open_space", "<steer >Plan</steer><exec>Work</exec>"),
+        ("A3_steer_close_space", "<steer>Plan</steer ><exec>Work</exec>"),
+        ("A4_exec_attribute", '<steer>Plan</steer><exec lang="python">print(5)</exec>'),
+        ("O1_exec_before_steer", "<exec>Work</exec><steer>Plan</steer>"),
+        ("O2_residual_between_blocks", "<steer>Plan</steer>residual<exec>Work</exec>"),
+        ("O3_residual_after_pair", "<steer>Plan</steer><exec>Work</exec>residual"),
+        ("O4_residual_before_pair", "residual<steer>Plan</steer><exec>Work</exec>"),
+        ("O5_extra_exec_close", "<steer>Plan</steer><exec>Work</exec></exec>"),
+        ("T1_nested_think", "<think><steer>Plan</steer><exec>Work</exec></think>"),
+    ),
+)
+def test_compute_score_branching_dapo_rejects_malformed_edge_cases(
+    *, case_id: str, think_text: str
+) -> None:
+    """Reward structure should reject malformed tag boundaries and ordering."""
+
+    result = compute_score_branching_dapo(
+        data_source="AceReason-Math",
+        solution_str=f"<think>{think_text}</think>\n\n\\boxed{{5}}",
+        ground_truth=["5"],
+        extra_info={
+            "source_family": "AceReason-Math",
+            "case_id": case_id,
+            "rollout_reward_scores": {},
+        },
+    )
+
+    assert result["score"] == 1.0
+    assert result["acc"] is True
+    assert result["structure_reward"] == 0.0
+    assert result["answer_reward"] == 1.0
+    assert result["format_valid"] is False
+    assert result["structure_issues"]
+
+
+@pytest.mark.parametrize(
+    ("case_id", "solution_str", "expected_score", "answer_reward"),
+    (
+        (
+            "T2_extra_think_close",
+            f"{VALID_THINK_BLOCK}</think>\n\n\\boxed{{5}}",
+            1.0,
+            1.0,
+        ),
+        (
+            "T3_missing_think_close",
+            "<think><steer>Plan</steer><exec>Work</exec>\n\n\\boxed{5}",
+            1.0,
+            1.0,
+        ),
+        (
+            "T4_think_close_without_open",
+            "<steer>Plan</steer><exec>Work</exec></think>\n\n\\boxed{5}",
+            1.0,
+            1.0,
+        ),
+        (
+            "T5_steer_exec_outside_think",
+            f"{VALID_THINK_BLOCK}\n<steer>Outside</steer><exec>Outside</exec>\n\\boxed{{5}}",
+            1.0,
+            1.0,
+        ),
+        ("B1_missing_boxed_answer", VALID_THINK_BLOCK, 0.0, 0.0),
+        (
+            "B2_boxed_inside_think_only",
+            "<think><steer>Plan</steer><exec>Work \\boxed{5}</exec></think>",
+            0.0,
+            0.0,
+        ),
+        (
+            "B3_boxed_before_think",
+            f"\\boxed{{5}}\n{VALID_THINK_BLOCK}",
+            0.0,
+            0.0,
+        ),
+        (
+            "B4_invalid_structure_correct_answer",
+            "<think><steer>Plan</steer>residual<exec>Work</exec></think>\n\n\\boxed{5}",
+            1.0,
+            1.0,
+        ),
+        (
+            "B5_malformed_boxed_answer",
+            f"{VALID_THINK_BLOCK}\n\n\\boxed{{5",
+            0.0,
+            0.0,
+        ),
+    ),
+)
+def test_compute_score_branching_dapo_rejects_full_response_edge_cases(
+    *, case_id: str, solution_str: str, expected_score: float, answer_reward: float
+) -> None:
+    """Reward structure should reject think and boxed-answer boundary failures."""
+
+    result = compute_score_branching_dapo(
+        data_source="AceReason-Math",
+        solution_str=solution_str,
+        ground_truth=["5"],
+        extra_info={
+            "source_family": "AceReason-Math",
+            "case_id": case_id,
+            "rollout_reward_scores": {},
+        },
+    )
+
+    assert result["score"] == expected_score
+    assert result["structure_reward"] == 0.0
+    assert result["answer_reward"] == answer_reward
+    assert result["format_valid"] is False
+    assert result["structure_issues"]
 
 
 def test_compute_score_branching_dapo_rejects_answer_before_think() -> None:

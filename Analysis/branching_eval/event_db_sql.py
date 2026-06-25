@@ -106,6 +106,21 @@ INSERT OR REPLACE INTO selector_candidate_cluster (
 ) VALUES (?, ?, ?, ?)
 """
 
+INSERT_VERBALIZED_SAMPLING_DECISION_SQL = """
+INSERT OR REPLACE INTO verbalized_sampling_decision (
+    event_index, doc_id, doc_attempt, task_name, model_id, selector_mode,
+    timestamp_utc, branch_point_id, candidate_pool_id, node_id,
+    candidate_count, branch_fanout, sampled_option_numbers,
+    parse_status, enumeration_exec_text
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+INSERT_VERBALIZED_SAMPLING_CANDIDATE_SQL = """
+INSERT OR REPLACE INTO verbalized_sampling_candidate (
+    decision_event_index, option_number, candidate_rank, candidate_text, selected
+) VALUES (?, ?, ?, ?, ?)
+"""
+
 INSERT_VLLM_REQUEST_SQL = """
 INSERT OR IGNORE INTO vllm_request (
     event_index, doc_id, doc_attempt, task_name, model_id, selector_mode,
@@ -250,6 +265,22 @@ FROM node_advantage
 WHERE doc_id = ? AND doc_attempt = ? AND task_name = ?
   AND model_id = ? AND selector_mode = ?
 ORDER BY branch_depth, child_node_id
+"""
+
+VERBALIZED_SAMPLING_DECISION_ROWS_FOR_EVENTS_SQL = """
+SELECT
+    event_index, branch_point_id, candidate_pool_id, node_id, candidate_count,
+    branch_fanout, sampled_option_numbers, parse_status, enumeration_exec_text
+FROM verbalized_sampling_decision
+WHERE event_index IN ({placeholders})
+ORDER BY event_index
+"""
+
+VERBALIZED_SAMPLING_CANDIDATE_ROWS_FOR_EVENTS_SQL = """
+SELECT decision_event_index, option_number, candidate_rank, candidate_text, selected
+FROM verbalized_sampling_candidate
+WHERE decision_event_index IN ({placeholders})
+ORDER BY decision_event_index, selected DESC, option_number
 """
 
 EDGE_PATH_ROWS_FOR_NODE_SQL = """
@@ -1167,6 +1198,7 @@ BACKFILL_SQL_STATEMENTS = (
              WHEN event_type = 'candidate_pool_resolved' THEN 'candidate pool n=' || COALESCE(json_extract(payload_json, '$.num_candidates'), 0)
              WHEN event_type = 'selector_applied' THEN 'selector kept ' || COALESCE(json_array_length(json_extract(payload_json, '$.selected_candidate_ids')), 0)
              WHEN event_type = 'selector_continued_inline' THEN 'selector continued inline ' || COALESCE(json_extract(payload_json, '$.selected_candidate_id'), '')
+             WHEN event_type = 'verbalized_sampling_applied' THEN 'verbalized sampling selected ' || COALESCE(json_extract(payload_json, '$.sampled_option_numbers[0]'), '')
              WHEN event_type = 'leaf_completed' THEN 'leaf completed ' || COALESCE(json_extract(payload_json, '$.leaf_id'), '')
              WHEN event_type = 'leaf_scored' THEN 'leaf scored verify=' || COALESCE(json_extract(payload_json, '$.verification'), '')
              ELSE event_type
@@ -1192,6 +1224,8 @@ BACKFILL_SQL_STATEMENTS = (
                COALESCE(json_extract(payload_json, '$.text'), json_extract(payload_json, '$.text_preview'), '')
              WHEN event_type = 'malformed_steer_decision' THEN
                COALESCE(json_extract(payload_json, '$.candidate_text'), json_extract(payload_json, '$.assistant_prefix_tail'), '')
+             WHEN event_type = 'verbalized_sampling_applied' THEN
+               COALESCE(json_extract(payload_json, '$.enumeration_exec_text'), '')
              ELSE ''
            END
     FROM event_log
@@ -1200,7 +1234,8 @@ BACKFILL_SQL_STATEMENTS = (
           'prompt_logged',
           'trigger_fired', 'trigger_skipped_max_branch_points',
           'candidate_pool_resolved', 'selector_applied',
-          'selector_continued_inline', 'leaf_completed', 'leaf_scored'
+          'selector_continued_inline', 'verbalized_sampling_applied',
+          'leaf_completed', 'leaf_scored'
       )
       AND doc_id IS NOT NULL AND doc_attempt IS NOT NULL
     """,
@@ -1455,6 +1490,41 @@ CREATE TABLE IF NOT EXISTS selector_candidate_cluster (
 
 CREATE INDEX IF NOT EXISTS idx_selector_candidate_cluster_event
 ON selector_candidate_cluster(selector_event_index, mode_name, cluster_name);
+
+CREATE TABLE IF NOT EXISTS verbalized_sampling_decision (
+    event_index INTEGER PRIMARY KEY,
+    doc_id INTEGER NOT NULL,
+    doc_attempt INTEGER NOT NULL,
+    task_name TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    selector_mode TEXT NOT NULL,
+    timestamp_utc TEXT NOT NULL,
+    branch_point_id TEXT NOT NULL,
+    candidate_pool_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    candidate_count INTEGER NOT NULL,
+    branch_fanout INTEGER NOT NULL,
+    sampled_option_numbers TEXT NOT NULL,
+    parse_status TEXT NOT NULL,
+    enumeration_exec_text TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_verbalized_sampling_decision_attempt
+ON verbalized_sampling_decision(
+    doc_id, doc_attempt, task_name, model_id, selector_mode, event_index
+);
+
+CREATE TABLE IF NOT EXISTS verbalized_sampling_candidate (
+    decision_event_index INTEGER NOT NULL,
+    option_number INTEGER NOT NULL,
+    candidate_rank INTEGER NOT NULL,
+    candidate_text TEXT NOT NULL,
+    selected INTEGER NOT NULL,
+    PRIMARY KEY(decision_event_index, option_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_verbalized_sampling_candidate_event
+ON verbalized_sampling_candidate(decision_event_index, selected, option_number);
 
 CREATE TABLE IF NOT EXISTS vllm_request (
     event_index INTEGER PRIMARY KEY,

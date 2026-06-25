@@ -312,8 +312,7 @@ def render_html(
     """Render a simple HTML viewer for the story completions."""
     cards: list[str] = []
     for row in rows:
-        cards.append(
-            f"""
+        cards.append(f"""
             <section class='card'>
               <div class='meta'>
                 <span>prompt {row.prompt.prompt_id}</span>
@@ -325,8 +324,7 @@ def render_html(
               <h2>Completion</h2>
               <pre>{html.escape(row.generated_text)}</pre>
             </section>
-            """
-        )
+            """)
     document = f"""
     <!doctype html>
     <html>

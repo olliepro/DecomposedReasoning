@@ -5,7 +5,12 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from transformers import ProgressCallback, TrainerControl, TrainerState, TrainingArguments
+from transformers import (
+    ProgressCallback,
+    TrainerControl,
+    TrainerState,
+    TrainingArguments,
+)
 
 
 @dataclass(frozen=True)
@@ -60,7 +65,9 @@ def progress_description(state: TrainerState, total_epochs: int) -> str:
     """
     max_steps = max(1, int(state.max_steps))
     current_epoch = epoch_index(state=state, total_epochs=total_epochs)
-    return f"epoch {current_epoch}/{total_epochs} | step {state.global_step}/{max_steps}"
+    return (
+        f"epoch {current_epoch}/{total_epochs} | step {state.global_step}/{max_steps}"
+    )
 
 
 def row_progress(
@@ -119,7 +126,9 @@ class DescriptiveProgressCallback(ProgressCallback):
         if not state.is_world_process_zero or self.training_bar is None:
             return
         description = progress_description(state=state, total_epochs=self.total_epochs)
-        rows = row_progress(state=state, args=args, total_train_rows=self.total_train_rows)
+        rows = row_progress(
+            state=state, args=args, total_train_rows=self.total_train_rows
+        )
         self.training_bar.set_description(description)
         self.training_bar.set_postfix(rows.to_postfix(), refresh=False)
 

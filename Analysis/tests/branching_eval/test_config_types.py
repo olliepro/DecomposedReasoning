@@ -32,6 +32,7 @@ def test_config_defaults_parse_from_minimal_payload(tmp_path: Path) -> None:
     assert config.decoding.debug_assert_text_token_alignment is False
     assert config.branching.num_candidates == 100
     assert config.branching.steer_repetition_penalty == 1.01
+    assert config.branching.repetition_checking_enabled is True
     assert config.branching.epsilon_greedy_prob == 0.05
     assert config.serve.scheduling_policy == "priority"
     assert config.serve.kv_offloading_size_gb == 64.0
@@ -124,6 +125,27 @@ def test_scheduling_policy_parses_from_serve_block(tmp_path: Path) -> None:
     assert config.serve.kv_offloading_backend == "lmcache"
     assert config.serve.request_timeout_seconds == 321.0
     assert config.branching.steer_repetition_penalty == 1.2
+
+
+def test_branching_repetition_checking_parses_bool_string(tmp_path: Path) -> None:
+    """Branching configs should parse false string values for repeat truncation."""
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "models": [
+                    {"model_id": "non_sft", "checkpoint_or_repo": "Qwen/Qwen3-8B"}
+                ],
+                "branching": {"repetition_checking_enabled": "False"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_branching_eval_config(config_path=config_path)
+
+    assert config.branching.repetition_checking_enabled is False
 
 
 def test_external_server_model_spec_parses(tmp_path: Path) -> None:

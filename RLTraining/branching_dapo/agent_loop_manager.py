@@ -73,6 +73,14 @@ class PromptGroupGeneration:
 
 
 @dataclass(frozen=True)
+class InitialPrefixState:
+    """Prompt ids and mirrored assistant prefill text used for rollout."""
+
+    prompt_ids: list[int]
+    assistant_prefix: str
+
+
+@dataclass(frozen=True)
 class ArtifactBatchScope:
     """Resolved artifact paths and ids for one rollout batch.
 
@@ -351,12 +359,14 @@ class BranchingAgentLoopManager(AgentLoopManager):
             num_candidates=self.settings.num_candidates,
             branch_fanout=branch_fanout,
             max_clusters=self.settings.max_clusters,
-            candidate_span_tokens=self.settings.candidate_span_tokens,
             max_steer_tokens=self.settings.max_steer_tokens,
             steer_repetition_penalty=self.settings.steer_repetition_penalty,
+            repetition_checking_enabled=self.settings.repetition_checking_enabled,
             epsilon_greedy_prob=self.settings.epsilon_greedy_prob,
-            entropy_threshold=self.settings.entropy_threshold,
-            entropy_profile_name=self.settings.entropy_profile_name,
+            off_policy_min_candidates=self.settings.off_policy_min_candidates,
+            off_policy_max_candidates=self.settings.off_policy_max_candidates,
+            use_full_stop_strings=self.settings.use_full_stop_strings,
+            verbalized_off_policy_enabled=mode == "epsilon_greedy_off_policy",
         )
 
     def _build_executor(
@@ -411,9 +421,9 @@ class BranchingAgentLoopManager(AgentLoopManager):
             decode_chunk_tokens=min(512, int(self.rollout_config.response_length)),
         )
         selector_mode = cast(SelectorMode, self.settings.validated_selector_mode())
-        allow_true_branching = (
-            self.settings.validated_rollout_mode() != "epsilon_greedy"
-        )
+        allow_true_branching = self.settings.validated_rollout_mode() not in {
+            "epsilon_greedy"
+        }
         return InstrumentedBranchExecutor(
             client=client,
             cluster_client=None,
@@ -427,7 +437,6 @@ class BranchingAgentLoopManager(AgentLoopManager):
             active_selector=selector_mode,
             seed=self.settings.seed + doc_id,
             trigger_steer_enabled=self.settings.trigger_steer_enabled,
-            trigger_entropy_enabled=self.settings.trigger_entropy_enabled,
             env_paths=self.settings.env_paths,
             branch_task_semaphore=self._ensure_branch_task_semaphore(),
             allow_true_branching=allow_true_branching,
@@ -464,7 +473,17 @@ class BranchingAgentLoopManager(AgentLoopManager):
             return prompt_ids
         return prompt_ids[-prompt_length:]
 
-    def _initial_assistant_prefix(self, *, prompt_ids: list[int]) -> str:
+    def _token_ids_for_text(self, *, text: str) -> list[int]:
+        """Tokenize plain assistant text without special tokens."""
+
+        return normalize_token_ids(
+            tokenized_output=self.tokenizer.encode(
+                text,
+                add_special_tokens=False,
+            )
+        )
+
+    def _chat_template_tail_prefix(self, *, prompt_ids: list[int]) -> str:
         """Return assistant prefill text already present at the prompt tail.
 
         Args:
@@ -474,17 +493,45 @@ class BranchingAgentLoopManager(AgentLoopManager):
             Prefill text to mirror in executor state and reward validation.
         """
 
-        think_prefix_ids = normalize_token_ids(
-            tokenized_output=self.tokenizer.encode(
-                QWEN_THINK_ASSISTANT_PREFIX,
-                add_special_tokens=False,
-            )
-        )
+        think_prefix_ids = self._token_ids_for_text(text=QWEN_THINK_ASSISTANT_PREFIX)
         if not think_prefix_ids:
             return ""
         if prompt_ids[-len(think_prefix_ids) :] == think_prefix_ids:
             return QWEN_THINK_ASSISTANT_PREFIX
         return ""
+
+    def _initial_assistant_prefix_state(
+        self, *, prompt_ids: list[int]
+    ) -> InitialPrefixState:
+        """Resolve requested assistant prefill text and matching prompt ids."""
+
+        template_prefix = self._chat_template_tail_prefix(prompt_ids=prompt_ids)
+        requested_prefix = self.settings.initial_assistant_prefix
+        if not requested_prefix:
+            return InitialPrefixState(
+                prompt_ids=prompt_ids,
+                assistant_prefix=template_prefix,
+            )
+        if template_prefix:
+            assert requested_prefix.startswith(template_prefix), (
+                "initial_assistant_prefix must extend the chat-template tail "
+                f"{template_prefix!r}, got {requested_prefix!r}"
+            )
+            suffix_text = requested_prefix[len(template_prefix) :]
+        else:
+            suffix_text = requested_prefix
+        suffix_ids = self._token_ids_for_text(text=suffix_text)
+        updated_prompt_ids = self._truncate_prompt_ids(
+            prompt_ids=[*prompt_ids, *suffix_ids]
+        )
+        if suffix_ids:
+            assert (
+                updated_prompt_ids[-len(suffix_ids) :] == suffix_ids
+            ), "Prompt truncation removed the requested initial assistant prefix."
+        return InitialPrefixState(
+            prompt_ids=updated_prompt_ids,
+            assistant_prefix=requested_prefix,
+        )
 
     def _build_branch_records(
         self,
@@ -519,6 +566,7 @@ class BranchingAgentLoopManager(AgentLoopManager):
                 initial_assistant_prefix=initial_assistant_prefix,
                 logical_response_text=leaf.text,
                 steer_phase_token_spans=leaf.steer_phase_token_spans,
+                off_policy_token_spans=leaf.off_policy_token_spans,
                 repeat_stop_reason=leaf.repeat_stop_reason,
                 repeat_block_kind=leaf.repeat_block_kind,
                 repeat_block_count=leaf.repeat_block_count,
@@ -542,6 +590,10 @@ class BranchingAgentLoopManager(AgentLoopManager):
                 "steer_phase_token_spans": [
                     [span_start, span_end]
                     for span_start, span_end in leaf.steer_phase_token_spans
+                ],
+                "off_policy_token_spans": [
+                    [span_start, span_end]
+                    for span_start, span_end in leaf.off_policy_token_spans
                 ],
             }
             if leaf.repeat_stop_reason is not None:
@@ -659,7 +711,7 @@ class BranchingAgentLoopManager(AgentLoopManager):
             return await executor.run_structured_rollouts_async(
                 rollout_count=rollout_count
             )
-        if mode == "epsilon_greedy":
+        if mode in {"epsilon_greedy", "epsilon_greedy_off_policy"}:
             executor.set_event_context(
                 doc_id=doc_id,
                 doc_attempt=0,
@@ -687,8 +739,11 @@ class BranchingAgentLoopManager(AgentLoopManager):
             Maximum realizable leaves for the configured rollout mode.
         """
 
-        if self.settings.validated_rollout_mode() == "branching":
+        mode = self.settings.validated_rollout_mode()
+        if mode == "branching":
             return self.settings.leaf_limit()
+        if mode == "epsilon_greedy_off_policy":
+            return rollout_count * self.settings.leaf_limit()
         return rollout_count
 
     def _expected_prompt_group_size(self) -> int:
@@ -723,7 +778,9 @@ class BranchingAgentLoopManager(AgentLoopManager):
 
         prompt_text = extract_prompt_text(raw_prompt=prompt_group.raw_prompt)
         prompt_ids = self._tokenize_prompt(raw_prompt=prompt_group.raw_prompt)
-        initial_assistant_prefix = self._initial_assistant_prefix(prompt_ids=prompt_ids)
+        prefix_state = self._initial_assistant_prefix_state(prompt_ids=prompt_ids)
+        prompt_ids = prefix_state.prompt_ids
+        initial_assistant_prefix = prefix_state.assistant_prefix
         doc_id = self.doc_counter
         self.doc_counter += 1
         selector_label = self.settings.selector_label_for_records()

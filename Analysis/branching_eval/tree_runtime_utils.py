@@ -72,6 +72,9 @@ def leaf_from_outcome(*, outcome: DecodeOutcome, state: PathState) -> LeafRollou
         steer_phase_token_spans=(
             outcome.steer_phase_token_spans or state.steer_phase_token_spans
         ),
+        off_policy_token_spans=(
+            outcome.off_policy_token_spans or state.off_policy_token_spans
+        ),
     )
 
 
@@ -112,6 +115,10 @@ def leaf_event_payload(*, leaf: LeafRollout) -> dict[str, object]:
         "steer_phase_token_spans": [
             [span_start, span_end]
             for span_start, span_end in leaf.steer_phase_token_spans
+        ],
+        "off_policy_token_spans": [
+            [span_start, span_end]
+            for span_start, span_end in leaf.off_policy_token_spans
         ],
     }
     if leaf.repeat_stop_reason is not None:

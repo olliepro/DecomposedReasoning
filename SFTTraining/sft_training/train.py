@@ -18,6 +18,7 @@ import wandb
 from datasets import Dataset, IterableDataset
 from peft import LoraConfig as PeftLoraConfig
 from peft import TaskType
+from tokenizers import AddedToken
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -532,7 +533,49 @@ def load_tokenizer(config: RunConfig):
     )
     if config.chat_template_path is not None:
         tokenizer.chat_template = config.chat_template_path.read_text(encoding="utf-8")
+    add_configured_tokens(tokenizer=tokenizer, tokens=config.added_tokens)
     return tokenizer
+
+
+def add_configured_tokens(tokenizer: Any, tokens: tuple[str, ...]) -> None:
+    """Add configured vocabulary entries as ordinary non-special tokens.
+
+    Args:
+        tokenizer: Loaded tokenizer instance.
+        tokens: Token strings to add to the tokenizer vocabulary.
+    """
+    if not tokens:
+        return
+    existing_vocab = tokenizer.get_vocab()
+    missing_tokens = [token for token in tokens if token not in existing_vocab]
+    if missing_tokens:
+        added_count = tokenizer.add_tokens(
+            [
+                AddedToken(
+                    content=token,
+                    single_word=False,
+                    lstrip=False,
+                    rstrip=False,
+                    normalized=False,
+                    special=False,
+                )
+                for token in missing_tokens
+            ],
+            special_tokens=False,
+        )
+        assert added_count == len(
+            missing_tokens
+        ), "Failed to add all configured tokens."
+    special_tokens = set(tokenizer.all_special_tokens)
+    for token in tokens:
+        token_ids = tokenizer(token, add_special_tokens=False).input_ids
+        assert len(token_ids) == 1, f"Configured token is not atomic: {token!r}"
+        assert token not in special_tokens, f"Configured token is special: {token!r}"
+    if is_world_process_zero():
+        token_pairs = [
+            f"{token}={tokenizer.convert_tokens_to_ids(token)}" for token in tokens
+        ]
+        print("Configured ordinary added tokens: " + ", ".join(token_pairs))
 
 
 def _tokenize_masked_conversation_example(
@@ -800,6 +843,7 @@ def build_training_args(
         ),
         num_train_epochs=config.num_train_epochs,
         learning_rate=config.learning_rate,
+        lr_scheduler_type=config.lr_scheduler_type,
         optim=config.optim,
         adam_beta1=config.adam_beta1,
         adam_beta2=config.adam_beta2,

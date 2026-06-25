@@ -1,0 +1,278 @@
+{
+  "domain_counts_final": {
+    "code": 1,
+    "general/chat": 422,
+    "general/reasoning": 1,
+    "math": 40,
+    "multilingual/general": 4,
+    "python/code": 541,
+    "science": 655,
+    "synthetic/general": 336
+  },
+  "domain_counts_original_full": {
+    "code": 3,
+    "general/chat": 442,
+    "general/reasoning": 1,
+    "math": 44,
+    "multilingual/general": 5,
+    "python/code": 604,
+    "science": 679,
+    "synthetic/general": 415
+  },
+  "exec_blocks": {
+    "max": 85.0,
+    "mean": 17.426,
+    "median": 16.0,
+    "min": 4.0,
+    "n": 2000,
+    "p10": 10.0,
+    "p90": 27.0
+  },
+  "final_answer_control_tag_rows": 0,
+  "final_dir": "/fs/scratch/PAA0201/ollieproudman/DecomposedReasoning/Analysis/branching_eval/sft_warmup_off_policy/sft_warmup_final_sft2000_ckpt300_verbalized_offpolicy_p02_nobranch_fixed_complete_2000_20260623T131907Z",
+  "generated": {
+    "alternatively_per_1k_tokens": 0.5531013052474815,
+    "alternatively_per_1k_words": 1.0047904767974694,
+    "alternatively_rows": 893,
+    "alternatively_rows_pct": 44.65,
+    "alternatively_total": 3090,
+    "chars": {
+      "max": 36810.0,
+      "mean": 9934.7035,
+      "median": 8552.5,
+      "min": 1655.0,
+      "n": 2000,
+      "p10": 4593.599999999999,
+      "p90": 17041.600000000006
+    },
+    "tokens": {
+      "max": 12912.0,
+      "mean": 2793.34,
+      "median": 2332.0,
+      "min": 592.0,
+      "n": 2000,
+      "p10": 1247.9,
+      "p90": 4928.300000000002
+    },
+    "wait_per_1k_tokens": 1.1280402672069996,
+    "wait_per_1k_words": 2.0492522928083017,
+    "wait_rows": 1046,
+    "wait_rows_pct": 52.3,
+    "wait_total": 6302,
+    "words": {
+      "max": 6624.0,
+      "mean": 1537.634,
+      "median": 1311.5,
+      "min": 71.0,
+      "n": 2000,
+      "p10": 679.0,
+      "p90": 2674.500000000001
+    }
+  },
+  "original_full": {
+    "alternatively_per_1k_tokens": 0.30445778169717236,
+    "alternatively_per_1k_words": 0.5603397428335496,
+    "alternatively_rows": 751,
+    "alternatively_rows_pct": 34.2453260373917,
+    "alternatively_total": 2261,
+    "chars": {
+      "max": 66430.0,
+      "mean": 11708.535795713635,
+      "median": 9906.0,
+      "min": 1094.0,
+      "n": 2193,
+      "p10": 4971.2,
+      "p90": 20093.6
+    },
+    "tokens": {
+      "max": 17080.0,
+      "mean": 3386.373461012312,
+      "median": 2743.0,
+      "min": 511.0,
+      "n": 2193,
+      "p10": 1340.2000000000003,
+      "p90": 5998.599999999999
+    },
+    "wait_per_1k_tokens": 0.5255633445219212,
+    "wait_per_1k_words": 0.9672737798670252,
+    "wait_rows": 631,
+    "wait_rows_pct": 28.773369813041494,
+    "wait_total": 3903,
+    "words": {
+      "max": 10375.0,
+      "mean": 1839.968992248062,
+      "median": 1547.0,
+      "min": 61.0,
+      "n": 2193,
+      "p10": 729.0,
+      "p90": 3148.2
+    }
+  },
+  "original_matched": {
+    "alternatively_per_1k_tokens": 0.2961752168945377,
+    "alternatively_per_1k_words": 0.5417103075217891,
+    "alternatively_rows": 688,
+    "alternatively_rows_pct": 34.4,
+    "alternatively_total": 1954,
+    "chars": {
+      "max": 66430.0,
+      "mean": 11514.692,
+      "median": 9748.0,
+      "min": 1094.0,
+      "n": 2000,
+      "p10": 4927.7,
+      "p90": 19723.100000000002
+    },
+    "tokens": {
+      "max": 17080.0,
+      "mean": 3298.723,
+      "median": 2679.5,
+      "min": 511.0,
+      "n": 2000,
+      "p10": 1335.8,
+      "p90": 5700.3
+    },
+    "wait_per_1k_tokens": 0.5212623187821469,
+    "wait_per_1k_words": 0.9533990519792387,
+    "wait_rows": 579,
+    "wait_rows_pct": 28.95,
+    "wait_total": 3439,
+    "words": {
+      "max": 10375.0,
+      "mean": 1803.547,
+      "median": 1527.0,
+      "min": 61.0,
+      "n": 2000,
+      "p10": 722.9000000000001,
+      "p90": 3075.4000000000005
+    }
+  },
+  "per_domain_generated": [
+    {
+      "alternatively_total": 4,
+      "domain": "code",
+      "mean_tokens": 4790,
+      "median_tokens": 4790,
+      "rows": 1,
+      "wait_total": 21
+    },
+    {
+      "alternatively_total": 278,
+      "domain": "general/chat",
+      "mean_tokens": 2027.696682464455,
+      "median_tokens": 1824.5,
+      "rows": 422,
+      "wait_total": 476
+    },
+    {
+      "alternatively_total": 1,
+      "domain": "general/reasoning",
+      "mean_tokens": 2053,
+      "median_tokens": 2053,
+      "rows": 1,
+      "wait_total": 5
+    },
+    {
+      "alternatively_total": 321,
+      "domain": "math",
+      "mean_tokens": 6075.975,
+      "median_tokens": 5664.5,
+      "rows": 40,
+      "wait_total": 586
+    },
+    {
+      "alternatively_total": 1,
+      "domain": "multilingual/general",
+      "mean_tokens": 2342,
+      "median_tokens": 2037.5,
+      "rows": 4,
+      "wait_total": 1
+    },
+    {
+      "alternatively_total": 679,
+      "domain": "python/code",
+      "mean_tokens": 2141.5600739371534,
+      "median_tokens": 1900,
+      "rows": 541,
+      "wait_total": 2459
+    },
+    {
+      "alternatively_total": 1406,
+      "domain": "science",
+      "mean_tokens": 2828.314503816794,
+      "median_tokens": 2562,
+      "rows": 655,
+      "wait_total": 1653
+    },
+    {
+      "alternatively_total": 400,
+      "domain": "synthetic/general",
+      "mean_tokens": 4347.059523809524,
+      "median_tokens": 3866.0,
+      "rows": 336,
+      "wait_total": 1101
+    }
+  ],
+  "ratios_generated_over_original_matched": {
+    "char_ratio": {
+      "max": 4.57209015128126,
+      "mean": 0.955791484776649,
+      "median": 0.8827807139884951,
+      "min": 0.20796958174904942,
+      "n": 2000,
+      "p10": 0.5711810076295702,
+      "p90": 1.3915486465466549
+    },
+    "token_ratio": {
+      "max": 5.458502024291498,
+      "mean": 0.9439358387078232,
+      "median": 0.8742233504147356,
+      "min": 0.23093340922026181,
+      "n": 2000,
+      "p10": 0.5573688370612931,
+      "p90": 1.3658556739934489
+    },
+    "word_ratio": {
+      "max": 5.363207547169812,
+      "mean": 0.9527797479301366,
+      "median": 0.8725450421500263,
+      "min": 0.2119815668202765,
+      "n": 2000,
+      "p10": 0.555358176653244,
+      "p90": 1.3999890847027072
+    }
+  },
+  "source_counts_final": {
+    "allenai/SYNTHETIC-2-SFT-cn-fltrd-final-ngram-filtered-chinese-filtered": 336,
+    "allenai/aya-100k-r1-format-filtered-keyword-filtered-filter-datecutoff-ngram-filtered": 4,
+    "allenai/coconot-r1-format-domain-filtered-keyword-filtered-filter-datecutoff-chinese-filtered": 1,
+    "allenai/oasst1-r1-format-filtered-keyword-filtered-filter-datecutoff-chinese-filtered": 422,
+    "saumyamalik/OpenThoughts3-full-filtered-code-subsampled-decontam-v2": 1,
+    "saumyamalik/OpenThoughts3-full-filtered-math-decontam-v2": 40,
+    "saumyamalik/OpenThoughts3-full-filtered-science-decontam-v2": 655,
+    "saumyamalik/correct-python-sft-187k-x16-thoughts-filtered-decontam-v2": 541
+  },
+  "source_counts_original_full": {
+    "allenai/SYNTHETIC-2-SFT-cn-fltrd-final-ngram-filtered-chinese-filtered": 415,
+    "allenai/aya-100k-r1-format-filtered-keyword-filtered-filter-datecutoff-ngram-filtered": 5,
+    "allenai/coconot-r1-format-domain-filtered-keyword-filtered-filter-datecutoff-chinese-filtered": 1,
+    "allenai/oasst1-r1-format-filtered-keyword-filtered-filter-datecutoff-chinese-filtered": 442,
+    "saumyamalik/OpenThoughts3-full-filtered-code-subsampled-decontam-v2": 3,
+    "saumyamalik/OpenThoughts3-full-filtered-math-decontam-v2": 44,
+    "saumyamalik/OpenThoughts3-full-filtered-science-decontam-v2": 679,
+    "saumyamalik/correct-python-sft-187k-x16-thoughts-filtered-decontam-v2": 604
+  },
+  "steer_blocks": {
+    "max": 85.0,
+    "mean": 17.426,
+    "median": 16.0,
+    "min": 4.0,
+    "n": 2000,
+    "p10": 10.0,
+    "p90": 27.0
+  },
+  "system_prompt_rows": {
+    "jsonl_messages_rows_with_system": 0,
+    "jsonl_prompt_rows_with_system": 0
+  }
+}

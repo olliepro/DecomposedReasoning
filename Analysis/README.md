@@ -1,22 +1,13 @@
 # Analysis
 
-Steer-aware branching sampler and modular report viewer builder for vLLM OpenAI-compatible serving.
+SQLite-backed branching evaluation and visualization for vLLM
+OpenAI-compatible serving.
 
 ## Setup
 
 ```bash
 cd Analysis
 uv sync --extra dev
-```
-
-## Run sampler + report
-
-```bash
-cd Analysis
-uv run python run_steer_branching.py \
-  --model qwen3_8b_to_think \
-  --prompt "Find all a which satisfy a^4 + a^3 + a^2 = 100" \
-  --base-url http://127.0.0.1:8000/v1
 ```
 
 ## Run branching lm_eval framework (AIME24 default)
@@ -26,6 +17,44 @@ cd Analysis
 uv run python run_branching_lm_eval.py \
   --config branching_eval/example_aime24.yaml
 ```
+
+The top-level `branching_eval/*.yaml` files are examples only. Historical
+checkpoint-specific OLMo/Qwen launch snapshots live under
+`branching_eval/archive/checkpoint_run_configs/`; do not copy them for new
+runs.
+
+For real checkpoint evals, generate an immutable run spec:
+
+```bash
+cd Analysis
+RUN_NAME=qwen3-8b-doc6-12-structured \
+MODEL_PATH=/path/to/checkpoint-or-hf-repo \
+TASK_NAME=aime25 \
+EVAL_MODE=structured \
+DOC_IDS=6,12 \
+BASELINE_ROLLOUTS=48 \
+MAX_GEN_TOKS=32768 \
+uv run python -m branching_eval.run_specs dry-run
+```
+
+This writes `branching_eval/generated_run_specs/<run-name>/config.yaml` and
+`run_spec.json`. Submit only after checking the generated config and Slurm
+forecast:
+
+```bash
+uv run python -m branching_eval.run_specs test-only
+uv run python -m branching_eval.run_specs submit
+```
+
+Useful knobs:
+
+- `EVAL_MODE`: `baseline`, `structured`, `branching`, `epsilon`, or `all`.
+- `SELECTOR`: `embed_diverse_topk_random`, `cluster_across`, `within_cluster`,
+  or `random`.
+- `DOC_IDS`: comma/space separated lm_eval doc ids passed as repeated
+  `--doc-id` flags.
+- `PARTITION`, `GPU_COUNT`, `GPU_TYPE`, `TIME_LIMIT`, `MEMORY`, `CPU_COUNT`:
+  Slurm resource request fields.
 
 ## Run NoveltyBench generation
 
@@ -50,7 +79,7 @@ completed prompt unless true tree branching fails to produce enough leaves.
 Outputs are written under `artifacts.output_root`:
 - `generations.jsonl`: official-compatible NoveltyBench generation rows.
 - `generation_metadata.jsonl`: raw/cleaned text length sidecar.
-- `tree_events.jsonl`: branching runtime request/tree events.
+- `tree_events.sqlite`: branching runtime request/tree events.
 - `run_manifest.json` and `config_snapshot.json`: reproducibility metadata.
 
 Score a completed run with the upstream NoveltyBench repo:
@@ -74,116 +103,19 @@ uv run python run_branching_lm_eval.py \
   --model non_sft
 ```
 
-## Run a baseline-vs-branching TOK/sec comparison
-
-Use the dedicated comparison config to launch a matched baseline `n` rollout and
-one branching run:
+## Serve a dynamic branching viewer
 
 ```bash
 cd Analysis
-uv run python run_branching_lm_eval.py \
-  --config branching_eval/example_tok_sec.yaml \
-  --limit 1 \
-  --model non_sft \
-  --seed 1234
+uv run python scripts/serve_branching_viz.py \
+  --run-dir path/to/run-dir
 ```
 
-The baseline `n` value is `run_matrix.baseline_rollouts` in
-`branching_eval/example_tok_sec.yaml`.
-
-After runs finish, compare token throughput from `tree_events.jsonl`:
-
-```bash
-cd Analysis
-uv run python compare_tok_sec.py \
-  --output-root output/branching_eval \
-  --model non_sft \
-  --seed 1234 \
-  --show-request-kinds
-```
-
-Notes:
-- `req_tok/s` is computed from total output tokens divided by summed
-  `vllm_response.latency_seconds`.
-- `wall_tok/s` is computed from total output tokens divided by elapsed wall time
-  between the first `vllm_request` and the last `vllm_response`.
-- `--all-runs` disables latest-run deduplication when you want every historical
-  run under `output/branching_eval`.
-
-One-time entropy calibration helper:
-
-```bash
-cd /users/PAA0201/ollieproudman/work/DecomposedReasoning
-python Analysis/scripts/calibrate_entropy_threshold.py
-```
-
-Outputs are written under `output/<run_id>/`:
-- `config.json`
-- `steps.jsonl`
-- `steer_candidates.jsonl`
-- `token_stats.jsonl`
-- `report.html`
-- `final_text.json`
-- `report_assets/`
-
-## Rebuild report from artifacts
-
-```bash
-cd Analysis
-uv run python build_report.py --run-dir output/<run_id>
-```
-
-Bundle multiple outputs in one viewer:
-
-```bash
-cd Analysis
-uv run python build_report.py \
-  --run-dir output/<run_id_a> \
-  --run-dir output/<run_id_b> \
-  --output output/report_bundle.html
-```
-
-To tune clustering behavior:
-
-```bash
-cd Analysis
-uv run python build_report.py \
-  --run-dir output/<run_id> \
-  --gemini-model gemini-3-flash-preview \
-  --gemini-temperature 0.2 \
-  --previous-steps-window 5 \
-  --cluster-max-concurrency 50 \
-  --cluster-cache output/<run_id>/cluster_prompt_cache.json \
-  --env-file .env \
-  --env-file BuildSFTDataset/.env
-```
-
-Clustering uses Gemini structured-output prompting on deduplicated steer strings.
-When previous selected steps exist, up to 5 are included as context with `>>` separators.
-Prompt responses are cached by default at `<run_dir>/cluster_prompt_cache.json`.
-
-Viewer behavior:
-- Home page explains the generation algorithm and lists available outputs.
-- Sidebar includes Home plus per-output selection named by input prompt.
-- Steps are collapsible and labeled with selected steer text.
-- Clusters are single-click selectable.
-- Chosen candidate is always visible.
-- Unchosen variants appear only after selecting a cluster.
-- Variants are deduplicated with occurrence counts.
-- Execution text is in a dropdown and rendered as markdown.
-
-By default, `build_report.py` now checks dotenv files in this order:
-- repo root `.env` (for `VERTEX_KEY` / `GEMINI_API_KEY`)
-- `BuildSFTDataset/.env`
-- current working directory `.env`
-- `<run_dir>/.env`
-
-To disable semantic clustering and force fallback grouping:
-
-```bash
-cd Analysis
-uv run python build_report.py --run-dir output/<run_id> --disable-clustering
-```
+The viewer reads `tree_events.sqlite` directly. Pass repeated `--run-dir`
+arguments or `--run-root path/to/artifact-root` to serve a run picker.
+Per-document diagnostics are emitted as `doc_diagnostics_recorded` rows in the
+same SQLite event stream. `clustering_debug.jsonl` remains an intentional raw
+provider trace for selector retries and is not part of canonical tree replay.
 
 ## Validate
 

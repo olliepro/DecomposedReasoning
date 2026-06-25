@@ -32,6 +32,11 @@ THINK_BLOCK_PATTERN = re.compile(
 THINK_OPEN_PATTERN = re.compile(r"<think>", flags=re.IGNORECASE)
 THINK_CLOSE_PATTERN = re.compile(r"</think>", flags=re.IGNORECASE)
 STEER_EXEC_TAG_PATTERN = re.compile(r"</?(?:steer|exec)>", flags=re.IGNORECASE)
+CONTROL_TAG_PREFIX_PATTERN = re.compile(r"</?(?:think|steer|exec)", flags=re.IGNORECASE)
+CONTROL_TAG_FRAGMENT_PATTERN = re.compile(
+    r"</?(?:t|th|thi|thin|s|st|ste|stee|e|ex|exe)(?=[^A-Za-z0-9_]|$)",
+    flags=re.IGNORECASE,
+)
 STEER_EXEC_SEGMENT_PATTERN = re.compile(
     r"<(?P<tag>steer|exec)>(?P<content>.*?)</(?P=tag)>",
     flags=re.IGNORECASE | re.DOTALL,
@@ -386,8 +391,15 @@ def validate_steer_exec_sequence(
         actual_tag = str(match.group("tag")).lower()
         if actual_tag != expected_tag:
             issues.append("steer_exec_not_interleaved")
-        if not str(match.group("content")).strip():
+        content = str(match.group("content"))
+        if not content.strip():
             issues.append("empty_steer_exec_block")
+        if (
+            CONTROL_TAG_PREFIX_PATTERN.search(content)
+            or CONTROL_TAG_FRAGMENT_PATTERN.search(content)
+            or content.rstrip().endswith(("<", "</"))
+        ):
+            issues.append("control_tag_inside_steer_exec_block")
         cursor = match.end()
     if think_text[cursor:].strip():
         issues.append("non_whitespace_outside_steer_exec")

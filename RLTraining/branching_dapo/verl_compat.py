@@ -11,7 +11,9 @@ from typing import Any, Callable
 from branching_dapo.bootstrap import project_root
 
 
-def register_adv_est(name_or_enum: str | Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+def register_adv_est(
+    name_or_enum: str | Any,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Return the `verl` advantage-registration decorator or a test fallback.
 
     Args:
@@ -22,14 +24,18 @@ def register_adv_est(name_or_enum: str | Any) -> Callable[[Callable[..., Any]], 
     """
 
     try:
-        from verl.trainer.ppo.core_algos import register_adv_est as verl_register_adv_est
+        from verl.trainer.ppo.core_algos import (
+            register_adv_est as verl_register_adv_est,
+        )
 
         return verl_register_adv_est(name_or_enum)
     except ModuleNotFoundError:
         return _identity_register(name=name_or_enum)
 
 
-def _identity_register(name: str | Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+def _identity_register(
+    name: str | Any,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Return a no-op decorator for unit tests without full `verl` deps.
 
     Args:
@@ -63,8 +69,12 @@ def load_math_dapo_module() -> ModuleType:
         return math_dapo
     except ModuleNotFoundError:
         module_path = _math_dapo_path()
-        spec = importlib.util.spec_from_file_location("branching_dapo_math_dapo", module_path)
-        assert spec is not None and spec.loader is not None, f"Unable to load math_dapo module from {module_path}"
+        spec = importlib.util.spec_from_file_location(
+            "branching_dapo_math_dapo", module_path
+        )
+        assert (
+            spec is not None and spec.loader is not None
+        ), f"Unable to load math_dapo module from {module_path}"
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
@@ -80,4 +90,12 @@ def _math_dapo_path() -> Path:
         Absolute path to `math_dapo.py`.
     """
 
-    return project_root() / "RLTraining" / "verl" / "verl" / "utils" / "reward_score" / "math_dapo.py"
+    return (
+        project_root()
+        / "RLTraining"
+        / "verl"
+        / "verl"
+        / "utils"
+        / "reward_score"
+        / "math_dapo.py"
+    )

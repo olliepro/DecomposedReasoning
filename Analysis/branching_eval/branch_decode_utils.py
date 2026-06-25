@@ -25,9 +25,10 @@ EXEC_BLOCK_PATTERN = re.compile(
     r"<exec\b[^>]*>(.*?)</exec>", flags=re.IGNORECASE | re.DOTALL
 )
 EXEC_OPEN_TAG_PATTERN = re.compile(r"<exec\b[^>]*>", flags=re.IGNORECASE)
-ROLLOUT_STEER_STOP = ("</exec",)
-DEFAULT_EXEC_REPEAT_LOOKBACK_WINDOW = 3
 THINK_CLOSE_TAG = "</think>"
+ROLLOUT_STEER_STOP = ("</exec", THINK_CLOSE_TAG)
+ROLLOUT_STEER_STOP_FULL = ("</exec>", THINK_CLOSE_TAG)
+DEFAULT_EXEC_REPEAT_LOOKBACK_WINDOW = 3
 UNAVAILABLE_LOGPROB = -1e9
 CONTROL_EDGE_TAGS = (
     "<steer>",
@@ -1082,11 +1083,15 @@ def append_prompt_token_ids(
     return tuple(prompt_token_ids) + tuple(continuation_token_ids)
 
 
-def rollout_stop_markers(*, steer_enabled: bool) -> tuple[str, ...] | None:
+def rollout_stop_markers(
+    *, steer_enabled: bool, use_full_stop_strings: bool = False
+) -> tuple[str, ...] | None:
     """Return rollout stop markers for steer-enabled decode.
 
     Args:
         steer_enabled: Whether steer trigger is enabled.
+        use_full_stop_strings: Whether vLLM should stop on complete control
+            tags rather than legacy partial prefixes.
 
     Returns:
         Tuple of stop markers or `None`.
@@ -1094,6 +1099,8 @@ def rollout_stop_markers(*, steer_enabled: bool) -> tuple[str, ...] | None:
 
     if not steer_enabled:
         return None
+    if use_full_stop_strings:
+        return ROLLOUT_STEER_STOP_FULL
     return ROLLOUT_STEER_STOP
 
 

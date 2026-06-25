@@ -12,6 +12,5 @@ if str(ANALYSIS_ROOT) not in sys.path:
 
 from branching_eval.steer_trajectory_extractor import main
 
-
 if __name__ == "__main__":
     main()

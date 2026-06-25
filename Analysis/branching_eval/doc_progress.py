@@ -8,7 +8,6 @@ from typing import Callable
 
 from branching_eval.tree_types import LeafRollout
 
-
 AnswerExtractor = Callable[[str], str]
 TERMINATION_BUCKETS = ("natural", "max", "repeating", "other")
 

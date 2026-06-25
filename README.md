@@ -100,8 +100,8 @@ environment variables.
 
 | Variable | Used by | Purpose |
 | --- | --- | --- |
-| `GEMINI_API_KEY`, `GOOGLE_API_KEY` | `BuildSFTDataset`, `Analysis/build_report.py` | Gemini transform and report clustering. |
-| `VERTEX_KEY`, `VERTEX_API_KEY`, `GOOGLE_CLOUD_API_KEY` | `BuildSFTDataset`, `Analysis/build_report.py` | Vertex/Gemini variants. |
+| `GEMINI_API_KEY`, `GOOGLE_API_KEY` | `BuildSFTDataset`, `cluster_across` selector | Gemini transform and branch candidate clustering. |
+| `VERTEX_KEY`, `VERTEX_API_KEY`, `GOOGLE_CLOUD_API_KEY` | `BuildSFTDataset` | Vertex/Gemini variants. |
 | `OPENROUTER_API_KEY`, `OPEN_ROUTER_KEY` | augmentation bundle, cluster selectors | OpenRouter-backed intervention generation and some branch selection modes. |
 | `OPENAI_API_KEY` | `embed_diverse_topk_random` selector | Embedding-backed branch selection. |
 | `WANDB_*` | training and eval | W&B runs, grouping, and artifact logs. |
@@ -141,6 +141,14 @@ uv run python -m eval_runner.standalone \
 cd ../Analysis
 uv sync --extra dev
 uv run python run_branching_lm_eval.py --config branching_eval/example_aime24.yaml
+
+# Checkpoint branching eval from a generated run spec
+RUN_NAME=qwen3-8b-doc6-12-structured \
+MODEL_PATH=/path/to/checkpoint-or-hf-repo \
+TASK_NAME=aime25 \
+EVAL_MODE=structured \
+DOC_IDS=6,12 \
+uv run python -m branching_eval.run_specs dry-run
 
 # NoveltyBench generation through the branching engine
 uv run python run_branching_novelty_bench.py \
@@ -352,48 +360,8 @@ sbatch slurm/standalone_eval.sbatch \
 ## Workflow 4: Run Branching Analysis
 
 [`Analysis/`](Analysis/) contains the OpenAI-compatible vLLM client,
-single-prompt branching reports, branching `lm_eval` experiments, and
-visualization utilities.
-
-### Single-prompt steer branching
-
-Use this when you want one problem, one served model, and a detailed HTML report.
-
-```bash
-cd Analysis
-uv sync --extra dev
-
-uv run python run_steer_branching.py \
-  --model Qwen/Qwen3-8B \
-  --prompt "Find all a which satisfy a^4 + a^3 + a^2 = 100" \
-  --base-url http://127.0.0.1:8000/v1
-```
-
-This expects an existing vLLM OpenAI-compatible server. Outputs are written
-under `Analysis/output/<run_id>/` and include:
-
-- `config.json`
-- `steps.jsonl`
-- `steer_candidates.jsonl`
-- `token_stats.jsonl`
-- `chosen_path.txt`
-- `final_text.json`
-- `report.html`
-- `report_data.json`
-- `report_assets/`
-
-Rebuild or bundle reports:
-
-```bash
-cd Analysis
-
-uv run python build_report.py --run-dir output/<run_id>
-
-uv run python build_report.py \
-  --run-dir output/<run_id_a> \
-  --run-dir output/<run_id_b> \
-  --output output/report_bundle.html
-```
+SQLite-backed branching `lm_eval` experiments, NoveltyBench generation, and
+dynamic visualization utilities.
 
 ### Branching lm_eval matrix
 
@@ -416,6 +384,26 @@ uv run python run_branching_lm_eval.py \
   --selector random \
   --limit 4
 ```
+
+For real checkpoint runs, prefer typed run specs over one-off YAML copies:
+
+```bash
+cd Analysis
+RUN_NAME=qwen3-8b-doc6-12-structured \
+MODEL_PATH=/path/to/checkpoint-or-hf-repo \
+TASK_NAME=aime25 \
+EVAL_MODE=structured \
+DOC_IDS=6,12 \
+BASELINE_ROLLOUTS=48 \
+MAX_GEN_TOKS=32768 \
+uv run python -m branching_eval.run_specs dry-run
+uv run python -m branching_eval.run_specs test-only
+uv run python -m branching_eval.run_specs submit
+```
+
+`branching_eval/*.yaml` is reserved for maintained examples. Legacy
+checkpoint-specific launch snapshots are archived under
+`branching_eval/archive/checkpoint_run_configs/`.
 
 The config expands over:
 
@@ -440,12 +428,13 @@ Typical branching run artifacts include:
 
 - `run_manifest.json`
 - `config_snapshot.json`
-- `tree_events.jsonl`
+- `tree_events.sqlite`
 - `doc_progress/doc_*_attempt_*.json`
-- `doc_diagnostics.jsonl`
+- per-document diagnostics as `doc_diagnostics_recorded` rows in `tree_events.sqlite`
 - `lm_eval_aggregates.json`
 - `variance_diagnostics.json`
 - `length_diagnostics.json`
+- `clustering_debug.jsonl` for raw selector/provider retry traces when clustering is enabled
 - `serve_logs/serve_<model>_<port>.log`
 
 Monitor and visualize:
@@ -453,19 +442,12 @@ Monitor and visualize:
 ```bash
 cd Analysis
 
-uv run python scripts/track_branching_tree_events.py \
-  --tree-events-path path/to/tree_events.jsonl
-
-uv run python scripts/visualize_branching_run.py \
+uv run python scripts/serve_branching_viz.py \
   --run-dir path/to/run_dir
-
-uv run python compare_tok_sec.py \
-  --output-root output/branching_eval \
-  --all-runs
 ```
 
-`compare_tok_sec.py` reads recorded vLLM request/response events and compares
-baseline versus branching token throughput.
+The viewer reads `tree_events.sqlite` directly and can also serve a run picker
+with repeated `--run-dir` arguments or a `--run-root`.
 
 ## Workflow 5: Build RL Data And Train Branching DAPO
 
@@ -598,7 +580,7 @@ constants through scripts.
 | `SFTTraining/outputs/<run>/benchmark_evals/` | train sbatch post-eval | Eval JSONs and best-checkpoint metadata. |
 | `Eval/.../*.json` | standalone eval | Benchmark summaries and optional samples. |
 | `Analysis/output/<run_id>/report.html` | single-prompt branching | Static interactive report. |
-| `Analysis/.../tree_events.jsonl` | branching lm_eval | Event stream for diagnostics, replay, and throughput comparison. |
+| `Analysis/.../tree_events.sqlite` | branching lm_eval | Canonical event stream for diagnostics, replay, and throughput comparison. |
 | `RLTraining` `CACHE_ROOT` | branching DAPO | Checkpoints, selector caches, and branch artifacts. |
 
 Generated outputs, logs, caches, and W&B run directories should stay out of git.
@@ -645,11 +627,6 @@ Practical notes:
   `BRANCH_CONFIG` to an existing YAML instead of relying on its default.
 - **Manual configs with absolute paths**: many `manual_runs/` and experiment
   YAML files reference this workspace and scratch account directly.
-- **Unsloth path**:
-  [`SFTTraining/sft_training/train_unsloth.py`](SFTTraining/sft_training/train_unsloth.py)
-  requires an environment with `unsloth`; that dependency is not part of the
-  standard SFT `pyproject.toml`.
-
 ## Where To Make Changes
 
 Use this as a fast routing table.

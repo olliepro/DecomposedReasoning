@@ -29,10 +29,10 @@ from scripts.visualize_branching_interactive import (  # noqa: E402
     render_tree_workspace,
     tree_workspace_script,
 )
-from scripts.visualize_branching_replay import (  # noqa: E402
+from scripts.visualize_branching_common import (  # noqa: E402
     AttemptKey,
 )
-from scripts.visualize_branching_run import (  # noqa: E402
+from scripts.visualize_branching_progress import (  # noqa: E402
     ProgressAttemptView,
     selected_progress_attempts_by_doc,
 )

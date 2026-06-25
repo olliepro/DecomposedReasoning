@@ -618,8 +618,7 @@ def render_html(path: Path, rows: Sequence[PairedResult], model_path: str) -> No
     """Render the side-by-side HTML comparison view."""
     cards: list[str] = []
     for row in rows:
-        cards.append(
-            f"""
+        cards.append(f"""
             <section class='card'>
               <div class='meta'>
                 <span>sample {row.point.sample_id}</span>
@@ -649,8 +648,7 @@ def render_html(path: Path, rows: Sequence[PairedResult], model_path: str) -> No
                 </div>
               </div>
             </section>
-            """
-        )
+            """)
     document = f"""
     <!doctype html>
     <html>

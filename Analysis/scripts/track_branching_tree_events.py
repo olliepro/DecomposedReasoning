@@ -12,6 +12,5 @@ if str(ANALYSIS_ROOT) not in sys.path:
 
 from branching_eval.tree_event_stats import main
 
-
 if __name__ == "__main__":
     main()

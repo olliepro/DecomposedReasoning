@@ -37,7 +37,9 @@ def make_qwen3_config(source_dir: Path) -> Qwen3Config:
     full_config = AutoConfig.from_pretrained(source_dir, trust_remote_code=True)
     text_values = full_config.text_config.to_dict()
     allowed_keys = set(Qwen3Config().to_dict())
-    config_values = {key: value for key, value in text_values.items() if key in allowed_keys}
+    config_values = {
+        key: value for key, value in text_values.items() if key in allowed_keys
+    }
 
     for rope_key in ("rope_parameters", "rope_scaling"):
         rope_values = config_values.get(rope_key)
@@ -62,7 +64,9 @@ def source_weight_files(source_dir: Path) -> list[Path]:
     return files
 
 
-def map_language_weights(source_dir: Path, qwen3_config: Qwen3Config) -> dict[str, torch.Tensor]:
+def map_language_weights(
+    source_dir: Path, qwen3_config: Qwen3Config
+) -> dict[str, torch.Tensor]:
     mapped_state: dict[str, torch.Tensor] = {}
 
     for source_file in source_weight_files(source_dir=source_dir):
@@ -88,14 +92,20 @@ def map_language_weights(source_dir: Path, qwen3_config: Qwen3Config) -> dict[st
 def save_text_model(paths: ExportPaths) -> None:
     paths.output_dir.mkdir(parents=True, exist_ok=True)
     qwen3_config = make_qwen3_config(source_dir=paths.source_dir)
-    mapped_state = map_language_weights(source_dir=paths.source_dir, qwen3_config=qwen3_config)
+    mapped_state = map_language_weights(
+        source_dir=paths.source_dir, qwen3_config=qwen3_config
+    )
 
     qwen3_config.save_pretrained(paths.output_dir)
-    save_file(mapped_state, paths.output_dir / "model.safetensors", metadata={"format": "pt"})
+    save_file(
+        mapped_state, paths.output_dir / "model.safetensors", metadata={"format": "pt"}
+    )
     del mapped_state
     gc.collect()
 
-    AutoTokenizer.from_pretrained(paths.source_dir, trust_remote_code=True).save_pretrained(paths.output_dir)
+    AutoTokenizer.from_pretrained(
+        paths.source_dir, trust_remote_code=True
+    ).save_pretrained(paths.output_dir)
     GenerationConfig.from_pretrained(paths.source_dir).save_pretrained(paths.output_dir)
 
     loaded = AutoModelForCausalLM.from_pretrained(

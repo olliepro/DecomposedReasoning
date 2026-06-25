@@ -393,7 +393,6 @@ def build_runtime_config(
                 base_url=base_url,
                 served_model_name=model_name,
                 trigger_steer_default=True,
-                trigger_entropy_default=False,
             ),
         ),
         serve=ServeConfig(
@@ -424,7 +423,6 @@ def build_runtime_config(
             num_candidates=num_candidates,
             branch_fanout=2,
             max_clusters=4,
-            candidate_span_tokens=15,
             max_steer_tokens=15,
             steer_repetition_penalty=1.01,
             epsilon_greedy_prob=epsilon_greedy_prob,
@@ -748,7 +746,9 @@ def _mean_numeric_metrics(*, metric_rows: list[dict[str, Any]]) -> dict[str, Any
     reduced: dict[str, Any] = {}
     for key in keys:
         numeric_values = [
-            float(row[key]) for row in metric_rows if isinstance(row.get(key), (int, float))
+            float(row[key])
+            for row in metric_rows
+            if isinstance(row.get(key), (int, float))
         ]
         if numeric_values:
             reduced[key] = sum(numeric_values) / len(numeric_values)

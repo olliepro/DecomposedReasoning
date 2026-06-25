@@ -483,8 +483,7 @@ def render_html(*, path: Path, rows: Sequence[PairedResult], model_path: str) ->
     """Render a side-by-side HTML viewer for the story interventions."""
     cards: list[str] = []
     for row in rows:
-        cards.append(
-            f"""
+        cards.append(f"""
             <section class='card'>
               <div class='meta'>
                 <span>story {row.cut_point.prompt_id}</span>
@@ -507,8 +506,7 @@ def render_html(*, path: Path, rows: Sequence[PairedResult], model_path: str) ->
                 </div>
               </div>
             </section>
-            """
-        )
+            """)
     document = f"""
     <!doctype html>
     <html>

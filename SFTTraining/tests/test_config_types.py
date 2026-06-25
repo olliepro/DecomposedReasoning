@@ -36,6 +36,58 @@ def test_run_config_allows_null_deepspeed_path(tmp_path: Path) -> None:
     yaml_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
     config = RunConfig.from_yaml(yaml_path=yaml_path)
     assert config.deepspeed_config_path is None
+    assert config.lr_scheduler_type == "constant_with_warmup"
+
+
+def test_run_config_parses_added_tokens(tmp_path: Path) -> None:
+    """Run config loader should parse ordinary tokenizer-added tokens."""
+    payload = {
+        "run_name": "smoke",
+        "model_name_or_path": "Qwen/Qwen2.5-0.5B-Instruct",
+        "dataset_path": "../BuildSFTDataset/output/transformed_output.jsonl",
+        "output_dir": "/tmp/sft",
+        "deepspeed_config_path": None,
+        "wandb_project": "proj",
+        "added_tokens": ["<steer>", "</steer>", "<exec>", "</exec>"],
+    }
+    yaml_path = tmp_path / "run.yaml"
+    yaml_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    config = RunConfig.from_yaml(yaml_path=yaml_path)
+    assert config.added_tokens == ("<steer>", "</steer>", "<exec>", "</exec>")
+
+
+def test_run_config_parses_lr_scheduler_type(tmp_path: Path) -> None:
+    """Run config loader should parse explicit LR scheduler overrides."""
+    payload = {
+        "run_name": "smoke",
+        "model_name_or_path": "Qwen/Qwen2.5-0.5B-Instruct",
+        "dataset_path": "../BuildSFTDataset/output/transformed_output.jsonl",
+        "output_dir": "/tmp/sft",
+        "deepspeed_config_path": None,
+        "wandb_project": "proj",
+        "lr_scheduler_type": "linear",
+    }
+    yaml_path = tmp_path / "run.yaml"
+    yaml_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    config = RunConfig.from_yaml(yaml_path=yaml_path)
+    assert config.lr_scheduler_type == "linear"
+
+
+def test_run_config_rejects_duplicate_added_tokens(tmp_path: Path) -> None:
+    """Run config loader should reject ambiguous duplicate added-token entries."""
+    payload = {
+        "run_name": "smoke",
+        "model_name_or_path": "Qwen/Qwen2.5-0.5B-Instruct",
+        "dataset_path": "../BuildSFTDataset/output/transformed_output.jsonl",
+        "output_dir": "/tmp/sft",
+        "deepspeed_config_path": None,
+        "wandb_project": "proj",
+        "added_tokens": ["<steer>", "<steer>"],
+    }
+    yaml_path = tmp_path / "run.yaml"
+    yaml_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    with pytest.raises(AssertionError):
+        RunConfig.from_yaml(yaml_path=yaml_path)
 
 
 def test_run_config_resolves_deepspeed_path_when_provided(tmp_path: Path) -> None:

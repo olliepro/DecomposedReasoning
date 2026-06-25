@@ -48,7 +48,9 @@ class BenchmarkResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Standalone vLLM decode throughput benchmark.")
+    parser = argparse.ArgumentParser(
+        description="Standalone vLLM decode throughput benchmark."
+    )
     parser.add_argument("--model", required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--tensor-parallel-size", type=int, required=True)
@@ -64,7 +66,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load-format", default="auto")
     parser.add_argument("--language-model-only", action="store_true")
     parser.add_argument("--reasoning-parser")
-    parser.add_argument("--gdn-prefill-backend", choices=("flashinfer", "triton", "cutedsl"))
+    parser.add_argument(
+        "--gdn-prefill-backend", choices=("flashinfer", "triton", "cutedsl")
+    )
     parser.add_argument("--speculative-config-json")
     parser.add_argument("--trust-remote-code", action="store_true", default=True)
     parser.add_argument("--output-jsonl", required=True)
@@ -85,24 +89,64 @@ def prompt_with_token_count(tokenizer: object, token_count: int) -> str:
 def benchmark_cases(case_set: str) -> list[BenchmarkCase]:
     if case_set == "full":
         return [
-            BenchmarkCase(name="long_decode", num_prompts=64, prompt_tokens=512, max_tokens=512, n=1),
-            BenchmarkCase(name="rl_decode_chunk", num_prompts=128, prompt_tokens=4096, max_tokens=512, n=1),
-            BenchmarkCase(name="candidate_pool_n50", num_prompts=16, prompt_tokens=4096, max_tokens=512, n=50),
+            BenchmarkCase(
+                name="long_decode",
+                num_prompts=64,
+                prompt_tokens=512,
+                max_tokens=512,
+                n=1,
+            ),
+            BenchmarkCase(
+                name="rl_decode_chunk",
+                num_prompts=128,
+                prompt_tokens=4096,
+                max_tokens=512,
+                n=1,
+            ),
+            BenchmarkCase(
+                name="candidate_pool_n50",
+                num_prompts=16,
+                prompt_tokens=4096,
+                max_tokens=512,
+                n=50,
+            ),
         ]
 
     return [
-        BenchmarkCase(name="decode_512p128g", num_prompts=64, prompt_tokens=512, max_tokens=128, n=1),
-        BenchmarkCase(name="decode_4096p128g", num_prompts=64, prompt_tokens=4096, max_tokens=128, n=1),
-        BenchmarkCase(name="candidate_pool_n50", num_prompts=8, prompt_tokens=4096, max_tokens=16, n=50),
+        BenchmarkCase(
+            name="decode_512p128g",
+            num_prompts=64,
+            prompt_tokens=512,
+            max_tokens=128,
+            n=1,
+        ),
+        BenchmarkCase(
+            name="decode_4096p128g",
+            num_prompts=64,
+            prompt_tokens=4096,
+            max_tokens=128,
+            n=1,
+        ),
+        BenchmarkCase(
+            name="candidate_pool_n50",
+            num_prompts=8,
+            prompt_tokens=4096,
+            max_tokens=16,
+            n=50,
+        ),
     ]
 
 
 def build_llm(args: argparse.Namespace) -> LLM:
     engine_kwargs: dict[str, Any] = {}
     if args.gdn_prefill_backend is not None:
-        engine_kwargs["additional_config"] = {"gdn_prefill_backend": args.gdn_prefill_backend}
+        engine_kwargs["additional_config"] = {
+            "gdn_prefill_backend": args.gdn_prefill_backend
+        }
     if args.decode_context_parallel_size > 1:
-        engine_kwargs["decode_context_parallel_size"] = args.decode_context_parallel_size
+        engine_kwargs["decode_context_parallel_size"] = (
+            args.decode_context_parallel_size
+        )
     if args.enable_dbo:
         engine_kwargs["enable_dbo"] = True
     if args.dbo_decode_token_threshold is not None:
@@ -137,7 +181,9 @@ def build_llm(args: argparse.Namespace) -> LLM:
     )
 
 
-def run_case(llm: LLM, prompts: list[str], case: BenchmarkCase, args: argparse.Namespace) -> BenchmarkResult:
+def run_case(
+    llm: LLM, prompts: list[str], case: BenchmarkCase, args: argparse.Namespace
+) -> BenchmarkResult:
     sampling_params = SamplingParams(
         max_tokens=case.max_tokens,
         n=case.n,
@@ -149,7 +195,9 @@ def run_case(llm: LLM, prompts: list[str], case: BenchmarkCase, args: argparse.N
     start = time.perf_counter()
     outputs = llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
     elapsed_seconds = time.perf_counter() - start
-    output_tokens = sum(len(choice.token_ids) for output in outputs for choice in output.outputs)
+    output_tokens = sum(
+        len(choice.token_ids) for output in outputs for choice in output.outputs
+    )
     choices = sum(len(output.outputs) for output in outputs)
     return BenchmarkResult(
         name=case.name,
@@ -177,7 +225,9 @@ def run_case(llm: LLM, prompts: list[str], case: BenchmarkCase, args: argparse.N
 
 
 def run_warmup(llm: LLM, prompt: str) -> float:
-    sampling_params = SamplingParams(max_tokens=16, n=1, temperature=0.7, top_p=0.95, top_k=-1, ignore_eos=True)
+    sampling_params = SamplingParams(
+        max_tokens=16, n=1, temperature=0.7, top_p=0.95, top_k=-1, ignore_eos=True
+    )
     start = time.perf_counter()
     llm.generate([prompt] * 8, sampling_params=sampling_params, use_tqdm=False)
     return time.perf_counter() - start
@@ -187,10 +237,14 @@ def main() -> None:
     args = parse_args()
     output_path = Path(args.output_jsonl)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, trust_remote_code=args.trust_remote_code
+    )
     cases = benchmark_cases(case_set=args.case_set)
     prompts_by_tokens = {
-        case.prompt_tokens: prompt_with_token_count(tokenizer=tokenizer, token_count=case.prompt_tokens)
+        case.prompt_tokens: prompt_with_token_count(
+            tokenizer=tokenizer, token_count=case.prompt_tokens
+        )
         for case in cases
     }
     llm = build_llm(args=args)
