@@ -1,0 +1,32 @@
+[project]
+name = "vllm-experimental"
+version = "0.1.0"
+description = "Native vLLM tree-search experiments for DecomposedReasoning."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+]
+
+[project.optional-dependencies]
+dev = [
+  "pyright>=1.1.408",
+  "pytest>=9.0.2",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+reportMissingImports = "none"
+reportMissingTypeStubs = "none"
+
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["vllm_experimental*"]

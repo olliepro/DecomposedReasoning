@@ -16,13 +16,18 @@ import yaml
 from branching_eval.selector_types import SelectorMode
 
 DEFAULT_SCRATCH_ROOT = Path("/fs/scratch/PAA0201/ollieproudman/DecomposedReasoning")
-DEFAULT_ANALYSIS_DIR = Path(
-    "/users/PAA0201/ollieproudman/work/DecomposedReasoning/Analysis"
-)
+DEFAULT_ANALYSIS_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_SPEC_ROOT = DEFAULT_ANALYSIS_DIR / "branching_eval/generated_run_specs"
 DEFAULT_OUTPUT_PARENT = DEFAULT_SCRATCH_ROOT / "Analysis/branching_eval"
 
-EvalMode = Literal["baseline", "structured", "branching", "epsilon", "all"]
+EvalMode = Literal[
+    "baseline",
+    "structured",
+    "branching",
+    "epsilon",
+    "epsilon_off_policy",
+    "all",
+]
 
 
 def env_value(env: Mapping[str, str], name: str, default: str) -> str:
@@ -148,6 +153,8 @@ class EvalShape:
     branch_fanout: int
     max_steer_tokens: int
     epsilon_greedy_prob: float
+    off_policy_min_candidates: int
+    off_policy_max_candidates: int
     max_concurrent_docs: int
 
     @classmethod
@@ -193,6 +200,12 @@ class EvalShape:
             branch_fanout=int(env_value(env, "BRANCH_FANOUT", "2")),
             max_steer_tokens=int(env_value(env, "MAX_STEER_TOKENS", "20")),
             epsilon_greedy_prob=float(env_value(env, "EPSILON_GREEDY_PROB", "0.33")),
+            off_policy_min_candidates=int(
+                env_value(env, "OFF_POLICY_MIN_CANDIDATES", "3")
+            ),
+            off_policy_max_candidates=int(
+                env_value(env, "OFF_POLICY_MAX_CANDIDATES", "10")
+            ),
             max_concurrent_docs=int(env_value(env, "MAX_CONCURRENT_DOCS", "2")),
         )
 
@@ -231,7 +244,7 @@ class EvalShape:
     def serve_payload(self) -> dict[str, object]:
         """Return the generated serving block."""
 
-        return {
+        payload: dict[str, object] = {
             "host": "127.0.0.1",
             "base_port": 8020,
             "tensor_parallel_size": self.tensor_parallel_size,
@@ -245,6 +258,9 @@ class EvalShape:
             "request_timeout_seconds": 900.0,
             "poll_interval_seconds": 1.0,
         }
+        if self.max_model_len is not None:
+            payload["max_model_len"] = self.max_model_len
+        return payload
 
     def decoding_payload(self) -> dict[str, object]:
         """Return the generated decoding block."""
@@ -274,6 +290,9 @@ class EvalShape:
             "max_steer_tokens": self.max_steer_tokens,
             "steer_repetition_penalty": 1.01,
             "epsilon_greedy_prob": self.epsilon_greedy_prob,
+            "off_policy_min_candidates": self.off_policy_min_candidates,
+            "off_policy_max_candidates": self.off_policy_max_candidates,
+            "verbalized_off_policy_enabled": self.mode == "epsilon_off_policy",
         }
 
     def run_matrix_payload(self) -> dict[str, object]:
@@ -284,7 +303,8 @@ class EvalShape:
             "include_structured_baselines": self.mode in {"structured", "all"},
             "baseline_rollouts": self.baseline_rollouts,
             "include_branching": self.mode in {"branching", "all"},
-            "include_epsilon_greedy": self.mode in {"epsilon", "all"},
+            "include_epsilon_greedy": self.mode
+            in {"epsilon", "epsilon_off_policy", "all"},
             "selectors": [self.selector],
             "seed_values": [self.seed],
             "default_limit": self.limit,
@@ -376,7 +396,14 @@ class EvalRunSpec:
 
 
 def _parse_mode(*, raw_mode: str) -> EvalMode:
-    modes: set[str] = {"baseline", "structured", "branching", "epsilon", "all"}
+    modes: set[str] = {
+        "baseline",
+        "structured",
+        "branching",
+        "epsilon",
+        "epsilon_off_policy",
+        "all",
+    }
     assert raw_mode in modes, f"EVAL_MODE must be one of {sorted(modes)}"
     return raw_mode  # type: ignore[return-value]
 

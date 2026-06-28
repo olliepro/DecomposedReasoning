@@ -1,0 +1,11 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -2222,6 +2222,8 @@
+             return None
+ 
+         parent = self.requests[parent_id]
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None, "native branch parent payload missing"
+         if self._vllm_exp_pending_branch_plans[parent_id]:
+             self._vllm_exp_launch_branch_wave(parent, first_wave=False)
+             return None

@@ -69,3 +69,32 @@ def test_sbatch_args_include_resources_and_test_only(tmp_path: Path) -> None:
     assert "--account=PAA0201" in args
     assert "--partition=preemptible-quad" in args
     assert "--gres=gpu:a100:4" in args
+
+
+def test_generated_off_policy_epsilon_config(tmp_path: Path) -> None:
+    """Run specs expose the verbalized off-policy epsilon path."""
+
+    spec = EvalRunSpec.from_env(
+        env={
+            "RUN_NAME": "unit-off-policy",
+            "MODEL_PATH": "/tmp/checkpoint",
+            "EVAL_MODE": "epsilon_off_policy",
+            "DOC_IDS": "0",
+            "SPEC_ROOT": str(tmp_path / "specs"),
+            "OUTPUT_ROOT": str(tmp_path / "outputs/unit-off-policy"),
+            "EPSILON_GREEDY_PROB": "0.10",
+            "BRANCH_FANOUT": "2",
+            "OFF_POLICY_MIN_CANDIDATES": "3",
+            "OFF_POLICY_MAX_CANDIDATES": "10",
+        }
+    )
+
+    spec.write()
+
+    payload = yaml.safe_load(spec.config_path.read_text(encoding="utf-8"))
+    assert payload["run_matrix"]["include_epsilon_greedy"] is True
+    assert payload["branching"]["verbalized_off_policy_enabled"] is True
+    assert payload["branching"]["epsilon_greedy_prob"] == 0.10
+    assert payload["branching"]["branch_fanout"] == 2
+    assert payload["branching"]["off_policy_min_candidates"] == 3
+    assert payload["branching"]["off_policy_max_candidates"] == 10

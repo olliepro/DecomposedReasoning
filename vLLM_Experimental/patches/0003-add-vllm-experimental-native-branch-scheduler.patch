@@ -1,0 +1,669 @@
+--- vllm/v1/core/single_type_kv_cache_manager.py	2026-06-26 13:11:10.372594442 -0400
++++ vllm/v1/core/single_type_kv_cache_manager.py	2026-06-26 12:32:02.697843712 -0400
+@@ -357,6 +357,23 @@
+             )
+         return len(child_blocks)
+ 
++    def promote_blocks(self, source_request_id: str, target_request_id: str) -> int:
++        """Replace target block ownership with touched source blocks."""
++        assert source_request_id in self.req_to_blocks, source_request_id
++        source_blocks = list(self.req_to_blocks[source_request_id])
++        old_target_blocks = self.req_to_blocks.pop(target_request_id, [])
++        self.block_pool.free_blocks(reversed(old_target_blocks))
++        self.block_pool.touch(
++            [block for block in source_blocks if not block.is_null]
++        )
++        self.req_to_blocks[target_request_id] = source_blocks
++        source_cached_count = self.num_cached_block.get(source_request_id)
++        if source_cached_count is not None:
++            self.num_cached_block[target_request_id] = source_cached_count
++        else:
++            self.num_cached_block.pop(target_request_id, None)
++        return len(source_blocks)
++
+     def free(self, request_id: str) -> None:
+         """
+         Free the blocks for the request.
+@@ -1123,6 +1140,19 @@
+             self.last_state_block_idx[child_request_id] = parent_state_idx
+         return block_count
+ 
++    def promote_blocks(self, source_request_id: str, target_request_id: str) -> int:
++        block_count = super().promote_blocks(source_request_id, target_request_id)
++        if source_request_id in self._allocated_block_reqs:
++            self._allocated_block_reqs.add(target_request_id)
++        else:
++            self._allocated_block_reqs.discard(target_request_id)
++        source_state_idx = self.last_state_block_idx.get(source_request_id)
++        if source_state_idx is not None and source_state_idx < block_count:
++            self.last_state_block_idx[target_request_id] = source_state_idx
++        else:
++            self.last_state_block_idx.pop(target_request_id, None)
++        return block_count
++
+     def free(self, request_id: str) -> None:
+         if self.mamba_cache_mode == "align":
+             self._allocated_block_reqs.discard(request_id)
+--- vllm/v1/core/kv_cache_coordinator.py	2026-06-26 13:11:10.373722721 -0400
++++ vllm/v1/core/kv_cache_coordinator.py	2026-06-26 12:32:02.699061210 -0400
+@@ -224,6 +224,15 @@
+             )
+         return block_count
+ 
++    def promote_blocks(self, source_request_id: str, target_request_id: str) -> int:
++        """Replace target block ownership with source blocks in every group."""
++        block_count = 0
++        for manager in self.single_type_managers:
++            block_count += manager.promote_blocks(
++                source_request_id, target_request_id
++            )
++        return block_count
++
+     def free(self, request_id: str) -> None:
+         """
+         Free the blocks for the request.
+--- vllm/v1/core/kv_cache_manager.py	2026-06-26 13:11:10.374801036 -0400
++++ vllm/v1/core/kv_cache_manager.py	2026-06-26 12:32:02.701706970 -0400
+@@ -568,6 +568,17 @@
+             num_computed_tokens,
+         )
+ 
++    def promote_blocks(self, source_request: Request, target_request: Request) -> int:
++        """Move a source request's block table under a target request id."""
++        assert source_request.request_id != target_request.request_id
++        assert source_request.num_computed_tokens >= target_request.num_computed_tokens
++        block_count = self.coordinator.promote_blocks(
++            source_request.request_id,
++            target_request.request_id,
++        )
++        target_request.num_computed_tokens = source_request.num_computed_tokens
++        return block_count
++
+     def create_kv_cache_blocks(
+         self, blocks: tuple[list[KVCacheBlock], ...]
+     ) -> KVCacheBlocks:
+--- vllm/v1/core/sched/scheduler.py	2026-05-29 14:14:20.741225633 -0400
++++ vllm/v1/core/sched/scheduler.py	2026-06-26 13:12:47.595320348 -0400
+@@ -1,5 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import hashlib
++import json
+ import itertools
+ import time
+ from collections import defaultdict, deque
+@@ -276,6 +278,19 @@
+ 
+         self._pause_state: PauseState = PauseState.UNPAUSED
+ 
++        self._vllm_exp_suspended_parent_ids: set[str] = set()
++        self._vllm_exp_branch_children: dict[str, list[str]] = {}
++        self._vllm_exp_branch_completed: dict[str, set[str]] = defaultdict(set)
++        self._vllm_exp_pending_branch_plans: dict[
++            str, list[tuple[int, list[int], list[int]]]
++        ] = {}
++        self._vllm_exp_branch_budgets: dict[str, int] = {}
++        self._vllm_exp_branch_stop_token_ids: dict[str, list[int]] = {}
++        self._vllm_exp_branch_fork_tokens: dict[str, int] = {}
++        self._vllm_exp_hidden_scores: dict[str, float] = defaultdict(float)
++        self._vllm_exp_child_to_parent: dict[str, str] = {}
++        self._vllm_exp_parent_boundary_counts: dict[str, int] = defaultdict(int)
++
+     def _mamba_block_aligned_split(
+         self,
+         request: Request,
+@@ -365,6 +380,9 @@
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+             request = self.running[req_index]
++            if request.request_id in self._vllm_exp_suspended_parent_ids:
++                req_index += 1
++                continue
+ 
+             if (
+                 request.num_output_placeholders > 0
+@@ -1344,6 +1362,7 @@
+         # to avoid expensive operations inside the loop.
+         stopped_running_reqs: set[Request] = set()
+         stopped_preempted_reqs: set[Request] = set()
++        suspended_running_reqs: set[Request] = set()
+         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+             assert num_tokens_scheduled > 0
+             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
+@@ -1413,6 +1432,9 @@
+                 request.status = RequestStatus.FINISHED_STOPPED
+                 stopped = True
+ 
++            if new_token_ids and self._vllm_exp_try_start_branch(request):
++                suspended_running_reqs.add(request)
++
+             if new_token_ids and self.structured_output_manager.should_advance(request):
+                 struct_output_request = request.structured_output_request
+                 assert struct_output_request is not None
+@@ -1471,7 +1493,7 @@
+                         routed_experts = routing_data[end - len(new_token_ids) : end]
+ 
+             finish_reason = None
+-            if stopped:
++            if stopped and not self._vllm_exp_is_hidden(request):
+                 # Capture finish_reason BEFORE _handle_stopped_request, which may
+                 # reset the status to WAITING for streaming requests that continue.
+                 finish_reason = request.get_finished_reason()
+@@ -1492,6 +1514,33 @@
+             ):
+                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
+ 
++            if self._vllm_exp_is_hidden(request):
++                if new_logprobs is not None:
++                    self._vllm_exp_add_hidden_logprobs(request, new_logprobs)
++                if stopped:
++                    finished = self._handle_stopped_request(request)
++                    assert finished, "hidden branch requests must not be resumable"
++                    parent = self._vllm_exp_complete_hidden_child(request)
++                    if parent is not None:
++                        promoted_token_ids = getattr(
++                            parent, "_vllm_exp_promoted_token_ids", []
++                        )
++                        if promoted_token_ids:
++                            outputs[parent.client_index].append(
++                                EngineCoreOutput(
++                                    request_id=parent.request_id,
++                                    new_token_ids=promoted_token_ids,
++                                    trace_headers=parent.trace_headers,
++                                )
++                            )
++                            setattr(parent, "_vllm_exp_promoted_token_ids", [])
++                        self._vllm_exp_resume_parent(parent)
++                    if status_before_stop == RequestStatus.RUNNING:
++                        stopped_running_reqs.add(request)
++                    else:
++                        stopped_preempted_reqs.add(request)
++                continue
++
+             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
+                 request.num_nans_in_logits = num_nans_in_logits[req_id]
+ 
+@@ -1525,7 +1574,12 @@
+                 # Invariant: EngineCore returns no partial prefill outputs.
+                 assert not prompt_logprobs_tensors
+ 
+-        # Remove the stopped requests from the running and waiting queues.
++        # Remove stopped and branch-suspended requests from the running queue.
++        if suspended_running_reqs:
++            self._vllm_exp_suspended_parent_ids.update(
++                req.request_id for req in suspended_running_reqs
++            )
++        stopped_running_reqs.update(suspended_running_reqs)
+         if stopped_running_reqs:
+             self.running = remove_all(self.running, stopped_running_reqs)
+         if stopped_preempted_reqs:
+@@ -1646,6 +1700,457 @@
+         self._enqueue_waiting_request(request)
+         return False
+ 
++    def _vllm_exp_payload(self, request: Request) -> dict[str, Any] | None:
++        params = request.sampling_params
++        extra_args = getattr(params, "extra_args", None)
++        if not isinstance(extra_args, dict):
++            return None
++        payload = extra_args.get("vllm_experimental")
++        return payload if isinstance(payload, dict) else None
++
++    def _vllm_exp_is_hidden(self, request: Request) -> bool:
++        return bool(getattr(request, "_vllm_exp_hidden_branch", False))
++
++    def _vllm_exp_native_enabled(self, request: Request) -> bool:
++        payload = self._vllm_exp_payload(request)
++        return bool(payload) and bool(payload.get("native_scheduler_kv_fork")) and (
++            payload.get("mode")
++            in {"eps_on_policy_diverse", "eps_off_policy_verbalized"}
++        )
++
++    def _vllm_exp_ends_at_boundary(self, request: Request) -> bool:
++        payload = self._vllm_exp_payload(request)
++        assert payload is not None
++        token_payload = payload.get("control_token_ids")
++        assert isinstance(token_payload, dict)
++        exec_close = int(token_payload["exec_close"])
++        return bool(request._output_token_ids) and (
++            request._output_token_ids[-1] == exec_close
++        )
++
++    def _vllm_exp_fire_boundary(self, request: Request) -> bool:
++        payload = self._vllm_exp_payload(request)
++        assert payload is not None
++        parent_id = request.request_id
++        boundary_index = self._vllm_exp_parent_boundary_counts[parent_id]
++        self._vllm_exp_parent_boundary_counts[parent_id] = boundary_index + 1
++        fire_rate = float(payload.get("fire_rate", 0.10))
++        seed = int(payload.get("seed", 1234))
++        raw = f"{parent_id}:{boundary_index}:{seed}".encode("utf-8")
++        sample = int.from_bytes(hashlib.sha256(raw).digest()[:8], "big") / 2**64
++        return sample < fire_rate
++
++    def _vllm_exp_try_start_branch(self, request: Request) -> bool:
++        if self._vllm_exp_is_hidden(request):
++            return False
++        if not self._vllm_exp_native_enabled(request):
++            return False
++        if not self._vllm_exp_ends_at_boundary(request):
++            return False
++        if not self._vllm_exp_fire_boundary(request):
++            return False
++        return self._vllm_exp_start_branches(request)
++
++    def _vllm_exp_start_branches(self, parent: Request) -> bool:
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None
++        assert self.vllm_config.speculative_config is None, "spec decode unsupported"
++        assert not parent.has_encoder_inputs, "multimodal native branches unsupported"
++        assert not self.is_encoder_decoder, "encoder-decoder native branches unsupported"
++        assert not parent.resumable, "resumable streaming native branches unsupported"
++        assert parent.sampling_params is not None
++        assert parent.request_id not in self._vllm_exp_branch_children
++
++        remaining_tokens = parent.max_tokens - parent.num_output_tokens
++        branch_budget = min(
++            self._vllm_exp_requested_branch_budget(parent, payload),
++            remaining_tokens,
++        )
++        if branch_budget <= 0:
++            self._vllm_exp_log_event(
++                parent,
++                "branch_skip_no_budget",
++                remaining_tokens=remaining_tokens,
++            )
++            return False
++
++        fork_tokens = parent.num_computed_tokens // self.block_size * self.block_size
++        if fork_tokens <= 0:
++            self._vllm_exp_log_event(
++                parent,
++                "branch_skip_no_full_block",
++                block_size=self.block_size,
++                num_computed_tokens=parent.num_computed_tokens,
++            )
++            return False
++        branch_plan = self._vllm_exp_branch_plan(parent, payload)
++        parent_id = parent.request_id
++        self._vllm_exp_branch_children[parent_id] = []
++        self._vllm_exp_pending_branch_plans[parent_id] = list(branch_plan)
++        self._vllm_exp_branch_budgets[parent_id] = branch_budget
++        self._vllm_exp_branch_stop_token_ids[
++            parent_id
++        ] = self._vllm_exp_child_stop_token_ids(parent, payload)
++        self._vllm_exp_branch_fork_tokens[parent_id] = fork_tokens
++        child_ids = self._vllm_exp_launch_branch_wave(parent, first_wave=True)
++        self._vllm_exp_log_event(
++            parent,
++            "branch_start",
++            branch_budget=branch_budget,
++            candidate_count=len(child_ids),
++            total_candidate_count=len(branch_plan),
++            child_ids=child_ids,
++            fork_tokens=fork_tokens,
++            pending_candidate_count=len(self._vllm_exp_pending_branch_plans[parent_id]),
++            num_computed_tokens=parent.num_computed_tokens,
++            output_tokens=parent.num_output_tokens,
++            shared_blocks=fork_tokens // self.block_size,
++        )
++        parent.status = RequestStatus.PREEMPTED
++        return True
++
++    def _vllm_exp_launch_branch_wave(
++        self, parent: Request, first_wave: bool
++    ) -> list[str]:
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None
++        parent_id = parent.request_id
++        pending = self._vllm_exp_pending_branch_plans[parent_id]
++        wave_size = min(
++            max(1, int(payload.get("native_branch_wave_size", 50))),
++            len(pending),
++        )
++        branch_budget = self._vllm_exp_branch_budgets[parent_id]
++        fork_tokens = self._vllm_exp_branch_fork_tokens[parent_id]
++        stop_token_ids = self._vllm_exp_branch_stop_token_ids[parent_id]
++        wave_plan = pending[:wave_size]
++        del pending[:wave_size]
++        child_ids: list[str] = []
++        for candidate_id, initial_script, followup_script in wave_plan:
++            child = self._vllm_exp_make_child(
++                parent,
++                candidate_id,
++                branch_budget,
++                initial_script,
++                followup_script,
++                stop_token_ids,
++            )
++            child.num_computed_tokens = fork_tokens
++            self.kv_cache_manager.fork_blocks(parent, child, fork_tokens)
++            self.requests[child.request_id] = child
++            self.waiting.add_request(child)
++            self._vllm_exp_child_to_parent[child.request_id] = parent_id
++            self._vllm_exp_branch_children[parent_id].append(child.request_id)
++            child_ids.append(child.request_id)
++        if not first_wave:
++            self._vllm_exp_log_event(
++                parent,
++                "branch_wave_start",
++                branch_budget=branch_budget,
++                candidate_count=len(child_ids),
++                child_ids=child_ids,
++                fork_tokens=fork_tokens,
++                pending_candidate_count=len(pending),
++                shared_blocks=fork_tokens // self.block_size,
++            )
++        return child_ids
++
++    def _vllm_exp_requested_branch_budget(
++        self, parent: Request, payload: dict[str, Any]
++    ) -> int:
++        if payload.get("mode") == "eps_on_policy_diverse":
++            return int(payload.get("max_steer_tokens", 30)) + 2
++        return int(payload.get("branch_max_tokens", 700))
++
++    def _vllm_exp_child_stop_token_ids(
++        self, parent: Request, payload: dict[str, Any]
++    ) -> list[int]:
++        if payload.get("mode") != "eps_on_policy_diverse":
++            return []
++        token_payload = payload.get("control_token_ids")
++        assert isinstance(token_payload, dict)
++        return [int(token_payload["steer_close"])]
++
++    def _vllm_exp_branch_plan(
++        self, parent: Request, payload: dict[str, Any]
++    ) -> list[tuple[int, list[int], list[int]]]:
++        mode = payload.get("mode")
++        if mode == "eps_on_policy_diverse":
++            candidate_count = int(payload.get("candidate_count", 50))
++            return [(candidate_id, [], []) for candidate_id in range(candidate_count)]
++        assert mode == "eps_off_policy_verbalized", mode
++        option_count = self._vllm_exp_option_count(parent, payload)
++        option_numbers = self._vllm_exp_option_numbers(parent, payload, option_count)
++        enum_script = self._vllm_exp_verbalized_script(
++            payload, "enumerate", option_count
++        )
++        return [
++            (
++                candidate_id,
++                enum_script,
++                self._vllm_exp_verbalized_script(payload, "continue", option_number),
++            )
++            for candidate_id, option_number in enumerate(option_numbers)
++        ]
++
++    def _vllm_exp_option_count(
++        self, parent: Request, payload: dict[str, Any]
++    ) -> int:
++        min_count = int(payload.get("off_policy_min_candidates", 3))
++        max_count = int(payload.get("off_policy_max_candidates", 10))
++        assert 1 <= min_count <= max_count <= 10
++        span = max_count - min_count + 1
++        if span == 1:
++            return min_count
++        raw = self._vllm_exp_hash_int(parent.request_id, "option_count")
++        return min_count + raw % span
++
++    def _vllm_exp_option_numbers(
++        self, parent: Request, payload: dict[str, Any], option_count: int
++    ) -> list[int]:
++        branch_fanout = int(payload.get("branch_fanout", 2))
++        assert 1 <= branch_fanout <= option_count
++        ranked = sorted(
++            range(1, option_count + 1),
++            key=lambda option: self._vllm_exp_hash_int(
++                parent.request_id, "option", option
++            ),
++        )
++        return ranked[:branch_fanout]
++
++    def _vllm_exp_hash_int(self, *parts: object) -> int:
++        raw = ":".join(str(part) for part in parts).encode("utf-8")
++        return int.from_bytes(hashlib.sha256(raw).digest()[:8], "big")
++
++    def _vllm_exp_verbalized_script(
++        self, payload: dict[str, Any], script_name: str, script_key: int
++    ) -> list[int]:
++        scripts = payload.get("verbalized_token_scripts")
++        assert isinstance(scripts, dict), "missing verbalized token scripts"
++        script_group = scripts.get(script_name)
++        assert isinstance(script_group, dict), f"missing {script_name} scripts"
++        token_ids = script_group.get(str(script_key))
++        assert isinstance(token_ids, list), f"missing {script_name} script {script_key}"
++        return [int(token_id) for token_id in token_ids]
++
++    def _vllm_exp_make_child(
++        self,
++        parent: Request,
++        candidate_id: int,
++        branch_budget: int,
++        initial_script: list[int],
++        followup_script: list[int],
++        stop_token_ids: list[int],
++    ) -> Request:
++        assert parent.sampling_params is not None
++        child_params = parent.sampling_params.clone()
++        self._vllm_exp_set_child_forced_scripts(
++            child_params,
++            parent,
++            initial_script,
++            followup_script,
++        )
++        child_params.max_tokens = (
++            parent.num_output_tokens
++            + len(initial_script)
++            + branch_budget
++            + len(followup_script)
++        )
++        self._vllm_exp_add_child_stop_tokens(child_params, stop_token_ids)
++        child_params.logprobs = max(child_params.logprobs or 0, 1)
++        child_params.n = 1
++        child_id = f"{parent.request_id}::vllm_exp_branch::{candidate_id}"
++        child = Request(
++            request_id=child_id,
++            prompt_token_ids=parent.prompt_token_ids,
++            sampling_params=child_params,
++            pooling_params=None,
++            client_index=parent.client_index,
++            arrival_time=time.time(),
++            prompt_embeds=parent.prompt_embeds,
++            prompt_is_token_ids=parent.prompt_is_token_ids,
++            mm_features=parent.mm_features,
++            lora_request=parent.lora_request,
++            cache_salt=parent.cache_salt,
++            priority=parent.priority,
++            trace_headers=parent.trace_headers,
++            block_hasher=parent._block_hasher,
++            resumable=False,
++        )
++        child.append_output_token_ids(list(parent.output_token_ids))
++        setattr(child, "_vllm_exp_hidden_branch", True)
++        setattr(child, "_vllm_exp_parent_id", parent.request_id)
++        setattr(child, "_vllm_exp_candidate_id", candidate_id)
++        return child
++
++    def _vllm_exp_add_child_stop_tokens(
++        self, child_params: Any, stop_token_ids: list[int]
++    ) -> None:
++        if not stop_token_ids:
++            return
++        existing = list(child_params.stop_token_ids or [])
++        for token_id in stop_token_ids:
++            if token_id not in existing:
++                existing.append(token_id)
++        child_params.stop_token_ids = existing
++        child_params._all_stop_token_ids.update(stop_token_ids)
++
++    def _vllm_exp_set_child_forced_scripts(
++        self,
++        child_params: Any,
++        parent: Request,
++        initial_script: list[int],
++        followup_script: list[int],
++    ) -> None:
++        extra_args = dict(child_params.extra_args or {})
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None
++        child_payload = dict(payload)
++        child_payload["forced_output_start_index"] = parent.num_output_tokens
++        child_payload["forced_output_token_ids"] = list(initial_script)
++        child_payload["forced_after_exec_close_token_ids"] = list(followup_script)
++        child_payload["forced_after_exec_close_trigger_after"] = (
++            parent.num_output_tokens + len(initial_script)
++        )
++        extra_args["vllm_experimental"] = child_payload
++        child_params.extra_args = extra_args
++
++    def _vllm_exp_add_hidden_logprobs(self, request: Request, new_logprobs: Any) -> None:
++        logprob_values = getattr(new_logprobs, "logprobs", None)
++        if logprob_values is None:
++            return
++        self._vllm_exp_hidden_scores[request.request_id] += float(
++            logprob_values[:, 0].sum()
++        )
++
++    def _vllm_exp_complete_hidden_child(self, child: Request) -> Request | None:
++        parent_id = self._vllm_exp_child_to_parent[child.request_id]
++        self._vllm_exp_branch_completed[parent_id].add(child.request_id)
++        child_ids = self._vllm_exp_branch_children[parent_id]
++        if len(self._vllm_exp_branch_completed[parent_id]) < len(child_ids):
++            return None
++
++        parent = self.requests[parent_id]
++        if self._vllm_exp_pending_branch_plans[parent_id]:
++            self._vllm_exp_launch_branch_wave(parent, first_wave=False)
++            return None
++
++        winner_id = self._vllm_exp_select_winner(parent_id, child_ids)
++        winner = self.requests[winner_id]
++        suffix_tokens = max(0, winner.num_output_tokens - parent.num_output_tokens)
++        promoted_blocks = self._vllm_exp_promote_winner(parent, winner)
++        candidate_id = getattr(winner, "_vllm_exp_candidate_id", -1)
++        self._vllm_exp_log_event(
++            parent,
++            "branch_promote",
++            branch_count=len(child_ids),
++            children_freed=len(child_ids),
++            kv_blocks_promoted=promoted_blocks,
++            selected_candidate_id=int(candidate_id),
++            suffix_tokens=suffix_tokens,
++            winner_id=winner_id,
++        )
++        for child_id in child_ids:
++            child_request = self.requests.get(child_id)
++            if child_request is None:
++                continue
++            assert child_request.is_finished(), child_id
++            self._free_request(child_request)
++            self._vllm_exp_hidden_scores.pop(child_id, None)
++            self._vllm_exp_child_to_parent.pop(child_id, None)
++        self._vllm_exp_branch_children.pop(parent_id, None)
++        self._vllm_exp_branch_completed.pop(parent_id, None)
++        self._vllm_exp_pending_branch_plans.pop(parent_id, None)
++        self._vllm_exp_branch_budgets.pop(parent_id, None)
++        self._vllm_exp_branch_stop_token_ids.pop(parent_id, None)
++        self._vllm_exp_branch_fork_tokens.pop(parent_id, None)
++        return parent
++
++    def _vllm_exp_normalized_score(self, child_id: str) -> float:
++        child = self.requests[child_id]
++        parent_id = self._vllm_exp_child_to_parent[child_id]
++        parent = self.requests[parent_id]
++        generated = max(1, child.num_output_tokens - parent.num_output_tokens)
++        return self._vllm_exp_hidden_scores[child_id] / generated
++
++    def _vllm_exp_select_winner(self, parent_id: str, child_ids: list[str]) -> str:
++        parent = self.requests[parent_id]
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None
++        diversity_weight = float(payload.get("diversity_weight", 0.2))
++        return max(
++            child_ids,
++            key=lambda child_id: self._vllm_exp_candidate_score(
++                child_id, child_ids, diversity_weight
++            ),
++        )
++
++    def _vllm_exp_candidate_score(
++        self, child_id: str, child_ids: list[str], diversity_weight: float
++    ) -> float:
++        return self._vllm_exp_normalized_score(
++            child_id
++        ) + diversity_weight * self._vllm_exp_diversity_score(child_id, child_ids)
++
++    def _vllm_exp_diversity_score(self, child_id: str, child_ids: list[str]) -> float:
++        child_tokens = self._vllm_exp_suffix_token_set(child_id)
++        if not child_tokens:
++            return 0.0
++        distances: list[float] = []
++        for other_id in child_ids:
++            if other_id == child_id:
++                continue
++            other_tokens = self._vllm_exp_suffix_token_set(other_id)
++            union_count = len(child_tokens | other_tokens)
++            if union_count == 0:
++                continue
++            distances.append(1.0 - len(child_tokens & other_tokens) / union_count)
++        if not distances:
++            return 0.0
++        return sum(distances) / len(distances)
++
++    def _vllm_exp_suffix_token_set(self, child_id: str) -> set[int]:
++        child = self.requests[child_id]
++        parent_id = self._vllm_exp_child_to_parent[child_id]
++        parent = self.requests[parent_id]
++        return set(child.output_token_ids[parent.num_output_tokens :])
++
++    def _vllm_exp_promote_winner(self, parent: Request, winner: Request) -> int:
++        assert winner.num_output_tokens >= parent.num_output_tokens
++        suffix = list(winner.output_token_ids[parent.num_output_tokens :])
++        if suffix:
++            parent.append_output_token_ids(suffix)
++        setattr(parent, "_vllm_exp_promoted_token_ids", suffix)
++        promoted_blocks = self.kv_cache_manager.promote_blocks(winner, parent)
++        parent.num_computed_tokens = min(
++            parent.num_computed_tokens,
++            max(0, parent.num_tokens - 1),
++        )
++        return promoted_blocks
++
++    def _vllm_exp_resume_parent(self, parent: Request) -> None:
++        parent.status = RequestStatus.PREEMPTED
++        self._vllm_exp_suspended_parent_ids.discard(parent.request_id)
++        self.waiting.prepend_request(parent)
++
++    def _vllm_exp_log_event(
++        self, request: Request, event: str, **fields: Any
++    ) -> None:
++        payload = self._vllm_exp_payload(request)
++        if payload is None:
++            return
++        raw_path = payload.get("native_event_log_path")
++        if not isinstance(raw_path, str) or not raw_path:
++            return
++        record = {
++            "event": event,
++            "request_id": request.request_id,
++            "time_unix": time.time(),
++            **fields,
++        }
++        with open(raw_path, "a", encoding="utf-8") as handle:
++            handle.write(json.dumps(record, sort_keys=True) + "\n")
++
+     def _update_request_with_output(
+         self, request: Request, new_token_ids: list[int]
+     ) -> tuple[list[int], bool]:
+@@ -1848,8 +2353,9 @@
+         self.encoder_cache_manager.free(request)
+         request_id = request.request_id
+         self.finished_req_ids.add(request_id)
+-        if self.finished_req_ids_dict is not None:
+-            self.finished_req_ids_dict[request.client_index].add(request_id)
++        if not self._vllm_exp_is_hidden(request):
++            if self.finished_req_ids_dict is not None:
++                self.finished_req_ids_dict[request.client_index].add(request_id)
+ 
+         delay_free_blocks |= connector_delay_free_blocks
+         if not delay_free_blocks:

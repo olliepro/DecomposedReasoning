@@ -1,0 +1,84 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -291,6 +291,7 @@
+         self._vllm_exp_hidden_vector_counts: dict[str, int] = defaultdict(int)
+         self._vllm_exp_child_to_parent: dict[str, str] = {}
+         self._vllm_exp_parent_boundary_counts: dict[str, int] = defaultdict(int)
++        self._vllm_exp_parent_branch_fires: dict[str, int] = {}
+         self._vllm_exp_off_policy_pending_options: dict[str, list[int]] = {}
+         self._vllm_exp_off_policy_branch_options: dict[str, list[int]] = {}
+ 
+@@ -1778,11 +1779,36 @@
+         parent_id = request.request_id
+         boundary_index = self._vllm_exp_parent_boundary_counts[parent_id]
+         self._vllm_exp_parent_boundary_counts[parent_id] = boundary_index + 1
++        branch_depth_used = self._vllm_exp_branch_depth_used(request)
++        branch_depth_limit = int(payload.get("branch_depth", 4))
++        assert branch_depth_limit >= 1, "branch_depth must be positive"
++        if branch_depth_used >= branch_depth_limit:
++            self._vllm_exp_log_event(
++                request,
++                "branch_skip_depth_limit",
++                boundary_index=boundary_index,
++                branch_depth_used=branch_depth_used,
++                branch_depth_limit=branch_depth_limit,
++            )
++            return False
+         fire_rate = float(payload.get("fire_rate", 0.10))
+         seed = int(payload.get("seed", 1234))
+         raw = f"{parent_id}:{boundary_index}:{seed}".encode("utf-8")
+         sample = int.from_bytes(hashlib.sha256(raw).digest()[:8], "big") / 2**64
+-        return sample < fire_rate
++        if sample >= fire_rate:
++            return False
++        self._vllm_exp_parent_branch_fires[parent_id] = branch_depth_used + 1
++        return True
++
++    def _vllm_exp_branch_depth_used(self, request: Request) -> int:
++        payload = self._vllm_exp_payload(request)
++        assert payload is not None
++        parent_id = request.request_id
++        if parent_id not in self._vllm_exp_parent_branch_fires:
++            self._vllm_exp_parent_branch_fires[parent_id] = int(
++                payload.get("branch_depth_start", 0)
++            )
++        return self._vllm_exp_parent_branch_fires[parent_id]
+ 
+     def _vllm_exp_try_start_branch(self, request: Request) -> bool:
+         if self._vllm_exp_is_hidden(request):
+@@ -1933,6 +1959,8 @@
+             parent,
+             "branch_start",
+             branch_budget=branch_budget,
++            branch_depth_limit=int(payload.get("branch_depth", 4)),
++            branch_depth_used=self._vllm_exp_branch_depth_used(parent),
+             candidate_count=len(child_ids),
+             total_candidate_count=len(branch_plan),
+             child_ids=child_ids,
+@@ -2235,6 +2263,8 @@
+                 parent,
+                 "branch_return",
+                 branch_count=len(child_ids),
++                branch_depth_limit=int(payload.get("branch_depth", 4)),
++                branch_depth_used=self._vllm_exp_branch_depth_used(parent),
+                 children_freed=len(child_ids),
+                 candidate_audit=candidate_audit,
+                 diversity_vector_source=diversity_source,
+@@ -2269,6 +2299,8 @@
+                 parent,
+                 "branch_promote",
+                 branch_count=len(child_ids),
++                branch_depth_limit=int(payload.get("branch_depth", 4)),
++                branch_depth_used=self._vllm_exp_branch_depth_used(parent),
+                 children_freed=len(child_ids),
+                 candidate_audit=candidate_audit,
+                 diversity_vector_source=diversity_source,
+@@ -2299,6 +2331,8 @@
+         self._vllm_exp_branch_stop_token_ids.pop(parent_id, None)
+         self._vllm_exp_branch_fork_tokens.pop(parent_id, None)
+         self._vllm_exp_off_policy_branch_options.pop(parent_id, None)
++        if getattr(parent, "_vllm_exp_branch_output_records", None) is not None:
++            self._vllm_exp_parent_branch_fires.pop(parent_id, None)
+         return parent
+ 
+     def _vllm_exp_return_child_ids(

@@ -1,0 +1,112 @@
+--- vllm/v1/core/single_type_kv_cache_manager.py
++++ vllm/v1/core/single_type_kv_cache_manager.py
+@@ -374,6 +374,25 @@
+             self.num_cached_block.pop(target_request_id, None)
+         return len(source_blocks)
+ 
++    def trim_blocks(self, request_id: str, num_computed_tokens: int) -> int:
++        """Drop blocks after the computed-token prefix for token-stream rewrites."""
++        req_blocks = self.req_to_blocks.get(request_id)
++        if not req_blocks:
++            self.num_cached_block.pop(request_id, None)
++            return 0
++        retained_count = min(len(req_blocks), num_computed_tokens // self.block_size)
++        stale_blocks = req_blocks[retained_count:]
++        if stale_blocks:
++            del req_blocks[retained_count:]
++            self.block_pool.free_blocks(reversed(stale_blocks))
++        cached_count = self.num_cached_block.get(request_id)
++        if cached_count is not None:
++            if retained_count > 0:
++                self.num_cached_block[request_id] = min(cached_count, retained_count)
++            else:
++                self.num_cached_block.pop(request_id, None)
++        return len(stale_blocks)
++
+     def free(self, request_id: str) -> None:
+         """
+         Free the blocks for the request.
+@@ -1153,6 +1172,16 @@
+             self.last_state_block_idx.pop(target_request_id, None)
+         return block_count
+ 
++    def trim_blocks(self, request_id: str, num_computed_tokens: int) -> int:
++        trimmed_count = super().trim_blocks(request_id, num_computed_tokens)
++        retained_count = num_computed_tokens // self.block_size
++        if retained_count <= 0:
++            self._allocated_block_reqs.discard(request_id)
++            self.last_state_block_idx.pop(request_id, None)
++        elif self.last_state_block_idx.get(request_id, -1) >= retained_count:
++            self.last_state_block_idx.pop(request_id, None)
++        return trimmed_count
++
+     def free(self, request_id: str) -> None:
+         if self.mamba_cache_mode == "align":
+             self._allocated_block_reqs.discard(request_id)
+--- vllm/v1/core/kv_cache_coordinator.py
++++ vllm/v1/core/kv_cache_coordinator.py
+@@ -233,6 +233,13 @@
+             )
+         return block_count
+ 
++    def trim_blocks(self, request_id: str, num_computed_tokens: int) -> int:
++        """Drop blocks after a request's retained computed-token prefix."""
++        block_count = 0
++        for manager in self.single_type_managers:
++            block_count += manager.trim_blocks(request_id, num_computed_tokens)
++        return block_count
++
+     def free(self, request_id: str) -> None:
+         """
+         Free the blocks for the request.
+--- vllm/v1/core/kv_cache_manager.py
++++ vllm/v1/core/kv_cache_manager.py
+@@ -579,6 +579,10 @@
+         target_request.num_computed_tokens = source_request.num_computed_tokens
+         return block_count
+ 
++    def trim_blocks(self, request_id: str, num_computed_tokens: int) -> int:
++        """Drop request blocks after a retained computed-token prefix."""
++        return self.coordinator.trim_blocks(request_id, num_computed_tokens)
++
+     def create_kv_cache_blocks(
+         self, blocks: tuple[list[KVCacheBlock], ...]
+     ) -> KVCacheBlocks:
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -2558,7 +2558,7 @@
+                 if hidden_vector_child_count
+                 else 0.0
+             )
+-            promoted_blocks = self._vllm_exp_promote_winner(parent, winner_id)
++            trimmed_blocks = self._vllm_exp_promote_winner(parent, winner_id)
+             self._vllm_exp_log_event(
+                 parent,
+                 "branch_promote",
+@@ -2571,7 +2571,8 @@
+                 hidden_vector_child_count=hidden_vector_child_count,
+                 pool_hidden_pairwise_diversity=pool_hidden_pairwise_diversity,
+                 selected_hidden_diversity=selected_hidden_diversity,
+-                kv_blocks_promoted=promoted_blocks,
++                kv_blocks_promoted=0,
++                kv_blocks_trimmed=trimmed_blocks,
+                 candidate_bound=candidate_bound,
+                 selected_candidate_id=int(candidate_id),
+                 suffix_tokens=suffix_tokens,
+@@ -2840,11 +2841,15 @@
+             parent.request_id,
+             parent.num_computed_tokens,
+         )
++        trimmed_blocks = self.kv_cache_manager.trim_blocks(
++            parent.request_id,
++            replay_from_tokens,
++        )
+         parent.num_computed_tokens = min(
+             replay_from_tokens,
+             max(0, parent.num_tokens - 1),
+         )
+-        return 0
++        return trimmed_blocks
+ 
+     def _vllm_exp_finish_parent_if_limit_reached(self, parent: Request) -> bool:
+         if (

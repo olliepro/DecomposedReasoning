@@ -1,0 +1,158 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -291,6 +291,8 @@
+         self._vllm_exp_hidden_vector_counts: dict[str, int] = defaultdict(int)
+         self._vllm_exp_child_to_parent: dict[str, str] = {}
+         self._vllm_exp_parent_boundary_counts: dict[str, int] = defaultdict(int)
++        self._vllm_exp_off_policy_pending_options: dict[str, list[int]] = {}
++        self._vllm_exp_off_policy_branch_options: dict[str, list[int]] = {}
+ 
+     def _mamba_block_aligned_split(
+         self,
+@@ -1772,10 +1774,97 @@
+             return False
+         if not self._vllm_exp_ends_at_boundary(request):
+             return False
++        off_policy_result = self._vllm_exp_complete_off_policy_enumeration(request)
++        if off_policy_result is not None:
++            return off_policy_result
+         if not self._vllm_exp_fire_boundary(request):
+             return False
++        if self._vllm_exp_start_off_policy_enumeration(request):
++            return False
+         return self._vllm_exp_start_branches(request)
+ 
++    def _vllm_exp_start_off_policy_enumeration(self, parent: Request) -> bool:
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None
++        if payload.get("mode") != "eps_off_policy_verbalized":
++            return False
++        option_count = self._vllm_exp_option_count(parent, payload)
++        option_numbers = self._vllm_exp_option_numbers(parent, payload, option_count)
++        enum_script = self._vllm_exp_verbalized_script(
++            payload, "enumerate", option_count
++        )
++        self._vllm_exp_off_policy_pending_options[parent.request_id] = option_numbers
++        self._vllm_exp_force_parent_script(parent, enum_script)
++        self._vllm_exp_log_event(
++            parent,
++            "off_policy_enumerate_inline",
++            option_count=option_count,
++            option_numbers=option_numbers,
++            script_tokens=len(enum_script),
++        )
++        return True
++
++    def _vllm_exp_complete_off_policy_enumeration(
++        self, parent: Request
++    ) -> bool | None:
++        option_numbers = self._vllm_exp_off_policy_pending_options.pop(
++            parent.request_id, None
++        )
++        if option_numbers is None:
++            return None
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None
++        if len(option_numbers) == 1:
++            continue_script = self._vllm_exp_continue_script_after_boundary(
++                payload, option_numbers[0]
++            )
++            self._vllm_exp_force_parent_script(parent, continue_script)
++            self._vllm_exp_log_event(
++                parent,
++                "off_policy_continue_inline",
++                option_number=option_numbers[0],
++                script_tokens=len(continue_script),
++            )
++            return False
++        self._vllm_exp_off_policy_branch_options[parent.request_id] = option_numbers
++        self._vllm_exp_log_event(
++            parent,
++            "off_policy_continue_branch",
++            option_numbers=option_numbers,
++            branch_fanout=len(option_numbers),
++        )
++        if self._vllm_exp_start_branches(parent):
++            return True
++        self._vllm_exp_off_policy_branch_options.pop(parent.request_id, None)
++        continue_script = self._vllm_exp_continue_script_after_boundary(
++            payload, option_numbers[0]
++        )
++        self._vllm_exp_force_parent_script(parent, continue_script)
++        self._vllm_exp_log_event(
++            parent,
++            "off_policy_continue_inline_fallback",
++            option_number=option_numbers[0],
++            script_tokens=len(continue_script),
++        )
++        return False
++
++    def _vllm_exp_force_parent_script(
++        self, parent: Request, token_ids: list[int]
++    ) -> None:
++        assert parent.sampling_params is not None
++        extra_args = dict(parent.sampling_params.extra_args or {})
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None
++        parent_payload = dict(payload)
++        parent_payload["forced_output_start_index"] = parent.num_output_tokens
++        parent_payload["forced_output_token_ids"] = list(token_ids)
++        parent_payload["forced_after_exec_close_token_ids"] = []
++        parent_payload["forced_after_exec_close_trigger_after"] = (
++            parent.num_output_tokens + len(token_ids)
++        )
++        extra_args["vllm_experimental"] = parent_payload
++        parent.sampling_params.extra_args = extra_args
++
+     def _vllm_exp_start_branches(self, parent: Request) -> bool:
+         payload = self._vllm_exp_payload(parent)
+         assert payload is not None
+@@ -1916,16 +2005,14 @@
+                 for candidate_id in range(candidate_count)
+             ]
+         assert mode == "eps_off_policy_verbalized", mode
+-        option_count = self._vllm_exp_option_count(parent, payload)
+-        option_numbers = self._vllm_exp_option_numbers(parent, payload, option_count)
+-        enum_script = self._vllm_exp_verbalized_script(
+-            payload, "enumerate", option_count
++        option_numbers = self._vllm_exp_off_policy_branch_options.pop(
++            parent.request_id
+         )
+         return [
+             (
+                 candidate_id,
+-                enum_script,
+-                self._vllm_exp_verbalized_script(payload, "continue", option_number),
++                self._vllm_exp_continue_script_after_boundary(payload, option_number),
++                [],
+             )
+             for candidate_id, option_number in enumerate(option_numbers)
+         ]
+@@ -1970,6 +2057,19 @@
+         assert isinstance(token_ids, list), f"missing {script_name} script {script_key}"
+         return [int(token_id) for token_id in token_ids]
+ 
++    def _vllm_exp_continue_script_after_boundary(
++        self, payload: dict[str, Any], option_number: int
++    ) -> list[int]:
++        token_ids = self._vllm_exp_verbalized_script(
++            payload, "continue", option_number
++        )
++        token_payload = payload.get("control_token_ids")
++        assert isinstance(token_payload, dict)
++        newline = token_payload.get("newline")
++        if newline is not None and token_ids and token_ids[0] == int(newline):
++            return token_ids[1:]
++        return token_ids
++
+     def _vllm_exp_make_child(
+         self,
+         parent: Request,
+@@ -2142,6 +2242,7 @@
+         self._vllm_exp_branch_budgets.pop(parent_id, None)
+         self._vllm_exp_branch_stop_token_ids.pop(parent_id, None)
+         self._vllm_exp_branch_fork_tokens.pop(parent_id, None)
++        self._vllm_exp_off_policy_branch_options.pop(parent_id, None)
+         return parent
+ 
+     def _vllm_exp_select_winner(

@@ -1,0 +1,16 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -2258,7 +2258,13 @@
+             if fast_lane and self.policy == SchedulingPolicy.PRIORITY:
+                 child.priority -= int(payload.get("native_branch_priority_boost", 1000))
+             child.num_computed_tokens = fork_tokens
++            assert child.num_computed_tokens <= child.num_tokens, (
++                "native branch fork prefix exceeds child prompt length"
++            )
+             self.kv_cache_manager.fork_blocks(parent, child, fork_tokens)
++            if child.num_computed_tokens == child.num_tokens:
++                assert child.num_tokens > 0
++                child.num_computed_tokens = child.num_tokens - 1
+             self.requests[child.request_id] = child
+             self._vllm_exp_child_to_parent[child.request_id] = parent_id
+             self._vllm_exp_branch_children[parent_id].append(child.request_id)

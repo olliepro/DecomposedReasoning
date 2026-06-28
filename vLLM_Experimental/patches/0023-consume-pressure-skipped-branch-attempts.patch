@@ -1,0 +1,37 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -1804,26 +1804,28 @@
+                 branch_depth_limit=branch_depth_limit,
+             )
+             return False
++        fire_rate = float(payload.get("fire_rate", 0.10))
++        seed = int(payload.get("seed", 1234))
++        raw = f"{parent_id}:{boundary_index}:{seed}".encode("utf-8")
++        sample = int.from_bytes(hashlib.sha256(raw).digest()[:8], "big") / 2**64
++        if sample >= fire_rate:
++            return False
+         pressure_report = self._vllm_exp_branch_pressure_report(
+             request,
+             include_queued=True,
+         )
+         if not pressure_report["admissible"]:
++            self._vllm_exp_consume_branch_depth(request)
+             self._vllm_exp_log_event(
+                 request,
+                 "branch_skip_backpressure",
+                 boundary_index=boundary_index,
+                 branch_depth_used=branch_depth_used,
+                 branch_depth_limit=branch_depth_limit,
++                branch_depth_consumed=True,
+                 **pressure_report,
+             )
+             return False
+-        fire_rate = float(payload.get("fire_rate", 0.10))
+-        seed = int(payload.get("seed", 1234))
+-        raw = f"{parent_id}:{boundary_index}:{seed}".encode("utf-8")
+-        sample = int.from_bytes(hashlib.sha256(raw).digest()[:8], "big") / 2**64
+-        if sample >= fire_rate:
+-            return False
+         return True
+ 
+     def _vllm_exp_consume_branch_depth(self, request: Request) -> None:

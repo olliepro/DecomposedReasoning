@@ -1,0 +1,32 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -1803,9 +1803,14 @@
+         sample = int.from_bytes(hashlib.sha256(raw).digest()[:8], "big") / 2**64
+         if sample >= fire_rate:
+             return False
+-        self._vllm_exp_parent_branch_fires[parent_id] = branch_depth_used + 1
+         return True
+ 
++    def _vllm_exp_consume_branch_depth(self, request: Request) -> None:
++        branch_depth_used = self._vllm_exp_branch_depth_used(request)
++        self._vllm_exp_parent_branch_fires[request.request_id] = (
++            branch_depth_used + 1
++        )
++
+     def _vllm_exp_branch_depth_used(self, request: Request) -> int:
+         payload = self._vllm_exp_payload(request)
+         assert payload is not None
+@@ -1829,8 +1834,12 @@
+         if not self._vllm_exp_fire_boundary(request):
+             return False
+         if self._vllm_exp_start_off_policy_enumeration(request):
++            self._vllm_exp_consume_branch_depth(request)
+             return False
+-        return self._vllm_exp_start_branches(request)
++        started = self._vllm_exp_start_branches(request)
++        if started:
++            self._vllm_exp_consume_branch_depth(request)
++        return started
+ 
+     def _vllm_exp_start_off_policy_enumeration(self, parent: Request) -> bool:
+         payload = self._vllm_exp_payload(parent)

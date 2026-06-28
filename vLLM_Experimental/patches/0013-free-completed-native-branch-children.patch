@@ -1,0 +1,194 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -289,6 +289,7 @@
+         self._vllm_exp_branch_fork_tokens: dict[str, int] = {}
+         self._vllm_exp_hidden_vector_sums: dict[str, list[float]] = {}
+         self._vllm_exp_hidden_vector_counts: dict[str, int] = defaultdict(int)
++        self._vllm_exp_child_products: dict[str, dict[str, Any]] = {}
+         self._vllm_exp_child_to_parent: dict[str, str] = {}
+         self._vllm_exp_parent_boundary_counts: dict[str, int] = defaultdict(int)
+         self._vllm_exp_parent_branch_fires: dict[str, int] = {}
+@@ -2214,6 +2215,8 @@
+     def _vllm_exp_complete_hidden_child(self, child: Request) -> Request | None:
+         parent_id = self._vllm_exp_child_to_parent[child.request_id]
+         self._vllm_exp_branch_completed[parent_id].add(child.request_id)
++        self._vllm_exp_store_child_product(child)
++        self._free_request(child)
+         child_ids = self._vllm_exp_branch_children[parent_id]
+         if len(self._vllm_exp_branch_completed[parent_id]) < len(child_ids):
+             return None
+@@ -2274,7 +2277,7 @@
+                 returned_branch_count=len(branch_outputs),
+                 returned_candidate_ids=self._vllm_exp_candidate_ids(returned_child_ids),
+                 returned_suffix_tokens=[
+-                    len(self.requests[child_id].output_token_ids)
++                    len(self._vllm_exp_child_suffix_token_ids(child_id))
+                     for child_id in returned_child_ids
+                 ],
+                 top_k_candidate_ids=self._vllm_exp_candidate_ids(top_k_child_ids),
+@@ -2286,15 +2289,14 @@
+                 if returned_child_ids
+                 else self._vllm_exp_select_winner(parent_id, top_k_child_ids)
+             )
+-            winner = self.requests[winner_id]
+-            suffix_tokens = winner.num_output_tokens
+-            candidate_id = getattr(winner, "_vllm_exp_candidate_id", -1)
++            suffix_tokens = len(self._vllm_exp_child_suffix_token_ids(winner_id))
++            candidate_id = self._vllm_exp_child_candidate_id(winner_id)
+             selected_hidden_diversity = (
+                 self._vllm_exp_hidden_vector_diversity_for_child(winner_id, child_ids)
+                 if hidden_vector_child_count
+                 else 0.0
+             )
+-            promoted_blocks = self._vllm_exp_promote_winner(parent, winner)
++            promoted_blocks = self._vllm_exp_promote_winner(parent, winner_id)
+             self._vllm_exp_log_event(
+                 parent,
+                 "branch_promote",
+@@ -2316,11 +2318,7 @@
+                 winner_id=winner_id,
+             )
+         for child_id in child_ids:
+-            child_request = self.requests.get(child_id)
+-            if child_request is None:
+-                continue
+-            assert child_request.is_finished(), child_id
+-            self._free_request(child_request)
++            self._vllm_exp_child_products.pop(child_id, None)
+             self._vllm_exp_hidden_vector_sums.pop(child_id, None)
+             self._vllm_exp_hidden_vector_counts.pop(child_id, None)
+             self._vllm_exp_child_to_parent.pop(child_id, None)
+@@ -2335,6 +2333,40 @@
+             self._vllm_exp_parent_branch_fires.pop(parent_id, None)
+         return parent
+ 
++    def _vllm_exp_store_child_product(self, child: Request) -> None:
++        child_id = child.request_id
++        assert child_id not in self._vllm_exp_child_products
++        finish_reason = child.get_finished_reason()
++        self._vllm_exp_child_products[child_id] = {
++            "candidate_id": int(getattr(child, "_vllm_exp_candidate_id", -1)),
++            "child_id": child_id,
++            "finish_reason": str(finish_reason) if finish_reason is not None else None,
++            "stop_reason": child.stop_reason,
++            "suffix_token_ids": list(child.output_token_ids),
++        }
++
++    def _vllm_exp_child_product(self, child_id: str) -> dict[str, Any]:
++        product = self._vllm_exp_child_products.get(child_id)
++        if product is not None:
++            return product
++        child = self.requests[child_id]
++        finish_reason = child.get_finished_reason()
++        return {
++            "candidate_id": int(getattr(child, "_vllm_exp_candidate_id", -1)),
++            "child_id": child_id,
++            "finish_reason": str(finish_reason) if finish_reason is not None else None,
++            "stop_reason": child.stop_reason,
++            "suffix_token_ids": list(child.output_token_ids),
++        }
++
++    def _vllm_exp_child_suffix_token_ids(self, child_id: str) -> list[int]:
++        suffix = self._vllm_exp_child_product(child_id)["suffix_token_ids"]
++        assert isinstance(suffix, list)
++        return [int(token_id) for token_id in suffix]
++
++    def _vllm_exp_child_candidate_id(self, child_id: str) -> int:
++        return int(self._vllm_exp_child_product(child_id)["candidate_id"])
++
+     def _vllm_exp_return_child_ids(
+         self,
+         *,
+@@ -2362,20 +2394,17 @@
+         top_k_ids = set(top_k_child_ids)
+         records: list[dict[str, Any]] = []
+         for index, child_id in enumerate(child_ids):
+-            child = self.requests[child_id]
+-            candidate_id = int(getattr(child, "_vllm_exp_candidate_id", index))
+-            suffix = list(child.output_token_ids)
+-            finish_reason = child.get_finished_reason()
++            product = self._vllm_exp_child_product(child_id)
++            candidate_id = int(product.get("candidate_id", index))
++            suffix = self._vllm_exp_child_suffix_token_ids(child_id)
+             records.append(
+                 {
+                     "index": candidate_id,
+                     "candidate_id": candidate_id,
+                     "child_id": child_id,
+-                    "finish_reason": (
+-                        str(finish_reason) if finish_reason is not None else None
+-                    ),
++                    "finish_reason": product.get("finish_reason"),
+                     "in_diverse_top_k": child_id in top_k_ids,
+-                    "stop_reason": child.stop_reason,
++                    "stop_reason": product.get("stop_reason"),
+                     "suffix_token_ids": suffix,
+                     "token_ids": list(parent.output_token_ids) + suffix,
+                 }
+@@ -2424,7 +2453,7 @@
+         first_order: dict[tuple[int, ...], int] = {}
+         representatives: dict[tuple[int, ...], str] = {}
+         for index, child_id in enumerate(child_ids):
+-            suffix = tuple(self.requests[child_id].output_token_ids)
++            suffix = tuple(self._vllm_exp_child_suffix_token_ids(child_id))
+             counts[suffix] += 1
+             first_order.setdefault(suffix, index)
+             representatives.setdefault(suffix, child_id)
+@@ -2450,10 +2479,7 @@
+         return 1.0 - len(left_tokens & right_tokens) / union_count
+ 
+     def _vllm_exp_candidate_ids(self, child_ids: list[str]) -> list[int]:
+-        return [
+-            int(getattr(self.requests[child_id], "_vllm_exp_candidate_id", -1))
+-            for child_id in child_ids
+-        ]
++        return [self._vllm_exp_child_candidate_id(child_id) for child_id in child_ids]
+ 
+     def _vllm_exp_average_hidden_vector(self, child_id: str) -> list[float] | None:
+         vector_sum = self._vllm_exp_hidden_vector_sums.get(child_id)
+@@ -2514,13 +2540,10 @@
+         records: list[dict[str, Any]] = []
+         top_k_ids = set(top_k_child_ids)
+         for child_id in child_ids:
+-            child = self.requests[child_id]
+-            suffix = list(child.output_token_ids)
++            suffix = self._vllm_exp_child_suffix_token_ids(child_id)
+             records.append(
+                 {
+-                    "candidate_id": int(
+-                        getattr(child, "_vllm_exp_candidate_id", -1)
+-                    ),
++                    "candidate_id": self._vllm_exp_child_candidate_id(child_id),
+                     "child_id": child_id,
+                     "suffix_token_ids": suffix,
+                     "suffix_token_count": len(suffix),
+@@ -2542,20 +2565,22 @@
+         return dot / (left_norm * right_norm)
+ 
+     def _vllm_exp_suffix_token_set(self, child_id: str) -> set[int]:
+-        child = self.requests[child_id]
+-        return set(child.output_token_ids)
++        return set(self._vllm_exp_child_suffix_token_ids(child_id))
+ 
+-    def _vllm_exp_promote_winner(self, parent: Request, winner: Request) -> int:
+-        suffix = list(winner.output_token_ids)
++    def _vllm_exp_promote_winner(self, parent: Request, winner_id: str) -> int:
++        suffix = self._vllm_exp_child_suffix_token_ids(winner_id)
+         if suffix:
+             parent.append_output_token_ids(suffix)
+         setattr(parent, "_vllm_exp_promoted_token_ids", suffix)
+-        promoted_blocks = self.kv_cache_manager.promote_blocks(winner, parent)
+-        parent.num_computed_tokens = min(
++        replay_from_tokens = self._vllm_exp_branch_fork_tokens.get(
++            parent.request_id,
+             parent.num_computed_tokens,
++        )
++        parent.num_computed_tokens = min(
++            replay_from_tokens,
+             max(0, parent.num_tokens - 1),
+         )
+-        return promoted_blocks
++        return 0
+ 
+     def _vllm_exp_finish_parent_if_limit_reached(self, parent: Request) -> bool:
+         if (

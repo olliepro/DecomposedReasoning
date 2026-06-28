@@ -1,0 +1,20 @@
+diff -ruN -x __pycache__ vllm/v1/core/sched/scheduler.py vllm/v1/core/sched/scheduler.py
+--- vllm/v1/core/sched/scheduler.py	2026-06-26 20:45:29.305216532 -0400
++++ vllm/v1/core/sched/scheduler.py	2026-06-26 22:10:00.000000000 -0400
+@@ -1731,4 +1731,13 @@
+         exec_close = int(token_payload["exec_close"])
+-        return bool(request._output_token_ids) and (
+-            request._output_token_ids[-1] == exec_close
+-        )
++        think_close = int(token_payload["think_close"])
++        if think_close in request._output_token_ids:
++            return False
++        newline = token_payload.get("newline")
++        if not request._output_token_ids:
++            return False
++        if newline is not None:
++            return len(request._output_token_ids) >= 2 and (
++                request._output_token_ids[-2] == exec_close
++                and request._output_token_ids[-1] == int(newline)
++            )
++        return request._output_token_ids[-1] == exec_close

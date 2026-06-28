@@ -475,11 +475,16 @@ def expand_experiments(
                     )
                 if not config.run_matrix.include_epsilon_greedy:
                     continue
+                epsilon_mode = (
+                    "epsilon_greedy_off_policy"
+                    if config.branching.verbalized_off_policy_enabled
+                    else "epsilon_greedy"
+                )
                 experiments.append(
                     ExperimentSpec(
                         task_name=task_name,
                         model_id=model_spec.model_id,
-                        mode="epsilon_greedy",
+                        mode=epsilon_mode,
                         selector=EPSILON_GREEDY_SELECTOR,
                         seed=seed,
                         baseline_rollouts=config.run_matrix.baseline_rollouts,

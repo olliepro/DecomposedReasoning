@@ -1,0 +1,247 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -287,7 +287,6 @@
+         self._vllm_exp_branch_budgets: dict[str, int] = {}
+         self._vllm_exp_branch_stop_token_ids: dict[str, list[int]] = {}
+         self._vllm_exp_branch_fork_tokens: dict[str, int] = {}
+-        self._vllm_exp_hidden_scores: dict[str, float] = defaultdict(float)
+         self._vllm_exp_hidden_vector_sums: dict[str, list[float]] = {}
+         self._vllm_exp_hidden_vector_counts: dict[str, int] = defaultdict(int)
+         self._vllm_exp_child_to_parent: dict[str, str] = {}
+@@ -1517,8 +1516,6 @@
+                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
+ 
+             if self._vllm_exp_is_hidden(request):
+-                if new_logprobs is not None:
+-                    self._vllm_exp_add_hidden_logprobs(request, new_logprobs)
+                 hidden_vectors = model_runner_output.vllm_experimental_hidden_vectors
+                 if hidden_vectors is not None and new_token_ids:
+                     self._vllm_exp_add_hidden_vector(request, hidden_vectors[req_index])
+@@ -1978,7 +1975,6 @@
+         )
+         child_params.max_tokens = len(initial_script) + branch_budget + len(followup_script)
+         self._vllm_exp_add_child_stop_tokens(child_params, stop_token_ids)
+-        child_params.logprobs = max(child_params.logprobs or 0, 1)
+         child_params.n = 1
+         child_id = f"{parent.request_id}::vllm_exp_branch::{candidate_id}"
+         child = Request(
+@@ -2042,14 +2038,6 @@
+         extra_args["vllm_experimental"] = child_payload
+         child_params.extra_args = extra_args
+ 
+-    def _vllm_exp_add_hidden_logprobs(self, request: Request, new_logprobs: Any) -> None:
+-        logprob_values = getattr(new_logprobs, "logprobs", None)
+-        if logprob_values is None:
+-            return
+-        self._vllm_exp_hidden_scores[request.request_id] += float(
+-            logprob_values[:, 0].sum()
+-        )
+-
+     def _vllm_exp_add_hidden_vector(
+         self, request: Request, vector: list[float] | None
+     ) -> None:
+@@ -2076,7 +2064,8 @@
+             self._vllm_exp_launch_branch_wave(parent, first_wave=False)
+             return None
+ 
+-        winner_id = self._vllm_exp_select_winner(parent_id, child_ids)
++        top_k_child_ids = self._vllm_exp_diverse_top_k_child_ids(child_ids)
++        winner_id = self._vllm_exp_select_winner(parent_id, top_k_child_ids)
+         winner = self.requests[winner_id]
+         suffix_tokens = winner.num_output_tokens
+         candidate_id = getattr(winner, "_vllm_exp_candidate_id", -1)
+@@ -2095,12 +2084,9 @@
+             if hidden_vector_child_count
+             else 0.0
+         )
+-        payload = self._vllm_exp_payload(parent)
+-        assert payload is not None
+-        diversity_weight = float(payload.get("diversity_weight", 0.2))
+         candidate_audit = self._vllm_exp_candidate_audit_records(
+             child_ids=child_ids,
+-            diversity_weight=diversity_weight,
++            top_k_child_ids=top_k_child_ids,
+         )
+         promoted_blocks = self._vllm_exp_promote_winner(parent, winner)
+         self._vllm_exp_log_event(
+@@ -2118,8 +2104,13 @@
+             pool_hidden_pairwise_diversity=pool_hidden_pairwise_diversity,
+             selected_hidden_diversity=selected_hidden_diversity,
+             kv_blocks_promoted=promoted_blocks,
++            candidate_bound=self._vllm_exp_candidate_bound(
++                len(self._vllm_exp_unique_child_ids(child_ids))
++            ),
+             selected_candidate_id=int(candidate_id),
+             suffix_tokens=suffix_tokens,
++            top_k_candidate_ids=self._vllm_exp_candidate_ids(top_k_child_ids),
++            unique_candidate_count=len(self._vllm_exp_unique_child_ids(child_ids)),
+             winner_id=winner_id,
+         )
+         for child_id in child_ids:
+@@ -2128,7 +2119,6 @@
+                 continue
+             assert child_request.is_finished(), child_id
+             self._free_request(child_request)
+-            self._vllm_exp_hidden_scores.pop(child_id, None)
+             self._vllm_exp_hidden_vector_sums.pop(child_id, None)
+             self._vllm_exp_hidden_vector_counts.pop(child_id, None)
+             self._vllm_exp_child_to_parent.pop(child_id, None)
+@@ -2140,55 +2130,78 @@
+         self._vllm_exp_branch_fork_tokens.pop(parent_id, None)
+         return parent
+ 
+-    def _vllm_exp_normalized_score(self, child_id: str) -> float:
+-        child = self.requests[child_id]
+-        parent_id = self._vllm_exp_child_to_parent[child_id]
+-        parent = self.requests[parent_id]
+-        generated = max(1, child.num_output_tokens)
+-        return self._vllm_exp_hidden_scores[child_id] / generated
+-
+-    def _vllm_exp_select_winner(self, parent_id: str, child_ids: list[str]) -> str:
++    def _vllm_exp_select_winner(
++        self, parent_id: str, top_k_child_ids: list[str]
++    ) -> str:
+         parent = self.requests[parent_id]
+         payload = self._vllm_exp_payload(parent)
+         assert payload is not None
+-        diversity_weight = float(payload.get("diversity_weight", 0.2))
+-        return max(
+-            child_ids,
+-            key=lambda child_id: self._vllm_exp_candidate_score(
+-                child_id, child_ids, diversity_weight
+-            ),
+-        )
+-
+-    def _vllm_exp_candidate_score(
+-        self, child_id: str, child_ids: list[str], diversity_weight: float
+-    ) -> float:
+-        return self._vllm_exp_normalized_score(
+-            child_id
+-        ) + diversity_weight * self._vllm_exp_diversity_score(child_id, child_ids)
+-
+-    def _vllm_exp_diversity_score(self, child_id: str, child_ids: list[str]) -> float:
+-        vector = self._vllm_exp_average_hidden_vector(child_id)
+-        if vector is not None:
+-            return self._vllm_exp_hidden_vector_diversity(
+-                vector=vector,
+-                child_id=child_id,
+-                child_ids=child_ids,
++        assert top_k_child_ids, "diverse top-k set must be non-empty"
++        seed = int(payload.get("seed", 0))
++        selected_index = self._vllm_exp_hash_int(
++            parent_id, seed, "diverse_top_k_sample"
++        ) % len(top_k_child_ids)
++        return top_k_child_ids[selected_index]
++
++    def _vllm_exp_diverse_top_k_child_ids(self, child_ids: list[str]) -> list[str]:
++        unique_child_ids = self._vllm_exp_unique_child_ids(child_ids)
++        k = min(
++            len(unique_child_ids),
++            self._vllm_exp_candidate_bound(len(unique_child_ids)),
++        )
++        selected = [unique_child_ids[0]]
++        remaining = list(unique_child_ids[1:])
++        order = {child_id: index for index, child_id in enumerate(unique_child_ids)}
++        while len(selected) < k:
++            next_child_id = max(
++                remaining,
++                key=lambda child_id: (
++                    min(
++                        self._vllm_exp_candidate_distance(child_id, selected_id)
++                        for selected_id in selected
++                    ),
++                    -order[child_id],
++                ),
+             )
+-        child_tokens = self._vllm_exp_suffix_token_set(child_id)
+-        if not child_tokens:
++            selected.append(next_child_id)
++            remaining.remove(next_child_id)
++        return selected
++
++    def _vllm_exp_unique_child_ids(self, child_ids: list[str]) -> list[str]:
++        counts: dict[tuple[int, ...], int] = defaultdict(int)
++        first_order: dict[tuple[int, ...], int] = {}
++        representatives: dict[tuple[int, ...], str] = {}
++        for index, child_id in enumerate(child_ids):
++            suffix = tuple(self.requests[child_id].output_token_ids)
++            counts[suffix] += 1
++            first_order.setdefault(suffix, index)
++            representatives.setdefault(suffix, child_id)
++        keys = list(representatives)
++        keys.sort(key=lambda key: (-counts[key], first_order[key]))
++        assert keys, "candidate pool must contain at least one unique candidate"
++        return [representatives[key] for key in keys]
++
++    def _vllm_exp_candidate_bound(self, n_unique_candidates: int) -> int:
++        assert n_unique_candidates >= 1
++        return (n_unique_candidates - 1).bit_length() + 1
++
++    def _vllm_exp_candidate_distance(self, left_id: str, right_id: str) -> float:
++        left_vector = self._vllm_exp_average_hidden_vector(left_id)
++        right_vector = self._vllm_exp_average_hidden_vector(right_id)
++        if left_vector is not None and right_vector is not None:
++            return 1.0 - self._vllm_exp_cosine(left_vector, right_vector)
++        left_tokens = self._vllm_exp_suffix_token_set(left_id)
++        right_tokens = self._vllm_exp_suffix_token_set(right_id)
++        union_count = len(left_tokens | right_tokens)
++        if union_count == 0:
+             return 0.0
+-        distances: list[float] = []
+-        for other_id in child_ids:
+-            if other_id == child_id:
+-                continue
+-            other_tokens = self._vllm_exp_suffix_token_set(other_id)
+-            union_count = len(child_tokens | other_tokens)
+-            if union_count == 0:
+-                continue
+-            distances.append(1.0 - len(child_tokens & other_tokens) / union_count)
+-        if not distances:
+-            return 0.0
+-        return sum(distances) / len(distances)
++        return 1.0 - len(left_tokens & right_tokens) / union_count
++
++    def _vllm_exp_candidate_ids(self, child_ids: list[str]) -> list[int]:
++        return [
++            int(getattr(self.requests[child_id], "_vllm_exp_candidate_id", -1))
++            for child_id in child_ids
++        ]
+ 
+     def _vllm_exp_average_hidden_vector(self, child_id: str) -> list[float] | None:
+         vector_sum = self._vllm_exp_hidden_vector_sums.get(child_id)
+@@ -2241,13 +2254,16 @@
+         return sum(distances) / len(distances)
+ 
+     def _vllm_exp_candidate_audit_records(
+-        self, *, child_ids: list[str], diversity_weight: float
++        self,
++        *,
++        child_ids: list[str],
++        top_k_child_ids: list[str],
+     ) -> list[dict[str, Any]]:
+         records: list[dict[str, Any]] = []
++        top_k_ids = set(top_k_child_ids)
+         for child_id in child_ids:
+             child = self.requests[child_id]
+             suffix = list(child.output_token_ids)
+-            diversity_score = self._vllm_exp_diversity_score(child_id, child_ids)
+             records.append(
+                 {
+                     "candidate_id": int(
+@@ -2256,15 +2272,7 @@
+                     "child_id": child_id,
+                     "suffix_token_ids": suffix,
+                     "suffix_token_count": len(suffix),
+-                    "length_normalized_logprob": self._vllm_exp_normalized_score(
+-                        child_id
+-                    ),
+-                    "diversity_score": diversity_score,
+-                    "combined_score": self._vllm_exp_candidate_score(
+-                        child_id,
+-                        child_ids,
+-                        diversity_weight,
+-                    ),
++                    "in_diverse_top_k": child_id in top_k_ids,
+                     "has_hidden_vector": self._vllm_exp_average_hidden_vector(
+                         child_id
+                     )

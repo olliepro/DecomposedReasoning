@@ -1,0 +1,400 @@
+diff -ruN -x __pycache__ vllm/v1/core/sched/scheduler.py vllm/v1/core/sched/scheduler.py
+--- vllm/v1/core/sched/scheduler.py	2026-06-26 19:46:31.037704663 -0400
++++ vllm/v1/core/sched/scheduler.py	2026-06-26 20:45:29.305216532 -0400
+@@ -288,6 +288,8 @@
+         self._vllm_exp_branch_stop_token_ids: dict[str, list[int]] = {}
+         self._vllm_exp_branch_fork_tokens: dict[str, int] = {}
+         self._vllm_exp_hidden_scores: dict[str, float] = defaultdict(float)
++        self._vllm_exp_hidden_vector_sums: dict[str, list[float]] = {}
++        self._vllm_exp_hidden_vector_counts: dict[str, int] = defaultdict(int)
+         self._vllm_exp_child_to_parent: dict[str, str] = {}
+         self._vllm_exp_parent_boundary_counts: dict[str, int] = defaultdict(int)
+ 
+@@ -1517,6 +1519,9 @@
+             if self._vllm_exp_is_hidden(request):
+                 if new_logprobs is not None:
+                     self._vllm_exp_add_hidden_logprobs(request, new_logprobs)
++                hidden_vectors = model_runner_output.vllm_experimental_hidden_vectors
++                if hidden_vectors is not None and new_token_ids:
++                    self._vllm_exp_add_hidden_vector(request, hidden_vectors[req_index])
+                 if stopped:
+                     finished = self._handle_stopped_request(request)
+                     assert finished, "hidden branch requests must not be resumable"
+@@ -1858,17 +1873,17 @@
+     def _vllm_exp_requested_branch_budget(
+         self, parent: Request, payload: dict[str, Any]
+     ) -> int:
+         if payload.get("mode") == "eps_on_policy_diverse":
+-            return int(payload.get("max_steer_tokens", 30)) + 2
++            return int(payload.get("max_steer_tokens", 30)) + 3
+         return int(payload.get("branch_max_tokens", 700))
+ 
+     def _vllm_exp_child_stop_token_ids(
+         self, parent: Request, payload: dict[str, Any]
+     ) -> list[int]:
+         if payload.get("mode") != "eps_on_policy_diverse":
+             return []
+         token_payload = payload.get("control_token_ids")
+         assert isinstance(token_payload, dict)
+-        return [int(token_payload["steer_close"])]
++        return [int(token_payload["exec_open"])]
+ 
+     def _vllm_exp_branch_plan(
+@@ -1877,7 +1885,13 @@
+         mode = payload.get("mode")
+         if mode == "eps_on_policy_diverse":
+             candidate_count = int(payload.get("candidate_count", 50))
+-            return [(candidate_id, [], []) for candidate_id in range(candidate_count)]
++            token_payload = payload.get("control_token_ids")
++            assert isinstance(token_payload, dict)
++            steer_open = [int(token_payload["steer_open"])]
++            return [
++                (candidate_id, steer_open, [])
++                for candidate_id in range(candidate_count)
++            ]
+         assert mode == "eps_off_policy_verbalized", mode
+         option_count = self._vllm_exp_option_count(parent, payload)
+         option_numbers = self._vllm_exp_option_numbers(parent, payload, option_count)
+@@ -1950,19 +1964,14 @@
+             initial_script,
+             followup_script,
+         )
+-        child_params.max_tokens = (
+-            parent.num_output_tokens
+-            + len(initial_script)
+-            + branch_budget
+-            + len(followup_script)
+-        )
++        child_params.max_tokens = len(initial_script) + branch_budget + len(followup_script)
+         self._vllm_exp_add_child_stop_tokens(child_params, stop_token_ids)
+         child_params.logprobs = max(child_params.logprobs or 0, 1)
+         child_params.n = 1
+         child_id = f"{parent.request_id}::vllm_exp_branch::{candidate_id}"
+         child = Request(
+             request_id=child_id,
+-            prompt_token_ids=parent.prompt_token_ids,
++            prompt_token_ids=list(parent.prompt_token_ids) + list(parent.output_token_ids),
+             sampling_params=child_params,
+             pooling_params=None,
+             client_index=parent.client_index,
+@@ -1977,7 +1986,6 @@
+             block_hasher=parent._block_hasher,
+             resumable=False,
+         )
+-        child.append_output_token_ids(list(parent.output_token_ids))
+         setattr(child, "_vllm_exp_hidden_branch", True)
+         setattr(child, "_vllm_exp_parent_id", parent.request_id)
+         setattr(child, "_vllm_exp_candidate_id", candidate_id)
+@@ -2006,11 +2014,13 @@
+         payload = self._vllm_exp_payload(parent)
+         assert payload is not None
+         child_payload = dict(payload)
+-        child_payload["forced_output_start_index"] = parent.num_output_tokens
++        child_payload["prefix_output_token_ids"] = list(parent.output_token_ids)
++        child_payload["forced_output_start_index"] = 0
+         child_payload["forced_output_token_ids"] = list(initial_script)
+         child_payload["forced_after_exec_close_token_ids"] = list(followup_script)
+-        child_payload["forced_after_exec_close_trigger_after"] = (
+-            parent.num_output_tokens + len(initial_script)
++        child_payload["forced_after_exec_close_trigger_after"] = len(initial_script)
++        child_payload["return_hidden_state_vector"] = (
++            child_payload.get("diversity_vector_source") == "model_hidden_state"
+         )
+         extra_args["vllm_experimental"] = child_payload
+         child_params.extra_args = extra_args
+@@ -2023,6 +2033,20 @@
+             logprob_values[:, 0].sum()
+         )
+ 
++    def _vllm_exp_add_hidden_vector(
++        self, request: Request, vector: list[float] | None
++    ) -> None:
++        if vector is None:
++            return
++        existing = self._vllm_exp_hidden_vector_sums.get(request.request_id)
++        if existing is None:
++            self._vllm_exp_hidden_vector_sums[request.request_id] = list(vector)
++        else:
++            assert len(existing) == len(vector), "hidden vector size changed"
++            for index, value in enumerate(vector):
++                existing[index] += value
++        self._vllm_exp_hidden_vector_counts[request.request_id] += 1
++
+     def _vllm_exp_complete_hidden_child(self, child: Request) -> Request | None:
+         parent_id = self._vllm_exp_child_to_parent[child.request_id]
+         self._vllm_exp_branch_completed[parent_id].add(child.request_id)
+@@ -2037,14 +2061,45 @@
+ 
+         winner_id = self._vllm_exp_select_winner(parent_id, child_ids)
+         winner = self.requests[winner_id]
+-        suffix_tokens = max(0, winner.num_output_tokens - parent.num_output_tokens)
+-        promoted_blocks = self._vllm_exp_promote_winner(parent, winner)
++        suffix_tokens = winner.num_output_tokens
+         candidate_id = getattr(winner, "_vllm_exp_candidate_id", -1)
++        hidden_vector_child_count = sum(
++            1
++            for child_id in child_ids
++            if self._vllm_exp_average_hidden_vector(child_id) is not None
++        )
++        selected_hidden_diversity = (
++            self._vllm_exp_hidden_vector_diversity_for_child(winner_id, child_ids)
++            if hidden_vector_child_count
++            else 0.0
++        )
++        pool_hidden_pairwise_diversity = (
++            self._vllm_exp_hidden_vector_pairwise_diversity(child_ids)
++            if hidden_vector_child_count
++            else 0.0
++        )
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None
++        diversity_weight = float(payload.get("diversity_weight", 0.2))
++        candidate_audit = self._vllm_exp_candidate_audit_records(
++            child_ids=child_ids,
++            diversity_weight=diversity_weight,
++        )
++        promoted_blocks = self._vllm_exp_promote_winner(parent, winner)
+         self._vllm_exp_log_event(
+             parent,
+             "branch_promote",
+             branch_count=len(child_ids),
+             children_freed=len(child_ids),
++            candidate_audit=candidate_audit,
++            diversity_vector_source=(
++                "model_hidden_state"
++                if hidden_vector_child_count
++                else "token_set"
++            ),
++            hidden_vector_child_count=hidden_vector_child_count,
++            pool_hidden_pairwise_diversity=pool_hidden_pairwise_diversity,
++            selected_hidden_diversity=selected_hidden_diversity,
+             kv_blocks_promoted=promoted_blocks,
+             selected_candidate_id=int(candidate_id),
+             suffix_tokens=suffix_tokens,
+@@ -2057,6 +2112,8 @@
+             assert child_request.is_finished(), child_id
+             self._free_request(child_request)
+             self._vllm_exp_hidden_scores.pop(child_id, None)
++            self._vllm_exp_hidden_vector_sums.pop(child_id, None)
++            self._vllm_exp_hidden_vector_counts.pop(child_id, None)
+             self._vllm_exp_child_to_parent.pop(child_id, None)
+         self._vllm_exp_branch_children.pop(parent_id, None)
+         self._vllm_exp_branch_completed.pop(parent_id, None)
+@@ -2070,7 +2127,7 @@
+         child = self.requests[child_id]
+         parent_id = self._vllm_exp_child_to_parent[child_id]
+         parent = self.requests[parent_id]
+-        generated = max(1, child.num_output_tokens - parent.num_output_tokens)
++        generated = max(1, child.num_output_tokens)
+         return self._vllm_exp_hidden_scores[child_id] / generated
+ 
+     def _vllm_exp_select_winner(self, parent_id: str, child_ids: list[str]) -> str:
+@@ -2093,6 +2150,13 @@
+         ) + diversity_weight * self._vllm_exp_diversity_score(child_id, child_ids)
+ 
+     def _vllm_exp_diversity_score(self, child_id: str, child_ids: list[str]) -> float:
++        vector = self._vllm_exp_average_hidden_vector(child_id)
++        if vector is not None:
++            return self._vllm_exp_hidden_vector_diversity(
++                vector=vector,
++                child_id=child_id,
++                child_ids=child_ids,
++            )
+         child_tokens = self._vllm_exp_suffix_token_set(child_id)
+         if not child_tokens:
+             return 0.0
+@@ -2109,15 +2173,103 @@
+             return 0.0
+         return sum(distances) / len(distances)
+ 
++    def _vllm_exp_average_hidden_vector(self, child_id: str) -> list[float] | None:
++        vector_sum = self._vllm_exp_hidden_vector_sums.get(child_id)
++        count = self._vllm_exp_hidden_vector_counts.get(child_id, 0)
++        if vector_sum is None or count <= 0:
++            return None
++        return [value / count for value in vector_sum]
++
++    def _vllm_exp_hidden_vector_diversity(
++        self, *, vector: list[float], child_id: str, child_ids: list[str]
++    ) -> float:
++        distances: list[float] = []
++        for other_id in child_ids:
++            if other_id == child_id:
++                continue
++            other_vector = self._vllm_exp_average_hidden_vector(other_id)
++            if other_vector is None:
++                continue
++            distances.append(1.0 - self._vllm_exp_cosine(vector, other_vector))
++        if not distances:
++            return 0.0
++        return sum(distances) / len(distances)
++
++    def _vllm_exp_hidden_vector_diversity_for_child(
++        self, child_id: str, child_ids: list[str]
++    ) -> float:
++        vector = self._vllm_exp_average_hidden_vector(child_id)
++        if vector is None:
++            return 0.0
++        return self._vllm_exp_hidden_vector_diversity(
++            vector=vector,
++            child_id=child_id,
++            child_ids=child_ids,
++        )
++
++    def _vllm_exp_hidden_vector_pairwise_diversity(
++        self, child_ids: list[str]
++    ) -> float:
++        vectors = [
++            vector
++            for child_id in child_ids
++            if (vector := self._vllm_exp_average_hidden_vector(child_id)) is not None
++        ]
++        distances: list[float] = []
++        for left_index, left in enumerate(vectors):
++            for right in vectors[left_index + 1 :]:
++                distances.append(1.0 - self._vllm_exp_cosine(left, right))
++        if not distances:
++            return 0.0
++        return sum(distances) / len(distances)
++
++    def _vllm_exp_candidate_audit_records(
++        self, *, child_ids: list[str], diversity_weight: float
++    ) -> list[dict[str, Any]]:
++        records: list[dict[str, Any]] = []
++        for child_id in child_ids:
++            child = self.requests[child_id]
++            suffix = list(child.output_token_ids)
++            diversity_score = self._vllm_exp_diversity_score(child_id, child_ids)
++            records.append(
++                {
++                    "candidate_id": int(
++                        getattr(child, "_vllm_exp_candidate_id", -1)
++                    ),
++                    "child_id": child_id,
++                    "suffix_token_ids": suffix,
++                    "suffix_token_count": len(suffix),
++                    "length_normalized_logprob": self._vllm_exp_normalized_score(
++                        child_id
++                    ),
++                    "diversity_score": diversity_score,
++                    "combined_score": self._vllm_exp_candidate_score(
++                        child_id,
++                        child_ids,
++                        diversity_weight,
++                    ),
++                    "has_hidden_vector": self._vllm_exp_average_hidden_vector(
++                        child_id
++                    )
++                    is not None,
++                }
++            )
++        return sorted(records, key=lambda record: int(record["candidate_id"]))
++
++    def _vllm_exp_cosine(self, left: list[float], right: list[float]) -> float:
++        assert len(left) == len(right), "hidden vector size mismatch"
++        left_norm = sum(value * value for value in left) ** 0.5
++        right_norm = sum(value * value for value in right) ** 0.5
++        assert left_norm > 0.0 and right_norm > 0.0
++        dot = sum(a * b for a, b in zip(left, right))
++        return dot / (left_norm * right_norm)
++
+     def _vllm_exp_suffix_token_set(self, child_id: str) -> set[int]:
+         child = self.requests[child_id]
+-        parent_id = self._vllm_exp_child_to_parent[child_id]
+-        parent = self.requests[parent_id]
+-        return set(child.output_token_ids[parent.num_output_tokens :])
++        return set(child.output_token_ids)
+ 
+     def _vllm_exp_promote_winner(self, parent: Request, winner: Request) -> int:
+-        assert winner.num_output_tokens >= parent.num_output_tokens
+-        suffix = list(winner.output_token_ids[parent.num_output_tokens :])
++        suffix = list(winner.output_token_ids)
+         if suffix:
+             parent.append_output_token_ids(suffix)
+         setattr(parent, "_vllm_exp_promoted_token_ids", suffix)
+diff -ruN -x __pycache__ vllm/v1/outputs.py vllm/v1/outputs.py
+--- vllm/v1/outputs.py	2026-05-29 14:14:20.488662000 -0400
++++ vllm/v1/outputs.py	2026-06-26 19:49:00.444188278 -0400
+@@ -258,6 +258,10 @@
+     # [num_reqs, hidden_size]
+     pooler_output: list[torch.Tensor | None] | None = None
+ 
++    # Optional per-request final hidden-state vector for native experiments.
++    # Kept as Python lists so scheduler IPC does not serialize torch tensors.
++    vllm_experimental_hidden_vectors: list[list[float] | None] | None = None
++
+     kv_connector_output: KVConnectorOutput | None = None
+ 
+     ec_connector_output: ECConnectorOutput | None = None
+diff -ruN -x __pycache__ vllm/v1/worker/gpu_model_runner.py vllm/v1/worker/gpu_model_runner.py
+--- vllm/v1/worker/gpu_model_runner.py	2026-05-29 14:14:21.140545595 -0400
++++ vllm/v1/worker/gpu_model_runner.py	2026-06-26 19:49:00.446755573 -0400
+@@ -3650,6 +3650,55 @@
+             invalid_req_indices,
+         )
+ 
++    def _vllm_exp_needs_hidden_vector(self, req_id: str) -> bool:
++        request = self.requests.get(req_id)
++        if request is None or request.sampling_params is None:
++            return False
++        extra_args = getattr(request.sampling_params, "extra_args", None)
++        if not isinstance(extra_args, dict):
++            return False
++        payload = extra_args.get("vllm_experimental")
++        return isinstance(payload, dict) and bool(
++            payload.get("return_hidden_state_vector")
++        )
++
++    def _vllm_exp_hidden_vectors(
++        self,
++        *,
++        sample_hidden_states: torch.Tensor,
++        req_ids: list[str],
++        valid_sampled_token_ids: list[list[int]],
++        invalid_req_indices: list[int],
++    ) -> list[list[float] | None] | None:
++        tracked_indexes = [
++            index
++            for index, req_id in enumerate(req_ids)
++            if self._vllm_exp_needs_hidden_vector(req_id)
++        ]
++        if not tracked_indexes:
++            return None
++        assert sample_hidden_states.shape[0] >= len(req_ids)
++        hidden_vectors: list[list[float] | None] = [None] * len(req_ids)
++        invalid_index_set = set(invalid_req_indices)
++        for index in tracked_indexes:
++            if index in invalid_index_set:
++                continue
++            if not self.use_async_scheduling and (
++                index >= len(valid_sampled_token_ids)
++                or not valid_sampled_token_ids[index]
++            ):
++                continue
++            vector = sample_hidden_states[index].detach().to(
++                "cpu", dtype=torch.float32
++            )
++            norm = torch.linalg.vector_norm(vector)
++            if float(norm) == 0.0:
++                continue
++            hidden_vectors[index] = [
++                float(value) for value in (vector / norm).tolist()
++            ]
++        return hidden_vectors
++
+     @contextmanager
+     def synchronize_input_prep(self):
+         if self.prepare_inputs_event is None:
+@@ -4526,6 +4575,12 @@
+                 num_nans_in_logits=num_nans_in_logits,
+                 cudagraph_stats=cudagraph_stats,
+                 routed_experts=None,
++                vllm_experimental_hidden_vectors=self._vllm_exp_hidden_vectors(
++                    sample_hidden_states=sample_hidden_states,
++                    req_ids=req_ids_output_copy,
++                    valid_sampled_token_ids=valid_sampled_token_ids,
++                    invalid_req_indices=invalid_req_indices,
++                ),
+             )
+ 
+         if not self.use_async_scheduling:

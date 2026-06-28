@@ -1,0 +1,34 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -1768,10 +1768,17 @@
+         exec_close = int(token_payload["exec_close"])
+         think_close = int(token_payload["think_close"])
+         if think_close in request._output_token_ids:
++            self._vllm_exp_off_policy_pending_options.pop(request.request_id, None)
+             return False
+-        newline = token_payload.get("newline")
+         if not request._output_token_ids:
+             return False
++        if payload.get("mode") in {
++            "eps_on_policy_diverse",
++            "eps_off_policy_verbalized",
++        }:
++            steer_open = int(token_payload["steer_open"])
++            return request._output_token_ids[-1] == steer_open
++        newline = token_payload.get("newline")
+         if newline is not None:
+             return len(request._output_token_ids) >= 2 and (
+                 request._output_token_ids[-2] == exec_close
+@@ -2293,11 +2300,8 @@
+         mode = payload.get("mode")
+         if mode == "eps_on_policy_diverse":
+             candidate_count = int(payload.get("candidate_count", 50))
+-            token_payload = payload.get("control_token_ids")
+-            assert isinstance(token_payload, dict)
+-            steer_open = [int(token_payload["steer_open"])]
+             return [
+-                (candidate_id, steer_open, [])
++                (candidate_id, [], [])
+                 for candidate_id in range(candidate_count)
+             ]
+         assert mode == "eps_off_policy_verbalized", mode

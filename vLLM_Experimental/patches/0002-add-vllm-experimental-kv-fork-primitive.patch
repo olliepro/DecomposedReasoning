@@ -1,0 +1,106 @@
+--- vllm/v1/core/single_type_kv_cache_manager.py	2026-06-26 09:37:11.395656990 -0400
++++ vllm/v1/core/single_type_kv_cache_manager.py	2026-06-26 09:37:25.049691896 -0400
+@@ -335,6 +335,28 @@
+         """
+         return None
+ 
++    def fork_blocks(
++        self,
++        parent_request_id: str,
++        child_request_id: str,
++        num_computed_tokens: int,
++    ) -> int:
++        """Fork full computed blocks from one request to another."""
++        assert child_request_id not in self.req_to_blocks
++        parent_blocks = self.req_to_blocks.get(parent_request_id)
++        assert parent_blocks is not None, parent_request_id
++        num_shared_blocks = num_computed_tokens // self.block_size
++        assert num_shared_blocks <= len(parent_blocks)
++        child_blocks = list(parent_blocks[:num_shared_blocks])
++        self.block_pool.touch([block for block in child_blocks if not block.is_null])
++        self.req_to_blocks[child_request_id] = child_blocks
++        cached_count = self.num_cached_block.get(parent_request_id)
++        if cached_count is not None:
++            self.num_cached_block[child_request_id] = min(
++                cached_count, num_shared_blocks
++            )
++        return len(child_blocks)
++
+     def free(self, request_id: str) -> None:
+         """
+         Free the blocks for the request.
+@@ -1083,6 +1105,24 @@
+                 self._allocated_block_reqs.add(request_id)
+                 return req_blocks[prev_block_len:]
+ 
++    def fork_blocks(
++        self,
++        parent_request_id: str,
++        child_request_id: str,
++        num_computed_tokens: int,
++    ) -> int:
++        block_count = super().fork_blocks(
++            parent_request_id,
++            child_request_id,
++            num_computed_tokens,
++        )
++        if parent_request_id in self._allocated_block_reqs:
++            self._allocated_block_reqs.add(child_request_id)
++        parent_state_idx = self.last_state_block_idx.get(parent_request_id)
++        if parent_state_idx is not None and parent_state_idx < block_count:
++            self.last_state_block_idx[child_request_id] = parent_state_idx
++        return block_count
++
+     def free(self, request_id: str) -> None:
+         if self.mamba_cache_mode == "align":
+             self._allocated_block_reqs.discard(request_id)
+--- vllm/v1/core/kv_cache_coordinator.py	2026-06-26 09:37:11.399657000 -0400
++++ vllm/v1/core/kv_cache_coordinator.py	2026-06-26 09:37:39.833729690 -0400
+@@ -208,6 +208,22 @@
+         for manager in self.single_type_managers:
+             manager.cache_blocks(request, num_computed_tokens)
+ 
++    def fork_blocks(
++        self,
++        parent_request_id: str,
++        child_request_id: str,
++        num_computed_tokens: int,
++    ) -> int:
++        """Share every fully computed parent block with a child request."""
++        block_count = 0
++        for manager in self.single_type_managers:
++            block_count += manager.fork_blocks(
++                parent_request_id,
++                child_request_id,
++                num_computed_tokens,
++            )
++        return block_count
++
+     def free(self, request_id: str) -> None:
+         """
+         Free the blocks for the request.
+--- vllm/v1/core/kv_cache_manager.py	2026-06-26 09:37:11.401657005 -0400
++++ vllm/v1/core/kv_cache_manager.py	2026-06-26 09:38:17.537827415 -0400
+@@ -552,6 +552,22 @@
+         if self.enable_caching:
+             self.coordinator.cache_blocks(request, num_computed_tokens)
+ 
++    def fork_blocks(
++        self,
++        parent_request: Request,
++        child_request: Request,
++        num_computed_tokens: int,
++    ) -> int:
++        """Share parent full-block prefix with a child request."""
++        assert parent_request.request_id != child_request.request_id
++        assert 0 <= num_computed_tokens <= parent_request.num_computed_tokens
++        assert not any(self.coordinator.get_blocks(child_request.request_id))
++        return self.coordinator.fork_blocks(
++            parent_request.request_id,
++            child_request.request_id,
++            num_computed_tokens,
++        )
++
+     def create_kv_cache_blocks(
+         self, blocks: tuple[list[KVCacheBlock], ...]
+     ) -> KVCacheBlocks:

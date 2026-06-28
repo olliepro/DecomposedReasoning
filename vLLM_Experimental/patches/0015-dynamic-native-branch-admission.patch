@@ -1,0 +1,352 @@
+--- vllm/v1/core/sched/scheduler.py	2026-06-27 10:48:29.550741851 -0400
++++ vllm/v1/core/sched/scheduler.py	2026-06-27 10:50:35.486074000 -0400
+@@ -3,6 +3,7 @@
+ import hashlib
+ import json
+ import itertools
++import math
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -287,6 +288,9 @@
+         self._vllm_exp_branch_budgets: dict[str, int] = {}
+         self._vllm_exp_branch_stop_token_ids: dict[str, list[int]] = {}
+         self._vllm_exp_branch_fork_tokens: dict[str, int] = {}
++        self._vllm_exp_branch_pool_queue: deque[str] = deque()
++        self._vllm_exp_active_branch_pools: set[str] = set()
++        self._vllm_exp_last_blocked_log_at: dict[str, float] = defaultdict(float)
+         self._vllm_exp_hidden_vector_sums: dict[str, list[float]] = {}
+         self._vllm_exp_hidden_vector_counts: dict[str, int] = defaultdict(int)
+         self._vllm_exp_child_products: dict[str, dict[str, Any]] = {}
+@@ -380,6 +384,7 @@
+         scheduled_timestamp = time.monotonic()
+ 
+         self.kv_cache_manager.new_step_starts()
++        self._vllm_exp_try_admit_branch_pools()
+ 
+         # First, schedule the RUNNING requests.
+         req_index = 0
+@@ -1950,12 +1955,40 @@
+             parent_id
+         ] = self._vllm_exp_child_stop_token_ids(parent, payload)
+         self._vllm_exp_branch_fork_tokens[parent_id] = fork_tokens
+-        child_ids = self._vllm_exp_launch_branch_wave(parent, first_wave=True)
+         async_tokens_to_discard = parent.num_output_placeholders
+         assert parent.async_tokens_to_discard == 0
+         parent.async_tokens_to_discard = async_tokens_to_discard
+         parent.num_output_placeholders = 0
+         self.prev_step_scheduled_req_ids.discard(parent_id)
++        parent.status = RequestStatus.PREEMPTED
++        if self._vllm_exp_dynamic_admission_enabled(payload):
++            self._vllm_exp_branch_pool_queue.append(parent_id)
++            self._vllm_exp_log_event(
++                parent,
++                "branch_start",
++                branch_budget=branch_budget,
++                branch_depth_limit=int(payload.get("branch_depth", 4)),
++                branch_depth_used=self._vllm_exp_branch_depth_used(parent),
++                candidate_count=0,
++                total_candidate_count=len(branch_plan),
++                child_ids=[],
++                fork_tokens=fork_tokens,
++                pending_candidate_count=len(branch_plan),
++                num_computed_tokens=parent.num_computed_tokens,
++                output_tokens=parent.num_output_tokens,
++                async_tokens_to_discard=async_tokens_to_discard,
++                shared_blocks=fork_tokens // self.block_size,
++                dynamic_admission=True,
++            )
++            self._vllm_exp_log_pool_event(
++                parent,
++                "branch_pool_queued",
++                candidate_count=len(branch_plan),
++                reason="queued",
++            )
++            return True
++
++        child_ids = self._vllm_exp_launch_branch_wave(parent, first_wave=True)
+         self._vllm_exp_log_event(
+             parent,
+             "branch_start",
+@@ -1972,9 +2005,190 @@
+             async_tokens_to_discard=async_tokens_to_discard,
+             shared_blocks=fork_tokens // self.block_size,
+         )
+-        parent.status = RequestStatus.PREEMPTED
+         return True
+ 
++    def _vllm_exp_dynamic_admission_enabled(self, payload: dict[str, Any]) -> bool:
++        return bool(payload.get("native_branch_dynamic_admission", True))
++
++    def _vllm_exp_branch_pool_report(
++        self, parent: Request
++    ) -> dict[str, int | str | bool]:
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None
++        parent_id = parent.request_id
++        pending = self._vllm_exp_pending_branch_plans[parent_id]
++        candidate_count = len(pending)
++        block_pool = self.kv_cache_manager.block_pool
++        free_blocks = int(block_pool.get_num_free_blocks())
++        total_blocks = int(block_pool.num_gpu_blocks)
++        min_free_blocks = int(payload.get("native_branch_min_free_blocks", 256))
++        reserve_fraction = float(
++            payload.get("native_branch_free_block_fraction", 0.05)
++        )
++        reserve_blocks = max(min_free_blocks, int(total_blocks * reserve_fraction))
++        available_blocks = max(0, free_blocks - reserve_blocks)
++        active_request_count = (
++            len(self.running) + len(self.waiting) + len(self.skipped_waiting)
++        )
++        seq_reserve = int(payload.get("native_branch_seq_reserve", 8))
++        seq_slots = max(
++            0,
++            self.max_num_running_reqs - active_request_count - seq_reserve,
++        )
++        estimated_blocks = self._vllm_exp_estimated_pool_blocks(parent)
++        max_seq_capacity = max(0, self.max_num_running_reqs - seq_reserve)
++        max_block_capacity = max(0, total_blocks - reserve_blocks)
++        if candidate_count > max_seq_capacity:
++            reason = "seq_capacity"
++        elif estimated_blocks > max_block_capacity:
++            reason = "kv_capacity"
++        elif candidate_count > seq_slots:
++            reason = "seq_slots"
++        elif estimated_blocks > available_blocks:
++            reason = "free_blocks"
++        else:
++            reason = "admitted"
++        return {
++            "active_request_count": active_request_count,
++            "admissible": reason == "admitted",
++            "available_blocks": available_blocks,
++            "candidate_count": candidate_count,
++            "estimated_pool_blocks": estimated_blocks,
++            "ever_fits_blocks": estimated_blocks <= max_block_capacity,
++            "ever_fits_seq": candidate_count <= max_seq_capacity,
++            "free_blocks": free_blocks,
++            "live_branch_pool_count": len(self._vllm_exp_active_branch_pools),
++            "max_block_capacity": max_block_capacity,
++            "max_seq_capacity": max_seq_capacity,
++            "queued_branch_pool_count": len(self._vllm_exp_branch_pool_queue),
++            "reason": reason,
++            "reserved_blocks": reserve_blocks,
++            "seq_reserve": seq_reserve,
++            "seq_slots": seq_slots,
++            "total_blocks": total_blocks,
++        }
++
++    def _vllm_exp_estimated_pool_blocks(self, parent: Request) -> int:
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None
++        pending = self._vllm_exp_pending_branch_plans[parent.request_id]
++        if not pending:
++            return 0
++        branch_budget = self._vllm_exp_branch_budgets[parent.request_id]
++        max_child_tokens = max(
++            len(initial_script) + branch_budget + len(followup_script)
++            for _, initial_script, followup_script in pending
++        )
++        blocks_per_child = max(1, math.ceil(max_child_tokens / self.block_size))
++        multiplier = float(
++            payload.get("native_branch_block_safety_multiplier", 1.25)
++        )
++        return int(math.ceil(len(pending) * blocks_per_child * multiplier))
++
++    def _vllm_exp_log_pool_event(
++        self,
++        parent: Request,
++        event_name: str,
++        *,
++        candidate_count: int,
++        reason: str,
++        report: dict[str, int | str | bool] | None = None,
++        child_ids: list[str] | None = None,
++    ) -> None:
++        report_payload = dict(report or self._vllm_exp_branch_pool_report(parent))
++        report_payload.pop("candidate_count", None)
++        report_payload.pop("reason", None)
++        self._vllm_exp_log_event(
++            parent,
++            event_name,
++            branch_budget=self._vllm_exp_branch_budgets[parent.request_id],
++            candidate_count=candidate_count,
++            child_ids=child_ids or [],
++            fork_tokens=self._vllm_exp_branch_fork_tokens[parent.request_id],
++            pending_candidate_count=len(
++                self._vllm_exp_pending_branch_plans[parent.request_id]
++            ),
++            reason=reason,
++            shared_blocks=(
++                self._vllm_exp_branch_fork_tokens[parent.request_id]
++                // self.block_size
++            ),
++            **report_payload,
++        )
++
++    def _vllm_exp_maybe_log_pool_blocked(
++        self, parent: Request, report: dict[str, int | str | bool]
++    ) -> None:
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None
++        interval_s = float(payload.get("native_branch_blocked_log_interval_s", 5.0))
++        now = time.monotonic()
++        last = self._vllm_exp_last_blocked_log_at[parent.request_id]
++        if interval_s > 0.0 and now - last < interval_s:
++            return
++        self._vllm_exp_last_blocked_log_at[parent.request_id] = now
++        self._vllm_exp_log_pool_event(
++            parent,
++            "branch_pool_blocked",
++            candidate_count=int(report["candidate_count"]),
++            reason=str(report["reason"]),
++            report=report,
++        )
++
++    def _vllm_exp_try_admit_branch_pools(self) -> None:
++        while self._vllm_exp_branch_pool_queue:
++            parent_id = self._vllm_exp_branch_pool_queue[0]
++            parent = self.requests.get(parent_id)
++            if parent is None:
++                self._vllm_exp_branch_pool_queue.popleft()
++                continue
++            if not self._vllm_exp_pending_branch_plans.get(parent_id):
++                self._vllm_exp_branch_pool_queue.popleft()
++                continue
++            report = self._vllm_exp_branch_pool_report(parent)
++            assert report["ever_fits_seq"], (
++                "native branch pool cannot fit max_num_running_reqs: "
++                f"{report}"
++            )
++            assert report["ever_fits_blocks"], (
++                "native branch pool cannot fit KV cache: "
++                f"{report}"
++            )
++            if not report["admissible"]:
++                self._vllm_exp_maybe_log_pool_blocked(parent, report)
++                break
++            self._vllm_exp_branch_pool_queue.popleft()
++            child_ids = self._vllm_exp_launch_branch_pool(parent)
++            self._vllm_exp_active_branch_pools.add(parent_id)
++            admit_report = dict(report)
++            admit_report["live_branch_pool_count"] = len(
++                self._vllm_exp_active_branch_pools
++            )
++            admit_report["queued_branch_pool_count"] = len(
++                self._vllm_exp_branch_pool_queue
++            )
++            self._vllm_exp_log_pool_event(
++                parent,
++                "branch_pool_admitted",
++                candidate_count=len(child_ids),
++                child_ids=child_ids,
++                reason="admitted",
++                report=admit_report,
++            )
++
++    def _vllm_exp_launch_branch_pool(self, parent: Request) -> list[str]:
++        parent_id = parent.request_id
++        pending = self._vllm_exp_pending_branch_plans[parent_id]
++        pool_plan = list(pending)
++        pending.clear()
++        child_ids = self._vllm_exp_launch_branch_children(
++            parent,
++            pool_plan,
++            fast_lane=True,
++        )
++        assert child_ids, "dynamic branch pool admitted without children"
++        return child_ids
++
+     def _vllm_exp_launch_branch_wave(
+         self, parent: Request, first_wave: bool
+     ) -> list[str]:
+@@ -1988,11 +2202,41 @@
+         )
+         branch_budget = self._vllm_exp_branch_budgets[parent_id]
+         fork_tokens = self._vllm_exp_branch_fork_tokens[parent_id]
+-        stop_token_ids = self._vllm_exp_branch_stop_token_ids[parent_id]
+         wave_plan = pending[:wave_size]
+         del pending[:wave_size]
+-        child_ids: list[str] = []
+-        for candidate_id, initial_script, followup_script in wave_plan:
++        child_ids = self._vllm_exp_launch_branch_children(
++            parent,
++            wave_plan,
++            fast_lane=False,
++        )
++        if not first_wave:
++            self._vllm_exp_log_event(
++                parent,
++                "branch_wave_start",
++                branch_budget=branch_budget,
++                candidate_count=len(child_ids),
++                child_ids=child_ids,
++                fork_tokens=fork_tokens,
++                pending_candidate_count=len(pending),
++                shared_blocks=fork_tokens // self.block_size,
++            )
++        return child_ids
++
++    def _vllm_exp_launch_branch_children(
++        self,
++        parent: Request,
++        branch_plan: list[tuple[int, list[int], list[int]]],
++        *,
++        fast_lane: bool,
++    ) -> list[str]:
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None
++        parent_id = parent.request_id
++        branch_budget = self._vllm_exp_branch_budgets[parent_id]
++        fork_tokens = self._vllm_exp_branch_fork_tokens[parent_id]
++        stop_token_ids = self._vllm_exp_branch_stop_token_ids[parent_id]
++        children: list[Request] = []
++        for candidate_id, initial_script, followup_script in branch_plan:
+             child = self._vllm_exp_make_child(
+                 parent,
+                 candidate_id,
+@@ -2001,25 +2245,21 @@
+                 followup_script,
+                 stop_token_ids,
+             )
++            if fast_lane and self.policy == SchedulingPolicy.PRIORITY:
++                child.priority -= int(payload.get("native_branch_priority_boost", 1000))
+             child.num_computed_tokens = fork_tokens
+             self.kv_cache_manager.fork_blocks(parent, child, fork_tokens)
+             self.requests[child.request_id] = child
+-            self.waiting.add_request(child)
+             self._vllm_exp_child_to_parent[child.request_id] = parent_id
+             self._vllm_exp_branch_children[parent_id].append(child.request_id)
+-            child_ids.append(child.request_id)
+-        if not first_wave:
+-            self._vllm_exp_log_event(
+-                parent,
+-                "branch_wave_start",
+-                branch_budget=branch_budget,
+-                candidate_count=len(child_ids),
+-                child_ids=child_ids,
+-                fork_tokens=fork_tokens,
+-                pending_candidate_count=len(pending),
+-                shared_blocks=fork_tokens // self.block_size,
+-            )
+-        return child_ids
++            children.append(child)
++        enqueue_order = reversed(children) if fast_lane else children
++        for child in enqueue_order:
++            if fast_lane and self.policy == SchedulingPolicy.FCFS:
++                self.waiting.prepend_request(child)
++            else:
++                self.waiting.add_request(child)
++        return [child.request_id for child in children]
+ 
+     def _vllm_exp_requested_branch_budget(
+         self, parent: Request, payload: dict[str, Any]
+@@ -2330,6 +2570,8 @@
+         self._vllm_exp_branch_budgets.pop(parent_id, None)
+         self._vllm_exp_branch_stop_token_ids.pop(parent_id, None)
+         self._vllm_exp_branch_fork_tokens.pop(parent_id, None)
++        self._vllm_exp_active_branch_pools.discard(parent_id)
++        self._vllm_exp_last_blocked_log_at.pop(parent_id, None)
+         self._vllm_exp_off_policy_branch_options.pop(parent_id, None)
+         if getattr(parent, "_vllm_exp_branch_output_records", None) is not None:
+             self._vllm_exp_parent_branch_fires.pop(parent_id, None)

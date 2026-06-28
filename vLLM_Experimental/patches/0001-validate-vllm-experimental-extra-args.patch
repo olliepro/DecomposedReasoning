@@ -1,0 +1,24 @@
+--- vllm/v1/request.py
++++ vllm/v1/request.py
+@@ -23,6 +23,12 @@
+ from vllm.v1.metrics.stats import PrefillStats
+ from vllm.v1.structured_output.request import StructuredOutputRequest
+ from vllm.v1.utils import ConstantList
++
++try:
++    from vllm_experimental.vllm_plugin import validate_request_extra_args
++except Exception:
++    validate_request_extra_args = None
++
+ 
+ if TYPE_CHECKING:
+     from vllm.lora.request import LoRARequest
+@@ -107,6 +113,8 @@
+         elif sampling_params is not None:
+             # Generative models.
+             assert sampling_params.max_tokens is not None
++            if validate_request_extra_args is not None:
++                validate_request_extra_args(sampling_params=sampling_params)
+             self.max_tokens = sampling_params.max_tokens
+             if self.structured_output_request is not None:
+                 self.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR

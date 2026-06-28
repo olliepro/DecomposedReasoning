@@ -185,6 +185,7 @@ class ServeConfig:
         kv_offloading_backend: KV offload backend (`native` or `lmcache`).
         trust_remote_code: Forwarded model loading flag.
         max_logprobs: vLLM max logprobs engine cap.
+        max_model_len: Optional vLLM context window for server startup.
         startup_timeout_seconds: Max wait for server health.
         request_timeout_seconds: Max wait for one vLLM HTTP request.
         poll_interval_seconds: Health-check poll interval.
@@ -203,6 +204,7 @@ class ServeConfig:
     kv_offloading_backend: str = "native"
     trust_remote_code: bool = True
     max_logprobs: int = 20
+    max_model_len: int | None = None
     startup_timeout_seconds: float = 180.0
     request_timeout_seconds: float = 600.0
     poll_interval_seconds: float = 1.0
@@ -635,6 +637,7 @@ def _parse_serve(*, payload: dict[str, Any]) -> ServeConfig:
         kv_offloading_backend=str(serve_payload.get("kv_offloading_backend", "native")),
         trust_remote_code=bool(serve_payload.get("trust_remote_code", True)),
         max_logprobs=int(serve_payload.get("max_logprobs", 20)),
+        max_model_len=_optional_int(value=serve_payload.get("max_model_len")),
         startup_timeout_seconds=float(
             serve_payload.get("startup_timeout_seconds", 180.0)
         ),

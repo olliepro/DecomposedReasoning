@@ -1,0 +1,18 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -1795,11 +1795,14 @@
+         branch_depth_used = self._vllm_exp_branch_depth_used(request)
+         branch_depth_limit = int(payload.get("branch_depth", 4))
+         assert branch_depth_limit >= 1, "branch_depth must be positive"
+-        if branch_depth_used >= branch_depth_limit:
++        branch_fanout = int(payload.get("branch_fanout", 1))
++        assert branch_fanout >= 1, "branch_fanout must be positive"
++        if branch_fanout > 1 and branch_depth_used >= branch_depth_limit:
+             self._vllm_exp_log_event(
+                 request,
+                 "branch_skip_depth_limit",
+                 boundary_index=boundary_index,
++                branch_fanout=branch_fanout,
+                 branch_depth_used=branch_depth_used,
+                 branch_depth_limit=branch_depth_limit,
+             )

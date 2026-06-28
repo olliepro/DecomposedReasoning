@@ -1,0 +1,16 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -2020,7 +2020,12 @@
+         payload = self._vllm_exp_payload(parent)
+         assert payload is not None
+         child_payload = dict(payload)
+-        child_payload["prefix_output_token_ids"] = list(parent.output_token_ids)
++        parent_prefix_output_ids = child_payload.get("prefix_output_token_ids", [])
++        assert isinstance(parent_prefix_output_ids, list)
++        child_payload["prefix_output_token_ids"] = (
++            [int(token_id) for token_id in parent_prefix_output_ids]
++            + list(parent.output_token_ids)
++        )
+         child_payload["forced_output_start_index"] = 0
+         child_payload["forced_output_token_ids"] = list(initial_script)
+         child_payload["forced_after_exec_close_token_ids"] = list(followup_script)

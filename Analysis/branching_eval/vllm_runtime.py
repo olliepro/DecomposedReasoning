@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
 import subprocess
 import time
 from contextlib import contextmanager
@@ -54,7 +56,7 @@ def build_vllm_serve_command(
     """
 
     command = [
-        "vllm",
+        os.environ.get("VLLM_BIN", "vllm"),
         "serve",
         model_spec.served_model_arg(),
         "--host",
@@ -72,6 +74,8 @@ def build_vllm_serve_command(
         "--max-logprobs",
         str(serve_config.max_logprobs),
     ]
+    if serve_config.max_model_len is not None:
+        command.extend(["--max-model-len", str(serve_config.max_model_len)])
     if serve_config.kv_offloading_size_gb > 0.0:
         command.extend(
             [
@@ -84,6 +88,9 @@ def build_vllm_serve_command(
         command.append("--disable-hybrid-kv-cache-manager")
     if serve_config.trust_remote_code:
         command.append("--trust-remote-code")
+    extra_args = os.environ.get("VLLM_EXTRA_ARGS", "")
+    if extra_args:
+        command.extend(shlex.split(extra_args))
     if not model_spec.has_lora:
         return tuple(command)
     command.extend(

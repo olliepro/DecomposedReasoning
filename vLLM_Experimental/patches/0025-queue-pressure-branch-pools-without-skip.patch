@@ -1,0 +1,89 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -1810,22 +1810,6 @@
+         sample = int.from_bytes(hashlib.sha256(raw).digest()[:8], "big") / 2**64
+         if sample >= fire_rate:
+             return False
+-        pressure_report = self._vllm_exp_branch_pressure_report(
+-            request,
+-            include_queued=True,
+-        )
+-        if not pressure_report["admissible"]:
+-            self._vllm_exp_consume_branch_depth(request)
+-            self._vllm_exp_log_event(
+-                request,
+-                "branch_skip_backpressure",
+-                boundary_index=boundary_index,
+-                branch_depth_used=branch_depth_used,
+-                branch_depth_limit=branch_depth_limit,
+-                branch_depth_consumed=True,
+-                **pressure_report,
+-            )
+-            return False
+         return True
+ 
+     def _vllm_exp_consume_branch_depth(self, request: Request) -> None:
+@@ -2004,20 +1988,6 @@
+                 num_computed_tokens=parent.num_computed_tokens,
+             )
+             return False
+-        pressure_report = self._vllm_exp_branch_pressure_report(
+-            parent,
+-            include_queued=True,
+-        )
+-        if not pressure_report["admissible"]:
+-            self._vllm_exp_log_event(
+-                parent,
+-                "branch_skip_backpressure",
+-                branch_depth_used=self._vllm_exp_branch_depth_used(parent),
+-                branch_depth_limit=int(payload.get("branch_depth", 4)),
+-                fork_tokens=fork_tokens,
+-                **pressure_report,
+-            )
+-            return False
+         branch_plan = self._vllm_exp_branch_plan(parent, payload)
+         parent_id = parent.request_id
+         self._vllm_exp_branch_children[parent_id] = []
+@@ -2027,27 +1997,6 @@
+             parent_id
+         ] = self._vllm_exp_child_stop_token_ids(parent, payload)
+         self._vllm_exp_branch_fork_tokens[parent_id] = fork_tokens
+-        if self._vllm_exp_dynamic_admission_enabled(payload):
+-            admission_report = self._vllm_exp_branch_pool_report(parent)
+-            if not admission_report["admissible"]:
+-                consume_attempt = payload.get("mode") == "eps_on_policy_diverse"
+-                branch_depth_used = self._vllm_exp_branch_depth_used(parent)
+-                if consume_attempt:
+-                    self._vllm_exp_consume_branch_depth(parent)
+-                report_payload = dict(admission_report)
+-                report_payload.pop("candidate_count", None)
+-                self._vllm_exp_log_event(
+-                    parent,
+-                    "branch_skip_backpressure",
+-                    branch_depth_consumed=consume_attempt,
+-                    branch_depth_limit=int(payload.get("branch_depth", 4)),
+-                    branch_depth_used=branch_depth_used,
+-                    candidate_count=len(branch_plan),
+-                    fork_tokens=fork_tokens,
+-                    **report_payload,
+-                )
+-                self._vllm_exp_clear_pending_branch_pool(parent_id)
+-                return False
+         async_tokens_to_discard = parent.num_output_placeholders
+         assert parent.async_tokens_to_discard == 0
+         parent.async_tokens_to_discard = async_tokens_to_discard
+@@ -2104,14 +2053,6 @@
+     def _vllm_exp_dynamic_admission_enabled(self, payload: dict[str, Any]) -> bool:
+         return bool(payload.get("native_branch_dynamic_admission", True))
+ 
+-    def _vllm_exp_clear_pending_branch_pool(self, parent_id: str) -> None:
+-        self._vllm_exp_branch_children.pop(parent_id, None)
+-        self._vllm_exp_pending_branch_plans.pop(parent_id, None)
+-        self._vllm_exp_branch_budgets.pop(parent_id, None)
+-        self._vllm_exp_branch_stop_token_ids.pop(parent_id, None)
+-        self._vllm_exp_branch_fork_tokens.pop(parent_id, None)
+-        self._vllm_exp_active_branch_pools.discard(parent_id)
+-
+     def _vllm_exp_branch_pool_report(
+         self, parent: Request
+     ) -> dict[str, int | str | bool]:

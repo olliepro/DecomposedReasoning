@@ -1,0 +1,56 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -1524,20 +1524,34 @@ class Scheduler(SchedulerInterface):
+                     parent = self._vllm_exp_complete_hidden_child(request)
+                     if parent is not None:
+                         promoted_token_ids = getattr(
+                             parent, "_vllm_exp_promoted_token_ids", []
+                         )
+-                        if promoted_token_ids:
++                        parent_finished_by_limit = (
++                            self._vllm_exp_finish_parent_if_limit_reached(parent)
++                        )
++                        parent_finish_reason = None
++                        parent_kv_transfer_params = None
++                        if parent_finished_by_limit:
++                            parent_finish_reason = parent.get_finished_reason()
++                            parent_kv_transfer_params = self._free_request(parent)
++                        if promoted_token_ids or parent_finished_by_limit:
+                             outputs[parent.client_index].append(
+                                 EngineCoreOutput(
+                                     request_id=parent.request_id,
+                                     new_token_ids=promoted_token_ids,
++                                    finish_reason=parent_finish_reason,
++                                    stop_reason=parent.stop_reason,
++                                    events=parent.take_events(),
++                                    prefill_stats=parent.take_prefill_stats(),
++                                    kv_transfer_params=parent_kv_transfer_params,
+                                     trace_headers=parent.trace_headers,
+                                 )
+                             )
+                             setattr(parent, "_vllm_exp_promoted_token_ids", [])
+-                        self._vllm_exp_resume_parent(parent)
++                        if not parent_finished_by_limit:
++                            self._vllm_exp_resume_parent(parent)
+                     if status_before_stop == RequestStatus.RUNNING:
+                         stopped_running_reqs.add(request)
+                     else:
+                         stopped_preempted_reqs.add(request)
+                 continue
+@@ -2305,6 +2318,16 @@ class Scheduler(SchedulerInterface):
+         )
+         return promoted_blocks
+ 
++    def _vllm_exp_finish_parent_if_limit_reached(self, parent: Request) -> bool:
++        if (
++            parent.num_output_tokens < parent.max_tokens
++            and parent.num_tokens < self.max_model_len
++        ):
++            return False
++        self._vllm_exp_suspended_parent_ids.discard(parent.request_id)
++        parent.status = RequestStatus.FINISHED_LENGTH_CAPPED
++        return True
++
+     def _vllm_exp_resume_parent(self, parent: Request) -> None:
+         parent.status = RequestStatus.PREEMPTED
+         self._vllm_exp_suspended_parent_ids.discard(parent.request_id)

@@ -1,0 +1,10 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -1995,6 +1995,7 @@
+                 candidate_count=len(branch_plan),
+                 reason="queued",
+             )
++            self._vllm_exp_try_admit_branch_pools()
+             return True
+ 
+         child_ids = self._vllm_exp_launch_branch_wave(parent, first_wave=True)

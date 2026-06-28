@@ -1,0 +1,22 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -1807,6 +1807,11 @@
+         ] = self._vllm_exp_child_stop_token_ids(parent, payload)
+         self._vllm_exp_branch_fork_tokens[parent_id] = fork_tokens
+         child_ids = self._vllm_exp_launch_branch_wave(parent, first_wave=True)
++        async_tokens_to_discard = parent.num_output_placeholders
++        assert parent.async_tokens_to_discard == 0
++        parent.async_tokens_to_discard = async_tokens_to_discard
++        parent.num_output_placeholders = 0
++        self.prev_step_scheduled_req_ids.discard(parent_id)
+         self._vllm_exp_log_event(
+             parent,
+             "branch_start",
+@@ -1818,6 +1823,7 @@
+             pending_candidate_count=len(self._vllm_exp_pending_branch_plans[parent_id]),
+             num_computed_tokens=parent.num_computed_tokens,
+             output_tokens=parent.num_output_tokens,
++            async_tokens_to_discard=async_tokens_to_discard,
+             shared_blocks=fork_tokens // self.block_size,
+         )
+         parent.status = RequestStatus.PREEMPTED

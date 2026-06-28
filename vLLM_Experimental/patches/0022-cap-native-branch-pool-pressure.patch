@@ -1,0 +1,104 @@
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -1804,6 +1804,20 @@
+                 branch_depth_limit=branch_depth_limit,
+             )
+             return False
++        pressure_report = self._vllm_exp_branch_pressure_report(
++            request,
++            include_queued=True,
++        )
++        if not pressure_report["admissible"]:
++            self._vllm_exp_log_event(
++                request,
++                "branch_skip_backpressure",
++                boundary_index=boundary_index,
++                branch_depth_used=branch_depth_used,
++                branch_depth_limit=branch_depth_limit,
++                **pressure_report,
++            )
++            return False
+         fire_rate = float(payload.get("fire_rate", 0.10))
+         seed = int(payload.get("seed", 1234))
+         raw = f"{parent_id}:{boundary_index}:{seed}".encode("utf-8")
+@@ -1828,6 +1842,32 @@
+             )
+         return self._vllm_exp_parent_branch_fires[parent_id]
+ 
++    def _vllm_exp_branch_pressure_report(
++        self, request: Request, *, include_queued: bool
++    ) -> dict[str, int | str | bool]:
++        payload = self._vllm_exp_payload(request)
++        assert payload is not None
++        live_count = len(self._vllm_exp_active_branch_pools)
++        queued_count = len(self._vllm_exp_branch_pool_queue)
++        live_limit = int(payload.get("native_branch_max_live_pools", 2))
++        queued_limit = int(payload.get("native_branch_max_queued_pools", 8))
++        assert live_limit >= 0, "native_branch_max_live_pools must be non-negative"
++        assert queued_limit >= 0, "native_branch_max_queued_pools must be non-negative"
++        if live_limit > 0 and live_count >= live_limit:
++            reason = "live_pool_limit"
++        elif include_queued and queued_limit > 0 and queued_count >= queued_limit:
++            reason = "queued_pool_limit"
++        else:
++            reason = "admitted"
++        return {
++            "admissible": reason == "admitted",
++            "live_branch_pool_count": live_count,
++            "live_branch_pool_limit": live_limit,
++            "queued_branch_pool_count": queued_count,
++            "queued_branch_pool_limit": queued_limit,
++            "reason": reason,
++        }
++
+     def _vllm_exp_try_start_branch(self, request: Request) -> bool:
+         if self._vllm_exp_is_hidden(request):
+             return False
+@@ -1962,6 +2002,20 @@
+                 num_computed_tokens=parent.num_computed_tokens,
+             )
+             return False
++        pressure_report = self._vllm_exp_branch_pressure_report(
++            parent,
++            include_queued=True,
++        )
++        if not pressure_report["admissible"]:
++            self._vllm_exp_log_event(
++                parent,
++                "branch_skip_backpressure",
++                branch_depth_used=self._vllm_exp_branch_depth_used(parent),
++                branch_depth_limit=int(payload.get("branch_depth", 4)),
++                fork_tokens=fork_tokens,
++                **pressure_report,
++            )
++            return False
+         branch_plan = self._vllm_exp_branch_plan(parent, payload)
+         parent_id = parent.request_id
+         self._vllm_exp_branch_children[parent_id] = []
+@@ -2055,7 +2109,13 @@
+         estimated_blocks = self._vllm_exp_estimated_pool_blocks(parent)
+         max_seq_capacity = max(0, self.max_num_running_reqs - seq_reserve)
+         max_block_capacity = max(0, total_blocks - reserve_blocks)
+-        if candidate_count > max_seq_capacity:
++        pool_pressure = self._vllm_exp_branch_pressure_report(
++            parent,
++            include_queued=False,
++        )
++        if not pool_pressure["admissible"]:
++            reason = str(pool_pressure["reason"])
++        elif candidate_count > max_seq_capacity:
+             reason = "seq_capacity"
+         elif estimated_blocks > max_block_capacity:
+             reason = "kv_capacity"
+@@ -2075,9 +2135,11 @@
+             "ever_fits_seq": candidate_count <= max_seq_capacity,
+             "free_blocks": free_blocks,
+             "live_branch_pool_count": len(self._vllm_exp_active_branch_pools),
++            "live_branch_pool_limit": int(pool_pressure["live_branch_pool_limit"]),
+             "max_block_capacity": max_block_capacity,
+             "max_seq_capacity": max_seq_capacity,
+             "queued_branch_pool_count": len(self._vllm_exp_branch_pool_queue),
++            "queued_branch_pool_limit": int(pool_pressure["queued_branch_pool_limit"]),
+             "reason": reason,
+             "reserved_blocks": reserve_blocks,
+             "seq_reserve": seq_reserve,

@@ -1,0 +1,47 @@
+--- vllm/v1/core/single_type_kv_cache_manager.py
++++ vllm/v1/core/single_type_kv_cache_manager.py
+@@ -350,11 +350,10 @@
+         child_blocks = list(parent_blocks[:num_shared_blocks])
+         self.block_pool.touch([block for block in child_blocks if not block.is_null])
+         self.req_to_blocks[child_request_id] = child_blocks
+-        cached_count = self.num_cached_block.get(parent_request_id)
+-        if cached_count is not None:
+-            self.num_cached_block[child_request_id] = min(
+-                cached_count, num_shared_blocks
+-            )
++        if num_shared_blocks > 0:
++            self.num_cached_block[child_request_id] = num_shared_blocks
++        else:
++            self.num_cached_block.pop(child_request_id, None)
+         return len(child_blocks)
+ 
+     def promote_blocks(self, source_request_id: str, target_request_id: str) -> int:
+@@ -367,9 +366,8 @@
+             [block for block in source_blocks if not block.is_null]
+         )
+         self.req_to_blocks[target_request_id] = source_blocks
+-        source_cached_count = self.num_cached_block.get(source_request_id)
+-        if source_cached_count is not None:
+-            self.num_cached_block[target_request_id] = source_cached_count
++        if source_blocks:
++            self.num_cached_block[target_request_id] = len(source_blocks)
+         else:
+             self.num_cached_block.pop(target_request_id, None)
+         return len(source_blocks)
+@@ -385,12 +383,10 @@
+         if stale_blocks:
+             del req_blocks[retained_count:]
+             self.block_pool.free_blocks(reversed(stale_blocks))
+-        cached_count = self.num_cached_block.get(request_id)
+-        if cached_count is not None:
+-            if retained_count > 0:
+-                self.num_cached_block[request_id] = min(cached_count, retained_count)
+-            else:
+-                self.num_cached_block.pop(request_id, None)
++        if retained_count > 0:
++            self.num_cached_block[request_id] = retained_count
++        else:
++            self.num_cached_block.pop(request_id, None)
+         return len(stale_blocks)
+ 
+     def free(self, request_id: str) -> None:

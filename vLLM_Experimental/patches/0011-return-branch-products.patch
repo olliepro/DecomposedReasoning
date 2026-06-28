@@ -1,0 +1,352 @@
+--- vllm/v1/engine/__init__.py
++++ vllm/v1/engine/__init__.py
+@@ -189,6 +189,7 @@
+     prefill_stats: PrefillStats | None = None
+ 
+     routed_experts: np.ndarray | None = None
++    vllm_experimental_branch_outputs: list[dict[str, Any]] | None = None
+     # The number of NaNs in logits.
+     # A value greater than 0 indicates that the output is corrupted.
+     num_nans_in_logits: int = 0
+--- vllm/v1/engine/output_processor.py
++++ vllm/v1/engine/output_processor.py
+@@ -440,6 +440,46 @@
+     def has_unfinished_requests(self) -> bool:
+         return len(self.request_states) > 0
+ 
++    def _vllm_exp_decode_branch_text(self, token_ids: list[int]) -> str:
++        if self.tokenizer is None:
++            return ""
++        return self.tokenizer.decode(token_ids, skip_special_tokens=False)
++
++    def _vllm_exp_make_branch_request_output(
++        self,
++        req_state: RequestState,
++        branch_outputs: list[dict[str, Any]],
++        finish_reason: FinishReason,
++        stop_reason: int | str | None,
++        kv_transfer_params: dict[str, Any] | None,
++    ) -> RequestOutput:
++        completions: list[CompletionOutput] = []
++        for default_index, branch_output in enumerate(branch_outputs):
++            token_ids = [int(token_id) for token_id in branch_output["token_ids"]]
++            branch_finish_reason = branch_output.get("finish_reason")
++            completions.append(
++                CompletionOutput(
++                    index=int(branch_output.get("index", default_index)),
++                    text=self._vllm_exp_decode_branch_text(token_ids),
++                    token_ids=token_ids,
++                    cumulative_logprob=None,
++                    logprobs=None,
++                    finish_reason=(
++                        str(branch_finish_reason)
++                        if branch_finish_reason is not None
++                        else str(finish_reason)
++                    ),
++                    stop_reason=branch_output.get("stop_reason", stop_reason),
++                    lora_request=req_state.lora_request,
++                )
++            )
++        return req_state._new_request_output(
++            req_state.external_req_id,
++            completions,
++            True,
++            kv_transfer_params,
++        )
++
+     def propagate_error(self, e: Exception):
+         """Propagate error to all generate() tasks."""
+ 
+@@ -620,6 +660,7 @@
+             finish_reason = engine_core_output.finish_reason
+             stop_reason = engine_core_output.stop_reason
+             kv_transfer_params = engine_core_output.kv_transfer_params
++            branch_outputs = engine_core_output.vllm_experimental_branch_outputs
+             if engine_core_output.routed_experts is not None:
+                 req_state.routed_experts_chunks.append(
+                     engine_core_output.routed_experts
+@@ -632,7 +673,16 @@
+                     )
+                 req_state.is_prefilling = False
+ 
+-            if pooling_output is None:
++            if branch_outputs is not None:
++                assert finish_reason is not None
++                request_output = self._vllm_exp_make_branch_request_output(
++                    req_state,
++                    branch_outputs,
++                    finish_reason,
++                    stop_reason,
++                    kv_transfer_params,
++                )
++            elif pooling_output is None:
+                 assert req_state.detokenizer is not None
+                 assert req_state.logprobs_processor is not None
+                 # 2) Detokenize the token ids into text and perform stop checks.
+@@ -647,14 +697,23 @@
+                 # if required.
+                 req_state.logprobs_processor.update_from_output(engine_core_output)
+ 
+-            # 4) Create and handle RequestOutput objects.
+-            if request_output := req_state.make_request_output(
+-                new_token_ids,
+-                pooling_output,
+-                finish_reason,
+-                stop_reason,
+-                kv_transfer_params,
+-            ):
++                # 4) Create and handle RequestOutput objects.
++                request_output = req_state.make_request_output(
++                    new_token_ids,
++                    pooling_output,
++                    finish_reason,
++                    stop_reason,
++                    kv_transfer_params,
++                )
++            else:
++                request_output = req_state.make_request_output(
++                    new_token_ids,
++                    pooling_output,
++                    finish_reason,
++                    stop_reason,
++                    kv_transfer_params,
++                )
++            if request_output:
+                 if req_state.streaming_input:
+                     request_output.finished = False
+ 
+--- vllm/v1/core/sched/scheduler.py
++++ vllm/v1/core/sched/scheduler.py
+@@ -1526,18 +1526,30 @@
+                     assert finished, "hidden branch requests must not be resumable"
+                     parent = self._vllm_exp_complete_hidden_child(request)
+                     if parent is not None:
++                        branch_outputs = getattr(
++                            parent, "_vllm_exp_branch_output_records", None
++                        )
+                         promoted_token_ids = getattr(
+                             parent, "_vllm_exp_promoted_token_ids", []
+                         )
+-                        parent_finished_by_limit = (
+-                            self._vllm_exp_finish_parent_if_limit_reached(parent)
+-                        )
++                        parent_finished_by_limit = False
+                         parent_finish_reason = None
+                         parent_kv_transfer_params = None
+-                        if parent_finished_by_limit:
++                        if branch_outputs is not None:
++                            parent_finish_reason = parent.get_finished_reason()
++                            parent_kv_transfer_params = self._free_request(parent)
++                        else:
++                            parent_finished_by_limit = (
++                                self._vllm_exp_finish_parent_if_limit_reached(parent)
++                            )
++                        if branch_outputs is None and parent_finished_by_limit:
+                             parent_finish_reason = parent.get_finished_reason()
+                             parent_kv_transfer_params = self._free_request(parent)
+-                        if promoted_token_ids or parent_finished_by_limit:
++                        if (
++                            promoted_token_ids
++                            or parent_finished_by_limit
++                            or branch_outputs is not None
++                        ):
+                             outputs[parent.client_index].append(
+                                 EngineCoreOutput(
+                                     request_id=parent.request_id,
+@@ -1547,11 +1559,16 @@
+                                     events=parent.take_events(),
+                                     prefill_stats=parent.take_prefill_stats(),
+                                     kv_transfer_params=parent_kv_transfer_params,
++                                    vllm_experimental_branch_outputs=branch_outputs,
+                                     trace_headers=parent.trace_headers,
+                                 )
+                             )
+                             setattr(parent, "_vllm_exp_promoted_token_ids", [])
+-                        if not parent_finished_by_limit:
++                            setattr(parent, "_vllm_exp_branch_output_records", None)
++                        if (
++                            branch_outputs is None
++                            and not parent_finished_by_limit
++                        ):
+                             self._vllm_exp_resume_parent(parent)
+                     if status_before_stop == RequestStatus.RUNNING:
+                         stopped_running_reqs.add(request)
+@@ -2179,20 +2196,11 @@
+             return None
+ 
+         top_k_child_ids = self._vllm_exp_diverse_top_k_child_ids(child_ids)
+-        winner_id = self._vllm_exp_select_winner(parent_id, top_k_child_ids)
+-        winner = self.requests[winner_id]
+-        suffix_tokens = winner.num_output_tokens
+-        candidate_id = getattr(winner, "_vllm_exp_candidate_id", -1)
+         hidden_vector_child_count = sum(
+             1
+             for child_id in child_ids
+             if self._vllm_exp_average_hidden_vector(child_id) is not None
+         )
+-        selected_hidden_diversity = (
+-            self._vllm_exp_hidden_vector_diversity_for_child(winner_id, child_ids)
+-            if hidden_vector_child_count
+-            else 0.0
+-        )
+         pool_hidden_pairwise_diversity = (
+             self._vllm_exp_hidden_vector_pairwise_diversity(child_ids)
+             if hidden_vector_child_count
+@@ -2202,31 +2210,79 @@
+             child_ids=child_ids,
+             top_k_child_ids=top_k_child_ids,
+         )
+-        promoted_blocks = self._vllm_exp_promote_winner(parent, winner)
+-        self._vllm_exp_log_event(
+-            parent,
+-            "branch_promote",
+-            branch_count=len(child_ids),
+-            children_freed=len(child_ids),
+-            candidate_audit=candidate_audit,
+-            diversity_vector_source=(
+-                "model_hidden_state"
+-                if hidden_vector_child_count
+-                else "token_set"
+-            ),
+-            hidden_vector_child_count=hidden_vector_child_count,
+-            pool_hidden_pairwise_diversity=pool_hidden_pairwise_diversity,
+-            selected_hidden_diversity=selected_hidden_diversity,
+-            kv_blocks_promoted=promoted_blocks,
+-            candidate_bound=self._vllm_exp_candidate_bound(
+-                len(self._vllm_exp_unique_child_ids(child_ids))
+-            ),
+-            selected_candidate_id=int(candidate_id),
+-            suffix_tokens=suffix_tokens,
+-            top_k_candidate_ids=self._vllm_exp_candidate_ids(top_k_child_ids),
+-            unique_candidate_count=len(self._vllm_exp_unique_child_ids(child_ids)),
+-            winner_id=winner_id,
++        returned_child_ids = self._vllm_exp_return_child_ids(
++            parent=parent,
++            child_ids=child_ids,
++            top_k_child_ids=top_k_child_ids,
+         )
++        unique_count = len(self._vllm_exp_unique_child_ids(child_ids))
++        candidate_bound = self._vllm_exp_candidate_bound(unique_count)
++        diversity_source = (
++            "model_hidden_state"
++            if hidden_vector_child_count
++            else "token_set"
++        )
++        if len(returned_child_ids) > 1:
++            branch_outputs = self._vllm_exp_branch_output_records(
++                parent=parent,
++                child_ids=returned_child_ids,
++                top_k_child_ids=top_k_child_ids,
++            )
++            setattr(parent, "_vllm_exp_branch_output_records", branch_outputs)
++            parent.status = RequestStatus.FINISHED_STOPPED
++            parent.stop_reason = "vllm_experimental_branch_return"
++            self._vllm_exp_log_event(
++                parent,
++                "branch_return",
++                branch_count=len(child_ids),
++                children_freed=len(child_ids),
++                candidate_audit=candidate_audit,
++                diversity_vector_source=diversity_source,
++                hidden_vector_child_count=hidden_vector_child_count,
++                pool_hidden_pairwise_diversity=pool_hidden_pairwise_diversity,
++                candidate_bound=candidate_bound,
++                returned_branch_count=len(branch_outputs),
++                returned_candidate_ids=self._vllm_exp_candidate_ids(returned_child_ids),
++                returned_suffix_tokens=[
++                    len(self.requests[child_id].output_token_ids)
++                    for child_id in returned_child_ids
++                ],
++                top_k_candidate_ids=self._vllm_exp_candidate_ids(top_k_child_ids),
++                unique_candidate_count=unique_count,
++            )
++        else:
++            winner_id = (
++                returned_child_ids[0]
++                if returned_child_ids
++                else self._vllm_exp_select_winner(parent_id, top_k_child_ids)
++            )
++            winner = self.requests[winner_id]
++            suffix_tokens = winner.num_output_tokens
++            candidate_id = getattr(winner, "_vllm_exp_candidate_id", -1)
++            selected_hidden_diversity = (
++                self._vllm_exp_hidden_vector_diversity_for_child(winner_id, child_ids)
++                if hidden_vector_child_count
++                else 0.0
++            )
++            promoted_blocks = self._vllm_exp_promote_winner(parent, winner)
++            self._vllm_exp_log_event(
++                parent,
++                "branch_promote",
++                branch_count=len(child_ids),
++                children_freed=len(child_ids),
++                candidate_audit=candidate_audit,
++                diversity_vector_source=diversity_source,
++                hidden_vector_child_count=hidden_vector_child_count,
++                pool_hidden_pairwise_diversity=pool_hidden_pairwise_diversity,
++                selected_hidden_diversity=selected_hidden_diversity,
++                kv_blocks_promoted=promoted_blocks,
++                candidate_bound=candidate_bound,
++                selected_candidate_id=int(candidate_id),
++                suffix_tokens=suffix_tokens,
++                top_k_candidate_ids=self._vllm_exp_candidate_ids(top_k_child_ids),
++                unique_candidate_count=unique_count,
++                winner_id=winner_id,
++            )
+         for child_id in child_ids:
+             child_request = self.requests.get(child_id)
+             if child_request is None:
+@@ -2245,6 +2301,53 @@
+         self._vllm_exp_off_policy_branch_options.pop(parent_id, None)
+         return parent
+ 
++    def _vllm_exp_return_child_ids(
++        self,
++        *,
++        parent: Request,
++        child_ids: list[str],
++        top_k_child_ids: list[str],
++    ) -> list[str]:
++        payload = self._vllm_exp_payload(parent)
++        assert payload is not None
++        branch_fanout = int(payload.get("branch_fanout", 1))
++        if branch_fanout <= 1:
++            return []
++        if payload.get("mode") == "eps_on_policy_diverse":
++            return top_k_child_ids[:branch_fanout]
++        assert payload.get("mode") == "eps_off_policy_verbalized"
++        return child_ids[:branch_fanout]
++
++    def _vllm_exp_branch_output_records(
++        self,
++        *,
++        parent: Request,
++        child_ids: list[str],
++        top_k_child_ids: list[str],
++    ) -> list[dict[str, Any]]:
++        top_k_ids = set(top_k_child_ids)
++        records: list[dict[str, Any]] = []
++        for index, child_id in enumerate(child_ids):
++            child = self.requests[child_id]
++            candidate_id = int(getattr(child, "_vllm_exp_candidate_id", index))
++            suffix = list(child.output_token_ids)
++            finish_reason = child.get_finished_reason()
++            records.append(
++                {
++                    "index": candidate_id,
++                    "candidate_id": candidate_id,
++                    "child_id": child_id,
++                    "finish_reason": (
++                        str(finish_reason) if finish_reason is not None else None
++                    ),
++                    "in_diverse_top_k": child_id in top_k_ids,
++                    "stop_reason": child.stop_reason,
++                    "suffix_token_ids": suffix,
++                    "token_ids": list(parent.output_token_ids) + suffix,
++                }
++            )
++        return records
++
+     def _vllm_exp_select_winner(
+         self, parent_id: str, top_k_child_ids: list[str]
+     ) -> str:
